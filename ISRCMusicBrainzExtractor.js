@@ -183,10 +183,12 @@ function fetchMusicBrainzData(isrc, email) {
   const result = { year: "", genre: "" };
   const url = `https://musicbrainz.org/ws/2/recording/?query=isrc:${isrc}&fmt=json`;
   try {
-    const response = UrlFetchApp.fetch(url, {
-      "headers": { "User-Agent": `MusicMetadataScript/1.7 ( ${email} )` },
-      "muteHttpExceptions": true
-    });
+    const response = trackedFetch("MusicBrainz", url, {
+  "headers": {
+    "User-Agent": `MusicMetadataScript/1.7 ( ${email} )`
+  },
+  "muteHttpExceptions": true
+});
     if (response.getResponseCode() !== 200) return result;
     const data = JSON.parse(response.getContentText());
     if (data.recordings && data.recordings.length > 0) {

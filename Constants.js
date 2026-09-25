@@ -3,7 +3,8 @@
  * 
  */
 
-const GEMINI_API_KEY = "AIzaSyBqW8yF5y5lQ4OdYuN_M9IsMMg1Dx5aPJY";
+const GEMINI_API_KEY =
+  PropertiesService.getScriptProperties().getProperty("GEMINI_API_KEY");
 // const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;  //Updated to current version being used...
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;  //Updated to current version being used...
 

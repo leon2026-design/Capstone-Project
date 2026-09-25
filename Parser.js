@@ -207,7 +207,7 @@ function convertDocxToPdf(fileId, docName, targetFolder) {
     // Try direct DOCX → PDF export
     const url = `https://www.googleapis.com/drive/v3/files/${fileId}/export?mimeType=application/pdf&alt=media`;
     const token = ScriptApp.getOAuthToken();
-    const response = UrlFetchApp.fetch(url, {
+    const response = trackedFetch("Google Drive API", url, {
       headers: { Authorization: `Bearer ${token}` }
     });
 
@@ -221,7 +221,7 @@ function convertDocxToPdf(fileId, docName, targetFolder) {
 
     const url = `https://www.googleapis.com/drive/v3/files/${gdoc.id}/export?mimeType=application/pdf&alt=media`;
     const token = ScriptApp.getOAuthToken();
-    const response = UrlFetchApp.fetch(url, {
+    const response = trackedFetch("Google Drive API", url, {
       headers: { Authorization: `Bearer ${token}` }
     });
 

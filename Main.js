@@ -39,6 +39,9 @@ function runAutomatedFunctions() {
  * Add in any scripts you want called every x days.
  */
 function runScripts() {
+  resetApiInventory(); // Reset API call inventory at the start of the script run
+
+  try {
   processNewPDFs(); //Go over all input documents!
   //Make sure all the headers are standardized when possible!
   standardizeAndSplitHeaders();
@@ -48,4 +51,8 @@ function runScripts() {
   
   findProgramDirectorsWithVerification();
   cleanAndSortAllSheets();  //Remove duplicates and order each sheet alphabetically by the first column.
+  } finally {
+    printApiInventory(); // Print the API call inventory at the end of the script run
+  }
+
 }
