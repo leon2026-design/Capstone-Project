@@ -1,4 +1,25 @@
 /**
+ * Normalizes ISRC and rejects invalid formats.
+ * Returns normalized 12-character ISRC, or null if invalid.
+ */
+function normalizeISRC(value) {
+  if (value === null || value === undefined) return null;
+
+  const isrc = String(value)
+    .trim()
+    .toUpperCase()
+    .replace(/[\s-]/g, "");
+
+  /**
+   * 2 letters + 3 letters/digits + 2 digits + 5 digits
+   * If it is outside this format, we consider it invalid & return null.
+   */
+  const isValid = /^[A-Z]{2}[A-Z0-9]{3}[0-9]{7}$/.test(isrc);
+
+  return isValid ? isrc : null;
+}
+
+/**
  * @fileoverview Music Metadata Processor (MusicBrainz Edition)
  * Final version with full MLC/BMI header string and 21-column mapping.
  */
@@ -56,21 +77,35 @@ function processISRCMusicMetadata() {
     let sheetNeedsUpdate = false;
 
     for (let i = 0; i < sheetData.length; i++) {
-      const row = sheetData[i];
-      const isrc = String(row[1]).trim(); 
-      if (isrc) {
-        processedISRCs.add(isrc);
-        if (!row[5] || !row[6]) {
-          const mbData = fetchMusicBrainzData(isrc, USER_EMAIL);
-          if (mbData.genre || mbData.year) {
-            if (!row[5]) sheetData[i][5] = mbData.genre;
-            if (!row[6]) sheetData[i][6] = mbData.year;
-            sheetNeedsUpdate = true;
-            Utilities.sleep(1500);
-          }
-        }
-      }
+  const row = sheetData[i];
+  const originalISRC = String(row[1] ?? "").trim();
+  const isrc = normalizeISRC(row[1]);
+
+  if (!isrc) {
+    if (originalISRC) {
+      console.warn(`Skipping invalid existing ISRC in row ${i + 2}: ${originalISRC}`);
     }
+    continue;
+  }
+
+  // Standardize existing spreadsheet ISRCs too.
+  if (row[1] !== isrc) {
+    sheetData[i][1] = isrc;
+    sheetNeedsUpdate = true;
+  }
+
+  processedISRCs.add(isrc);
+
+  if (!row[5] || !row[6]) {
+    const mbData = fetchMusicBrainzData(isrc, USER_EMAIL);
+    if (mbData.genre || mbData.year) {
+      if (!row[5]) sheetData[i][5] = mbData.genre;
+      if (!row[6]) sheetData[i][6] = mbData.year;
+      sheetNeedsUpdate = true;
+      Utilities.sleep(1500);
+    }
+  }
+}
     if (sheetNeedsUpdate) dataRange.setValues(sheetData);
   } else {
     outputSheet.appendRow(outputHeaders);
@@ -113,29 +148,36 @@ function processISRCMusicMetadata() {
     };
 
     if (idx.isrc !== -1) {
-      rows.forEach(row => {
-        const isrc = String(row[idx.isrc]).trim();
-        if (isrc && !processedISRCs.has(isrc)) {
-          processedISRCs.add(isrc);
-          const mbData = fetchMusicBrainzData(isrc, USER_EMAIL);
-          
-          finalData.push([
-            row[idx.track] || "", 
-            isrc, 
-            formatArtists(row[idx.pArtist]), 
-            row[idx.upc] || "", 
-            row[idx.product] || "", 
-            mbData.genre, 
-            mbData.year, 
-            row[idx.label] || "", 
-            formatArtists(row[idx.tArtist]), 
-            "", 
-            false // Flag for Export
-          ]);
-          Utilities.sleep(1500);
-        }
-      });
+  rows.forEach(row => {
+    const isrc = normalizeISRC(row[idx.isrc]);
+
+    if (!isrc) {
+      console.warn(`Skipping invalid ISRC in ${file.getName()}: ${row[idx.isrc]}`);
+      return;
     }
+
+    if (!processedISRCs.has(isrc)) {
+      processedISRCs.add(isrc);
+      const mbData = fetchMusicBrainzData(isrc, USER_EMAIL);
+
+      finalData.push([
+        row[idx.track] || "",
+        isrc,
+        formatArtists(row[idx.pArtist]),
+        row[idx.upc] || "",
+        row[idx.product] || "",
+        mbData.genre,
+        mbData.year,
+        row[idx.label] || "",
+        formatArtists(row[idx.tArtist]),
+        "",
+        false
+      ]);
+
+      Utilities.sleep(1500);
+    }
+  });
+}
     file.moveTo(processedFolder);
   }
 
@@ -154,7 +196,13 @@ function processISRCMusicMetadata() {
     for (let i = 0; i < fullData.length; i++) {
       if (fullData[i][10] === false || fullData[i][10] === "") {
         const title = fullData[i][0];
-        const isrc = fullData[i][1];
+        const isrc = normalizeISRC(fullData[i][1]);
+
+        if (!isrc) {
+          console.warn(`Skipping BMI/MLC export for invalid ISRC in row ${i + 2}`);
+          continue;
+        }
+
         const artist = fullData[i][8]; // Album Artist
         const label = fullData[i][7];
 

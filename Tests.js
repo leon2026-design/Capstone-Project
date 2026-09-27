@@ -84,3 +84,44 @@ function runScriptsNoAI() {
   processISRCMusicMetadata();
   cleanAndSortAllSheets();
 }
+
+
+/**
+ *  Unit tests for ISRC normalization and validation.
+ *
+ * To run locally, run:
+ *
+ * node -e "const fs = require('fs'); const vm = require('vm'); const code = fs.readFileSync('ISRCMusicBrainzExtractor.js', 'utf8') + '\n' + fs.readFileSync('Tests.js', 'utf8'); vm.runInNewContext(code + '\ntestNormalizeISRC();', { console });"
+ *
+ * Expected result: 9 PASS messages and
+ * "All ISRC normalization tests passed."
+ *
+ *
+ */
+function testNormalizeISRC() {
+  const tests = [
+    ["USUM71703861", "USUM71703861"],
+    ["usum71703861", "USUM71703861"],
+    ["US-UM7-17-03861", "USUM71703861"],
+    [" USUM71703861 ", "USUM71703861"],
+    ["INVALID-ISRC", null],
+    ["", null],
+    [null, null],
+    ["USUM7170386", null],
+    ["USUM717038611", null]
+  ];
+
+  tests.forEach(([input, expected]) => {
+    const actual = normalizeISRC(input);
+
+    if (actual !== expected) {
+      throw new Error(
+        `FAILED for ${input}: expected ${expected}, got ${actual}`
+      );
+    }
+
+    console.log(`PASS: ${input} -> ${actual}`);
+  });
+
+  console.log("All ISRC normalization tests passed.");
+}
