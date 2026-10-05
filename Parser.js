@@ -17,8 +17,13 @@ const SHEET_NAMES = ["Campaign Data"];
 const PDF_TYPES = ["campaign"];
 const PDF_HEADERS = [["Name", "Additional Info / Stations", "Reach", "Rating", "Favorite Track", "Comments"]];
 const PDF_PARSING_NOTES = ["Note: For the 'Not For Me' section, capture the Name and Additional Info only. Put in 'Not for me' in the comments section as well. "];
-const PARSER_INPUT_FOLDER = "1w_PIvVglw47a979oG4irui256HTqFcxM"
-const PARSER_OUTPUT_FOLDER = "1EO1TKtzjACLI4A71QMwpiV67SlS95wSU"
+const PARSER_INPUT_FOLDER =
+  PropertiesService.getScriptProperties()
+    .getProperty("PARSER_INPUT_FOLDER");
+
+const PARSER_OUTPUT_FOLDER =
+  PropertiesService.getScriptProperties()
+    .getProperty("PARSER_OUTPUT_FOLDER");
 
 function processNewPDFs() {
   const folder = DriveApp.getFolderById(PARSER_INPUT_FOLDER);
@@ -148,7 +153,7 @@ function geminiParsePDFUndefined(blob){
     }]
   };
 
-  return UrlFetchApp.fetch(url, {
+  return trackedFetch("Gemini", url, {
     method: "post",
     contentType: "application/json",
     payload: JSON.stringify(payload),
@@ -207,7 +212,7 @@ function convertDocxToPdf(fileId, docName, targetFolder) {
     // Try direct DOCX → PDF export
     const url = `https://www.googleapis.com/drive/v3/files/${fileId}/export?mimeType=application/pdf&alt=media`;
     const token = ScriptApp.getOAuthToken();
-    const response = UrlFetchApp.fetch(url, {
+    const response = trackedFetch("Google Drive API", url, {
       headers: { Authorization: `Bearer ${token}` }
     });
 
@@ -221,7 +226,7 @@ function convertDocxToPdf(fileId, docName, targetFolder) {
 
     const url = `https://www.googleapis.com/drive/v3/files/${gdoc.id}/export?mimeType=application/pdf&alt=media`;
     const token = ScriptApp.getOAuthToken();
-    const response = UrlFetchApp.fetch(url, {
+    const response = trackedFetch("Google Drive API", url, {
       headers: { Authorization: `Bearer ${token}` }
     });
 

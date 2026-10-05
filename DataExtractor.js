@@ -1,137 +1,293 @@
-/**
- * AI-POWERED DATA CONSOLIDATOR (FLAT LIST)
- * Features:
- * 1. No Deduplication: Every row from every source is preserved.
- * 2. Field Mapping: Uses AI to ensure "FName" and "First Name" land in the same column.
- * 3. Individual Entries: Treats every row as a unique entity.
- */
+/** Build the normalized alias lookup and reject conflicting definitions. */
+function buildHeaderAliasLookup() {
+  const lookup = new Map();
+
+  Object.keys(HEADER_ALIASES).forEach(field => {
+    if (!STANDARDIZED_HEADERS.includes(field)) {
+      throw new Error(
+        'Unknown standard header in HEADER_ALIASES: ' + field
+      );
+    }
+  });
+
+  STANDARDIZED_HEADERS.forEach(field => {
+    [field, ...(HEADER_ALIASES[field] || [])].forEach(alias => {
+      const key = normalizeKey(alias);
+
+      if (!key || (lookup.has(key) && lookup.get(key) !== field)) {
+        throw new Error('Empty or conflicting header alias: ' + alias);
+      }
+
+      lookup.set(key, field);
+    });
+  });
+
+  COMBINED_NAME_ALIASES.forEach(alias => {
+    if (lookup.has(normalizeKey(alias))) {
+      throw new Error(
+        'Combined name conflicts with a field alias: ' + alias
+      );
+    }
+  });
+
+  return lookup;
+}
+
+// Ignore capitalization, whitespace, and punctuation in header names.
+function normalizeKey(value) {
+  return String(value ?? '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '');
+}
+
+/** Return {sourceIdx, targetField, isCombinedName} objects. */
+function getDeterministicHeaderMapping(
+  sourceHeaders,
+  targetFields,
+  lookup
+) {
+  lookup = lookup || buildHeaderAliasLookup();
+
+  // Preserve requested output labels, such as "email"
+  // instead of changing the destination label to "Email Address".
+  const targets = new Map();
+
+  targetFields.forEach(field => {
+    const key = normalizeKey(
+      lookup.get(normalizeKey(field)) || field
+    );
+
+    if (key && !targets.has(key)) {
+      targets.set(key, field);
+    }
+  });
+
+  const combinedNames = new Set(
+    COMBINED_NAME_ALIASES.map(normalizeKey)
+  );
+
+  const canSplit =
+    targets.has('firstname') && targets.has('lastname');
+
+  const ranked = [];
+
+  // Find the matching destination field for each source column.
+  sourceHeaders.forEach((header, sourceIdx) => {
+    const key = normalizeKey(header);
+    if (!key) return;
+
+    if (canSplit && combinedNames.has(key)) {
+      ranked.push({
+        sourceIdx,
+        targetField: targets.get('firstname'),
+        isCombinedName: true,
+        priority: 0
+      });
+      return;
+    }
+
+    const canonical = lookup.get(key);
+    const targetField = targets.get(
+      normalizeKey(canonical || header)
+    );
+
+    if (targetField) {
+      ranked.push({
+        sourceIdx,
+        targetField,
+        isCombinedName: false,
+        priority:
+          canonical && key === normalizeKey(canonical) ? 2 : 1
+      });
+    }
+  });
+
+  // Combined names first, aliases next, standard headers last.
+  // Later nonempty values take precedence during consolidation.
+  // For equal-priority columns, the leftmost nonempty value wins.
+  return ranked
+    .sort(
+      (a, b) =>
+        a.priority - b.priority || b.sourceIdx - a.sourceIdx
+    )
+    .map(({ priority, ...mapping }) => mapping);
+}
 
 function consolidateFieldData() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const allSheets = ss.getSheets();
+  const lookup = buildHeaderAliasLookup();
+  const ss = SpreadsheetApp.openById(
+    SPREADSHEET_DATA_EXTRACTION
+  );
 
-  FIELDS_TO_MAKE_SHEETS_OF.forEach(fieldEntry => {
-    let destSheet = ss.getSheetByName(fieldEntry) || ss.insertSheet(fieldEntry);
-    destSheet.clear(); 
+  const combinedNames = new Set(
+    COMBINED_NAME_ALIASES.map(normalizeKey)
+  );
 
-    // 1. Prepare Headers
-    let requestedParts = [];
-    fieldEntry.split(/,|and/).forEach(p => {
-      const trimmed = p.trim();
-      if (trimmed.toLowerCase() === "name") {
-        requestedParts.push("First Name", "Last Name");
-      } else if (trimmed) {
-        requestedParts.push(trimmed);
+  // Read each source sheet once.
+  // Exclude master lists and Sheet1, as the existing function did.
+  const sources = ss.getSheets()
+    .filter(sheet =>
+      !FIELDS_TO_MAKE_SHEETS_OF.includes(sheet.getName()) &&
+      sheet.getName() !== 'Sheet1'
+    )
+    .map(sheet => {
+      const values = sheet.getDataRange().getValues();
+      const headers = (values[0] || []).map(String);
+
+      const unknown = headers.filter(header => {
+        const key = normalizeKey(header);
+        return key &&
+          !lookup.has(key) &&
+          !combinedNames.has(key);
+      });
+
+      if (unknown.length) {
+        console.warn(
+          'Review report-specific headers in ' +
+          sheet.getName() + ': ' + unknown.join(', ')
+        );
       }
+
+      return {
+        headers,
+        rows: values.slice(1)
+      };
     });
 
-    const displayHeaders = [...new Set(requestedParts)];
-    const normalizedHeaderKeys = displayHeaders.map(h => normalizeKey(h));
-    
-    // 2. DATA COLLECTION: A simple array to hold every single row
-    const allCollectedRows = [];
+  // Collect all output data before changing any destination.
+  const outputs = FIELDS_TO_MAKE_SHEETS_OF.map(sheetName => {
+    const fields = sheetName
+      .split(/,|\s+and\s+/i)
+      .flatMap(part => {
+        const field = part.trim();
+        if (!field) return [];
 
-    allSheets.forEach(sourceSheet => {
-      const sourceName = sourceSheet.getName();
-      // Skip the destination sheets and the main overview sheet
-      if (FIELDS_TO_MAKE_SHEETS_OF.includes(sourceName) || sourceName === "Sheet1") return;
+        return normalizeKey(field) === 'name'
+          ? ['First Name', 'Last Name']
+          : [field];
+      });
 
-      const sourceRange = sourceSheet.getDataRange();
-      if (sourceRange.isBlank()) return;
+    const headers = [...new Set(fields)];
+    const keys = headers.map(normalizeKey);
 
-      const sourceData = sourceRange.getValues();
-      const sourceHeaders = sourceData[0].map(String);
-      const sourceRows = sourceData.slice(1);
+    const firstField = headers.find(field =>
+      lookup.get(normalizeKey(field)) === 'First Name'
+    );
 
-      // Map source columns to our target headers
-      let aiMapping = getGeminiHeaderMapping(sourceHeaders, requestedParts) || 
-                      fallbackMatching(sourceHeaders, requestedParts);
+    const lastField = headers.find(field =>
+      lookup.get(normalizeKey(field)) === 'Last Name'
+    );
 
-      sourceRows.forEach(row => {
-        const rowData = {};
-        let hasData = false;
+    const rows = [];
 
-        aiMapping.forEach(map => {
-          let val = String(row[map.sourceIdx] || "").trim();
-          if (!val) return;
-          hasData = true;
+    sources.forEach(source => {
+      const mapping = getDeterministicHeaderMapping(
+        source.headers,
+        headers,
+        lookup
+      );
+
+      source.rows.forEach(sourceRow => {
+        const values = new Map();
+
+        mapping.forEach(map => {
+          const value = String(
+            sourceRow[map.sourceIdx] ?? ''
+          ).trim();
+
+          // Skip empty cells without discarding numeric zero.
+          if (!value) return;
 
           if (map.isCombinedName) {
-            const parts = val.split(/\s+/);
-            rowData[normalizeKey("First Name")] = parts[0] || "";
-            rowData[normalizeKey("Last Name")] = parts.length > 1 ? parts.slice(1).join(" ") : "";
+            const parts = value.split(/\s+/);
+
+            values.set(
+              normalizeKey(firstField),
+              parts[0]
+            );
+
+            values.set(
+              normalizeKey(lastField),
+              parts.slice(1).join(' ')
+            );
           } else {
-            rowData[normalizeKey(map.targetField)] = val;
+            values.set(
+              normalizeKey(map.targetField),
+              value
+            );
           }
         });
 
-        // If the row isn't empty, add it to our master list
-        if (hasData) {
-          allCollectedRows.push(rowData);
+        const row = keys.map(key => values.get(key) ?? '');
+
+        if (row.some(value => value !== '')) {
+          rows.push(row);
         }
       });
     });
 
-    // 3. BATCH WRITE
-    const finalRows = allCollectedRows.map(obj => {
-      return normalizedHeaderKeys.map(key => obj[key] || "");
-    });
+    return { sheetName, headers, rows };
+  });
 
-    if (displayHeaders.length > 0 && finalRows.length > 0) {
-      const outputMatrix = [displayHeaders, ...finalRows];
-      destSheet.getRange(1, 1, outputMatrix.length, displayHeaders.length).setValues(outputMatrix);
-      
-      // Formatting
-      destSheet.getRange(1, 1, 1, displayHeaders.length).setFontWeight("bold").setBackground("#f3f3f3");
-      destSheet.autoResizeColumns(1, displayHeaders.length);
-      destSheet.setFrozenRows(1);
+  outputs.forEach(({ sheetName, headers, rows }) => {
+    if (!rows.length) {
+      console.warn(
+        'No mapped rows for ' + sheetName +
+        '; existing output was kept.'
+      );
+      return;
     }
+
+    const sheet =
+      ss.getSheetByName(sheetName) || ss.insertSheet(sheetName);
+
+    const matrix = [headers, ...rows];
+    const oldRows = sheet.getLastRow();
+    const oldCols = sheet.getLastColumn();
+
+    // Expand the destination if the new output is larger.
+    if (sheet.getMaxRows() < matrix.length) {
+      sheet.insertRowsAfter(
+        sheet.getMaxRows(),
+        matrix.length - sheet.getMaxRows()
+      );
+    }
+
+    if (sheet.getMaxColumns() < headers.length) {
+      sheet.insertColumnsAfter(
+        sheet.getMaxColumns(),
+        headers.length - sheet.getMaxColumns()
+      );
+    }
+
+    // Write before clearing leftover cells from the previous output.
+    sheet.getRange(
+      1, 1, matrix.length, headers.length
+    ).setValues(matrix);
+
+    if (oldRows > matrix.length) {
+      sheet.getRange(
+        matrix.length + 1,
+        1,
+        oldRows - matrix.length,
+        oldCols
+      ).clearContent();
+    }
+
+    if (oldCols > headers.length) {
+      sheet.getRange(
+        1,
+        headers.length + 1,
+        matrix.length,
+        oldCols - headers.length
+      ).clearContent();
+    }
+
+    sheet.getRange(1, 1, 1, headers.length)
+      .setFontWeight('bold')
+      .setBackground('#f3f3f3');
+
+    sheet.autoResizeColumns(1, headers.length);
+    sheet.setFrozenRows(1);
   });
-}
-
-/**
- * AI Mapping & Fallback functions remain the same to ensure 
- * data lands in the correct columns regardless of source header naming.
- */
-function getGeminiHeaderMapping(sourceHeaders, targetFields) {
-  const prompt = `Map these source headers: [${sourceHeaders.join(", ")}] to these target fields: [${targetFields.join(", ")}]. 
-  Instructions:
-  - If source is "Name" and target has "First Name" and "Last Name", set isCombinedName to true.
-  - Recognize that snake_case, jammed case, or abbreviations match.
-  - Return JSON array ONLY: [{"sourceIdx": number, "targetField": string, "isCombinedName": boolean}].`;
-
-  const payload = {
-    contents: [{ parts: [{ text: prompt }] }],
-    generationConfig: { responseMimeType: "application/json" }
-  };
-
-  try {
-    const response = UrlFetchApp.fetch(GEMINI_URL, {
-      method: "post", contentType: "application/json",
-      payload: JSON.stringify(payload), muteHttpExceptions: true
-    });
-    const resText = JSON.parse(response.getContentText()).candidates[0].content.parts[0].text;
-    return JSON.parse(resText);
-  } catch (e) { 
-    console.error("AI Mapping failed, using fallback."); 
-    return null;
-  }
-}
-
-function fallbackMatching(sourceHeaders, targetFields) {
-  const mapping = [];
-  sourceHeaders.forEach((h, idx) => {
-    const hNorm = normalizeKey(h);
-    targetFields.forEach(tf => {
-      const tfNorm = normalizeKey(tf);
-      if (hNorm.includes(tfNorm) || tfNorm.includes(hNorm)) {
-        mapping.push({ sourceIdx: idx, targetField: tf, isCombinedName: false });
-      }
-    });
-  });
-  return mapping;
-}
-
-function normalizeKey(str) {
-  return String(str || "").toLowerCase().replace(/[^a-z0-9]/g, "");
 }
