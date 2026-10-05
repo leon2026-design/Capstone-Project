@@ -7,7 +7,7 @@
  */
 
 function consolidateFieldData() {
-  const ss = SpreadsheetApp.openById(SPREADSHEET_DATA_EXTRACTION);
+  const ss = SpreadsheetApp.openById(requireScriptProperty("SPREADSHEET_DATA_EXTRACTION", SPREADSHEET_DATA_EXTRACTION));
   const allSheets = ss.getSheets();
 
   FIELDS_TO_MAKE_SHEETS_OF.forEach(fieldEntry => {

@@ -5,19 +5,13 @@
 
 function processISRCMusicMetadata() {
   // --- CONFIGURATION ---
-  const TARGET_SPREADSHEET_ID =
-  PropertiesService.getScriptProperties()
-    .getProperty("TARGET_SPREADSHEET_ID");
+  const TARGET_SPREADSHEET_ID = requireScriptProperty("ISRC_SPREADSHEET", ISRC_SPREADSHEET);
   const TARGET_SHEET_NAME = 'ISRC_Metadata'; 
   const EXPORT_SHEET_NAME = 'BMI_MLC_EXPORT'; 
   
-  const SOURCE_FOLDER_ID =
-  PropertiesService.getScriptProperties()
-    .getProperty("SOURCE_FOLDER_ID");
+  const SOURCE_FOLDER_ID = requireScriptProperty("PARSER_INPUT_FOLDER", PARSER_INPUT_FOLDER);
 
-  const PROCESSED_FOLDER_ID =
-  PropertiesService.getScriptProperties()
-    .getProperty("PROCESSED_FOLDER_ID");
+  const PROCESSED_FOLDER_ID = requireScriptProperty("PARSER_OUTPUT_FOLDER", PARSER_OUTPUT_FOLDER);
   const USER_EMAIL = "capstone2026group@gmail.com"; 
 
   const targetSS = SpreadsheetApp.openById(TARGET_SPREADSHEET_ID);

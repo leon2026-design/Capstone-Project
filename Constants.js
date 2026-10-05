@@ -21,6 +21,27 @@ const SPREADSHEET_DATA_EXTRACTION =
 const ISRC_SPREADSHEET =
   PropertiesService.getScriptProperties()
     .getProperty("ISRC_SPREADSHEET");
+const PARSER_INPUT_FOLDER =
+  PropertiesService.getScriptProperties()
+    .getProperty("PARSER_INPUT_FOLDER");
+
+const PARSER_OUTPUT_FOLDER =
+  PropertiesService.getScriptProperties()
+    .getProperty("PARSER_OUTPUT_FOLDER");
+
+/**
+ * Fails fast with an actionable error when a required Script Property is missing.
+ * @param {string} name The Script Property key (used in the error message).
+ * @param {?string} value The value read from Script Properties.
+ * @return {string} The validated value.
+ */
+function requireScriptProperty(name, value) {
+  if (!value || !String(value).trim()) {
+    throw new Error(`Missing required Script Property "${name}". Set it in Project Settings > Script Properties.`);
+  }
+  return value;
+}
+
 //USER_AGENT - used to define the accessing technology for a less likely block of access when scraping websites for data...
 // const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36";
 const ISRC_REGEX = /[A-Z]{2}-[A-Z0-9]{3}-[0-9]{2}-[0-9]{5}/g;
