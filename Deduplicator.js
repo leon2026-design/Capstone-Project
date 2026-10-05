@@ -26,28 +26,29 @@ function cleanAndSortAllSheets() {
     // --- STEP 2: REMOVE DUPLICATES ---
     // This looks at the entire row content to determine if it's a duplicate
     const values = dataRange.getValues();
-    const uniqueRows = [];
+    const duplicateRows = [];
     const seen = new Set();
 
-    values.forEach(row => {
+    values.forEach((row, index) => {
       // Create a unique string representation of the row to compare
       const rowString = row.map(cell => String(cell).trim()).join("|--|");
       
-      if (!seen.has(rowString)) {
-        uniqueRows.push(row);
+      if (seen.has(rowString)) {
+        // +2 because data starts on spreadsheet row 2
+        duplicateRows.push(index + 2);
+      } else {
         seen.add(rowString);
       }
     });
 
     // --- STEP 3: UPDATE SHEET ---
     // Clear the old data (below headers) and write the unique, sorted rows back
-    dataRange.clearContent();
-    if (uniqueRows.length > 0) {
-      sheet.getRange(2, 1, uniqueRows.length, lastCol).setValues(uniqueRows);
-    }
-    
-    console.log(`Cleaned "${sheet.getName()}": Removed ${values.length - uniqueRows.length} duplicates.`);
-  });
+    for (let i = duplicateRows.length - 1; i >= 0; i--) {
+  sheet.deleteRow(duplicateRows[i]);
+}
 
-  console.log("Cleanup complete! All sheets sorted and duplicates removed.");
+console.log(`Cleaned "${sheet.getName()}": Removed ${duplicateRows.length} duplicates.`);
+
+
+    });
 }
