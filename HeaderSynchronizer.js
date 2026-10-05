@@ -90,7 +90,7 @@ function getGeminiInstructions(currentHeaders, standardList) {
   };
 
   try {
-    const response = UrlFetchApp.fetch(GEMINI_URL, {
+    const response = trackedFetch("Gemini", GEMINI_URL, {
       method: 'post', contentType: 'application/json', payload: JSON.stringify(payload), muteHttpExceptions: true
     });
     const resText = response.getContentText();
@@ -129,7 +129,7 @@ function splitLocationColumn(sheet, colIndex, newHeaderNames) {
 
   try {
     const payload = { contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.1 } };
-    const response = UrlFetchApp.fetch(GEMINI_URL, {
+    const response = trackedFetch("Gemini", GEMINI_URL, {
       method: 'post', contentType: 'application/json', payload: JSON.stringify(payload), muteHttpExceptions: true
     });
     const json = JSON.parse(response.getContentText());

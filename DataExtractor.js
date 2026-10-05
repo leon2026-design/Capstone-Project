@@ -7,7 +7,7 @@
  */
 
 function consolidateFieldData() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ss = SpreadsheetApp.openById(SPREADSHEET_DATA_EXTRACTION);
   const allSheets = ss.getSheets();
 
   FIELDS_TO_MAKE_SHEETS_OF.forEach(fieldEntry => {
@@ -106,7 +106,7 @@ function getGeminiHeaderMapping(sourceHeaders, targetFields) {
   };
 
   try {
-    const response = UrlFetchApp.fetch(GEMINI_URL, {
+    const response = trackedFetch("Gemini", GEMINI_URL, {
       method: "post", contentType: "application/json",
       payload: JSON.stringify(payload), muteHttpExceptions: true
     });
