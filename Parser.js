@@ -17,12 +17,9 @@ const SHEET_NAMES = ["Campaign Data"];
 const PDF_TYPES = ["campaign"];
 const PDF_HEADERS = [["Name", "Additional Info / Stations", "Reach", "Rating", "Favorite Track", "Comments"]];
 const PDF_PARSING_NOTES = ["Note: For the 'Not For Me' section, capture the Name and Additional Info only. Put in 'Not for me' in the comments section as well. "];
-const PARSER_INPUT_FOLDER = "1w_PIvVglw47a979oG4irui256HTqFcxM"
-const PARSER_OUTPUT_FOLDER = "1EO1TKtzjACLI4A71QMwpiV67SlS95wSU"
-
 function processNewPDFs() {
-  const folder = DriveApp.getFolderById(PARSER_INPUT_FOLDER);
-  const targetFolder = DriveApp.getFolderById(PARSER_OUTPUT_FOLDER); 
+  const folder = DriveApp.getFolderById(requireScriptProperty("PARSER_INPUT_FOLDER", PARSER_INPUT_FOLDER));
+  const targetFolder = DriveApp.getFolderById(requireScriptProperty("PARSER_OUTPUT_FOLDER", PARSER_OUTPUT_FOLDER)); 
 
   // 1. Convert Word docs to PDF
   checkForDocxFiles(folder, targetFolder);

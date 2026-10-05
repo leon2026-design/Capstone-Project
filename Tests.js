@@ -1,5 +1,7 @@
 // //function testSplitNameColumn() {
-//   const ss = SpreadsheetApp.openById("1NtbEGwKM7-Xp34i4mmcpg3YXxstt8iIthNJbzMSe7zE");
+//   const ss = SpreadsheetApp.openById(
+//     PropertiesService.getScriptProperties().getProperty("TEST_SPREADSHEET_ID")
+//   );
 //   const sheet = ss.getSheetByName("Sheet1");
 
 //   splitNameColumn(
