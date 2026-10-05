@@ -153,7 +153,7 @@ function geminiParsePDFUndefined(blob){
     }]
   };
 
-  return UrlFetchApp.fetch(url, {
+  return trackedFetch("Gemini", url, {
     method: "post",
     contentType: "application/json",
     payload: JSON.stringify(payload),
