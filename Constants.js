@@ -14,6 +14,27 @@ const STANDARDIZED_HEADERS =
 "Radio Station", "Track Name", "Music Genre", "Rating", "Comments",
 "State", "Country", "Region"];
 
+// Source column names recognized by the data consolidator. Keys must match
+// STANDARDIZED_HEADERS. Add new, verified source headers here as needed.
+const HEADER_ALIASES = {
+  "First Name": ["first", "fname", "given name"],
+  "Last Name": ["last", "lname", "surname", "family name"],
+  "Email Address": ["email", "e-mail", "e mail", "mail"],
+  "Phone Number": ["phone", "phone #", "telephone", "mobile"],
+  "Social Media Account": ["social", "social media", "social handle"],
+  "Radio Station": ["radio stations", "station", "station name"],
+  "Track Name": ["track", "track title", "song", "song title"],
+  "Music Genre": ["genre"],
+  "Rating": [],
+  "Comments": ["comment", "feedback"],
+  "State": [],
+  "Country": [],
+  "Region": []
+};
+
+// A combined name is split only when both name fields are requested.
+const COMBINED_NAME_ALIASES = ["name", "full name", "contact name"];
+
 const SPREADSHEET_DATA_EXTRACTION =
   PropertiesService.getScriptProperties()
     .getProperty("SPREADSHEET_DATA_EXTRACTION");
