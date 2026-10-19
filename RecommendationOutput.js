@@ -20,9 +20,10 @@ const RECOMMENDATION_OUTPUT_HEADERS = [
 ];
 
 /**
- * This function writes the recommendations to the output sheet.
- * Rank are currently left blank for the sorting task that follows.
+ * Writes recommendations to the output sheet.
+ * Sorts recommendations by score in descending order and assigns sequential ranks before writing to the sheet.
  */
+
 function writeRecommendationOutput(recommendations) {
   if (!Array.isArray(recommendations)) {
     throw new Error("Recommendations must be provided as an array.");
@@ -104,6 +105,27 @@ function writeRecommendationOutput(recommendations) {
     ];
   });
 
+
+  //Sort Recommendations by Relevance 
+  //Find the Recommendation Score and Rank columns.
+  const scoreIndex = RECOMMENDATION_OUTPUT_HEADERS.indexOf("Recommendation Score");
+  const rankIndex = RECOMMENDATION_OUTPUT_HEADERS.indexOf("Rank");
+
+  //Verify the required columns exist.
+  if (scoreIndex === -1 || rankIndex === -1) {
+    throw new Error("Recommendation Score or Rank column is missing.");
+  }
+
+  //Sort entire rows by score, highest first.
+  rows.sort((a, b) => b[scoreIndex] - a[scoreIndex]);
+
+  // ssign ranks after sorting.
+  rows.forEach((row, index) => {
+    row[rankIndex] = index + 1;
+  });
+
+
+  
   const spreadsheet = SpreadsheetApp.openById(SPREADSHEET_DATA_EXTRACTION);
   let sheet = spreadsheet.getSheetByName(RECOMMENDATION_OUTPUT_SHEET);
 
