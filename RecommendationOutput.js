@@ -35,27 +35,34 @@ function writeRecommendationOutput(recommendations) {
   }
 
   const rows = recommendations.map((item, index) => {
-    const artist = item.primaryArtist || item.featuredArtist || "";
-    const score = Number(item.recommendationScore);
+  const artist = String(item.primaryArtist || "").trim();
+  const track = String(item.trackName || "").trim();
+
+
+  const rawScore = item.recommendationScore;
+  let score = NaN;
+
+  if (typeof rawScore === "number") {
+    score = rawScore;
+  } else if (
+    typeof rawScore === "string" &&
+    rawScore.trim() !== ""
+  ) {
+    score = Number(rawScore);
+  }
     const confidence = String(item.confidenceLevel || "").trim();
     const reason = String(item.recommendationReason || "").trim();
     const station = String(item.radioStation || "").trim();
     const genre = String(item.primaryGenre || "").trim();
     const sources = String(item.sources || "").trim();
 
-    if (!artist || !item.trackName || !genre || !station || !reason) {
+    if (!artist || !track || !genre || !station || !reason) {
       throw new Error(
         `Recommendation ${index + 1} is missing a required output field.`
       );
     }
 
-    if (
-      item.recommendationScore === "" ||
-      item.recommendationScore === null ||
-      !Number.isFinite(score) ||
-      score < 0 ||
-      score > 100
-    ) {
+    if (!Number.isFinite(score) || score < 0 || score > 100) {
       throw new Error(
         `Recommendation ${index + 1} must have a score from 0 to 100.`
       );
@@ -87,7 +94,7 @@ function writeRecommendationOutput(recommendations) {
     return [
       "", // Rank is assigned by the sorting.
       artist,
-      item.trackName,
+      track,
       item.isrc || "",
       genre,
       station,
@@ -112,18 +119,47 @@ function writeRecommendationOutput(recommendations) {
   }
 
   // Refreshes this dedicated output tab only.
-  sheet.clearContents();
-  sheet
-    .getRange(1, 1, 1, RECOMMENDATION_OUTPUT_HEADERS.length)
-    .setValues([RECOMMENDATION_OUTPUT_HEADERS])
-    .setFontWeight("bold");
+  const previousLastRow = sheet.getLastRow();
+  const columnCount = RECOMMENDATION_OUTPUT_HEADERS.length;
 
-  if (rows.length > 0) {
-    sheet
-      .getRange(2, 1, rows.length, RECOMMENDATION_OUTPUT_HEADERS.length)
-      .setValues(rows);
+  // Combine the headers and recommendation rows for one write.
+  const output = [RECOMMENDATION_OUTPUT_HEADERS, ...rows];
+
+
+  if (output.length > sheet.getMaxRows()) {
+    sheet.insertRowsAfter(
+      sheet.getMaxRows(),
+      output.length - sheet.getMaxRows()
+    );
   }
 
+  if (columnCount > sheet.getMaxColumns()) {
+    sheet.insertColumnsAfter(
+      sheet.getMaxColumns(),
+      columnCount - sheet.getMaxColumns()
+    );
+  }
+
+  sheet
+    .getRange(1, 1, output.length, columnCount)
+    .setValues(output);
+
+  // Clear leftover rows when the new output is shorter.
+  if (previousLastRow > output.length) {
+    sheet
+      .getRange(
+        output.length + 1,
+        1,
+        previousLastRow - output.length,
+        columnCount
+      )
+      .clearContent();
+  }
+
+  sheet
+    .getRange(1, 1, 1, columnCount)
+    .setFontWeight("bold");
+
   sheet.setFrozenRows(1);
-  sheet.autoResizeColumns(1, RECOMMENDATION_OUTPUT_HEADERS.length);
+  sheet.autoResizeColumns(1, columnCount);
 }
