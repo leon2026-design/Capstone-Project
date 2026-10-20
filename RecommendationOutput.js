@@ -118,48 +118,19 @@ function writeRecommendationOutput(recommendations) {
     sheet = spreadsheet.insertSheet(RECOMMENDATION_OUTPUT_SHEET);
   }
 
-  // Refreshes this dedicated output tab only.
-  const previousLastRow = sheet.getLastRow();
-  const columnCount = RECOMMENDATION_OUTPUT_HEADERS.length;
-
-  // Combine the headers and recommendation rows for one write.
-  const output = [RECOMMENDATION_OUTPUT_HEADERS, ...rows];
-
-
-  if (output.length > sheet.getMaxRows()) {
-    sheet.insertRowsAfter(
-      sheet.getMaxRows(),
-      output.length - sheet.getMaxRows()
-    );
-  }
-
-  if (columnCount > sheet.getMaxColumns()) {
-    sheet.insertColumnsAfter(
-      sheet.getMaxColumns(),
-      columnCount - sheet.getMaxColumns()
-    );
-  }
-
+// Refreshes this dedicated output tab only.
+  sheet.clearContents();
   sheet
-    .getRange(1, 1, output.length, columnCount)
-    .setValues(output);
-
-  // Clear leftover rows when the new output is shorter.
-  if (previousLastRow > output.length) {
-    sheet
-      .getRange(
-        output.length + 1,
-        1,
-        previousLastRow - output.length,
-        columnCount
-      )
-      .clearContent();
-  }
-
-  sheet
-    .getRange(1, 1, 1, columnCount)
+    .getRange(1, 1, 1, RECOMMENDATION_OUTPUT_HEADERS.length)
+    .setValues([RECOMMENDATION_OUTPUT_HEADERS])
     .setFontWeight("bold");
 
+  if (rows.length > 0) {
+    sheet
+      .getRange(2, 1, rows.length, RECOMMENDATION_OUTPUT_HEADERS.length)
+      .setValues(rows);
+  }
+
   sheet.setFrozenRows(1);
-  sheet.autoResizeColumns(1, columnCount);
+  sheet.autoResizeColumns(1, RECOMMENDATION_OUTPUT_HEADERS.length);
 }
