@@ -20,10 +20,9 @@ const RECOMMENDATION_OUTPUT_HEADERS = [
 ];
 
 /**
- * Writes recommendations to the output sheet.
- * Sorts recommendations by score in descending order and assigns sequential ranks before writing to the sheet.
+ * This function writes the recommendations to the output sheet.
+ * Rank are currently left blank for the sorting task that follows.
  */
-
 function writeRecommendationOutput(recommendations) {
   if (!Array.isArray(recommendations)) {
     throw new Error("Recommendations must be provided as an array.");
@@ -36,27 +35,34 @@ function writeRecommendationOutput(recommendations) {
   }
 
   const rows = recommendations.map((item, index) => {
-    const artist = item.primaryArtist || item.featuredArtist || "";
-    const score = Number(item.recommendationScore);
+  const artist = String(item.primaryArtist || "").trim();
+  const track = String(item.trackName || "").trim();
+
+
+  const rawScore = item.recommendationScore;
+  let score = NaN;
+
+  if (typeof rawScore === "number") {
+    score = rawScore;
+  } else if (
+    typeof rawScore === "string" &&
+    rawScore.trim() !== ""
+  ) {
+    score = Number(rawScore);
+  }
     const confidence = String(item.confidenceLevel || "").trim();
     const reason = String(item.recommendationReason || "").trim();
     const station = String(item.radioStation || "").trim();
     const genre = String(item.primaryGenre || "").trim();
     const sources = String(item.sources || "").trim();
 
-    if (!artist || !item.trackName || !genre || !station || !reason) {
+    if (!artist || !track || !genre || !station || !reason) {
       throw new Error(
         `Recommendation ${index + 1} is missing a required output field.`
       );
     }
 
-    if (
-      item.recommendationScore === "" ||
-      item.recommendationScore === null ||
-      !Number.isFinite(score) ||
-      score < 0 ||
-      score > 100
-    ) {
+    if (!Number.isFinite(score) || score < 0 || score > 100) {
       throw new Error(
         `Recommendation ${index + 1} must have a score from 0 to 100.`
       );
@@ -88,7 +94,7 @@ function writeRecommendationOutput(recommendations) {
     return [
       "", // Rank is assigned by the sorting.
       artist,
-      item.trackName,
+      track,
       item.isrc || "",
       genre,
       station,
@@ -104,27 +110,26 @@ function writeRecommendationOutput(recommendations) {
       sources
     ];
   });
-
-
-  //Sort Recommendations by Relevance 
-  //Find the Recommendation Score and Rank columns.
-  const scoreIndex = RECOMMENDATION_OUTPUT_HEADERS.indexOf("Recommendation Score");
+  
+    // Find the score and rank columns.
+  const scoreIndex = RECOMMENDATION_OUTPUT_HEADERS.indexOf(
+    "Recommendation Score"
+  );
   const rankIndex = RECOMMENDATION_OUTPUT_HEADERS.indexOf("Rank");
 
-  //Verify the required columns exist.
   if (scoreIndex === -1 || rankIndex === -1) {
-    throw new Error("Recommendation Score or Rank column is missing.");
+    throw new Error(
+      "Recommendation Score or Rank column is missing."
+    );
   }
 
-  //Sort entire rows by score, highest first.
+  // Sort entire rows by score, highest first.
   rows.sort((a, b) => b[scoreIndex] - a[scoreIndex]);
 
-  // ssign ranks after sorting.
+  // Assign sequential ranks.
   rows.forEach((row, index) => {
     row[rankIndex] = index + 1;
   });
-
-
   
   const spreadsheet = SpreadsheetApp.openById(SPREADSHEET_DATA_EXTRACTION);
   let sheet = spreadsheet.getSheetByName(RECOMMENDATION_OUTPUT_SHEET);
@@ -133,7 +138,7 @@ function writeRecommendationOutput(recommendations) {
     sheet = spreadsheet.insertSheet(RECOMMENDATION_OUTPUT_SHEET);
   }
 
-  // Refreshes this dedicated output tab only.
+// Refreshes this dedicated output tab only.
   sheet.clearContents();
   sheet
     .getRange(1, 1, 1, RECOMMENDATION_OUTPUT_HEADERS.length)
