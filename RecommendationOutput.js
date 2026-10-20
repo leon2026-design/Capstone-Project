@@ -110,7 +110,27 @@ function writeRecommendationOutput(recommendations) {
       sources
     ];
   });
+  
+    // Find the score and rank columns.
+  const scoreIndex = RECOMMENDATION_OUTPUT_HEADERS.indexOf(
+    "Recommendation Score"
+  );
+  const rankIndex = RECOMMENDATION_OUTPUT_HEADERS.indexOf("Rank");
 
+  if (scoreIndex === -1 || rankIndex === -1) {
+    throw new Error(
+      "Recommendation Score or Rank column is missing."
+    );
+  }
+
+  // Sort entire rows by score, highest first.
+  rows.sort((a, b) => b[scoreIndex] - a[scoreIndex]);
+
+  // Assign sequential ranks.
+  rows.forEach((row, index) => {
+    row[rankIndex] = index + 1;
+  });
+  
   const spreadsheet = SpreadsheetApp.openById(SPREADSHEET_DATA_EXTRACTION);
   let sheet = spreadsheet.getSheetByName(RECOMMENDATION_OUTPUT_SHEET);
 
