@@ -1,768 +1,477 @@
 /**
- * Runs recommendation-writer tests using the Phase 1 workbook.
- * Automatically fills Actual Result and Status in Test Cases.
+ * Reads every test from the Output Tests tab.
+ * Runs the actual recommendation output function.
+ * Writes Actual Result and Status beside each test.
  *
  * Uses the existing SPREADSHEET_DATA_EXTRACTION setting.
- * Replaces Station_Recommendations in that test spreadsheet.
+ * Replaces Station_Recommendations during testing.
+ * Does not call Gemini or MusicBrainz.
  */
 function runRecommendationDatasetTest() {
-    const ss = SpreadsheetApp.openById(
-      SPREADSHEET_DATA_EXTRACTION
+  const ss = SpreadsheetApp.openById(
+    SPREADSHEET_DATA_EXTRACTION
+  );
+
+  const sheet = ss.getSheetByName("Output Tests");
+
+  if (!sheet) {
+    throw new Error(
+      "Missing Output Tests tab. Import the new workbook first."
     );
-  
-    const caseSheet = ss.getSheetByName("Test Cases");
-  
-    if (!caseSheet) {
-      throw new Error("Missing Test Cases tab.");
+  }
+
+  const data = sheet.getDataRange().getValues();
+
+  const headers = data[0].map(value =>
+    String(value).trim()
+  );
+
+  // Accept either the renamed header or the original header.
+  const errorHeader = headers.includes("Expected Error Message")
+    ? "Expected Error Message"
+    : "Expected Error Contains";
+
+  // Match spreadsheet columns to the writer's input properties.
+  const fieldMap = {
+    "Primary Artist": "primaryArtist",
+    "Track Name": "trackName",
+    "ISRC": "isrc",
+    "Primary Genre": "primaryGenre",
+    "Radio Station": "radioStation",
+    "Station Format": "stationFormat",
+    "Market": "market",
+    "Recommendation Score": "recommendationScore",
+    "Recommendation Reason": "recommendationReason",
+    "Confidence Level": "confidenceLevel",
+    "Review Notes": "reviewNotes",
+    "Program Director": "programDirector",
+    "Contact Info": "contactInfo",
+    "Sources": "sources",
+    "Featured Artist (test only)": "featuredArtist"
+  };
+
+  // Confirm all columns required by the runner are present.
+  const required = [
+    "Test ID",
+    "What It Tests",
+    "Expected Outcome",
+    "Actual Result",
+    "Status",
+    "Input Mode",
+    "Expected Rank",
+    "Expected Score",
+    "Expected Level",
+    errorHeader
+  ].concat(Object.keys(fieldMap));
+
+  required.forEach(name => {
+    if (headers.indexOf(name) === -1) {
+      throw new Error("Missing column: " + name);
     }
-  
-    // Locate the case table and its result columns.
-    const caseValues = caseSheet.getDataRange().getValues();
-  
-    const headerIndex = caseValues.findIndex(
-      row => row[0] === "Case ID"
+  });
+
+  const actualIndex = headers.indexOf("Actual Result");
+
+  if (headers.indexOf("Status") !== actualIndex + 1) {
+    throw new Error(
+      "Keep Status immediately after Actual Result."
     );
-  
-    if (headerIndex === -1) {
-      throw new Error("Missing Case ID header.");
+  }
+
+  // Group rows sharing a Test ID into one test.
+  const groups = new Map();
+  let lastTestRow = 1;
+
+  data.slice(1).forEach((values, index) => {
+    const record = {};
+
+    headers.forEach((header, col) => {
+      record[header] = values[col];
+    });
+
+    const id = String(record["Test ID"] || "").trim();
+
+    // Ignore notes and other rows that are not test records.
+    if (!/^OUT\d+$/.test(id)) {
+      return;
     }
-  
-    const caseHeaders = caseValues[headerIndex];
-  
-    const actualColumn =
-      caseHeaders.indexOf("Actual Result") + 1;
-  
-    const statusColumn =
-      caseHeaders.indexOf("Status") + 1;
-  
-    if (!actualColumn || !statusColumn) {
+
+    const input = {};
+
+    Object.keys(fieldMap).forEach(header => {
+      input[fieldMap[header]] = record[header];
+    });
+
+    const entry = {
+      record: record,
+      input: input,
+      sheetRow: index + 2
+    };
+
+    if (!groups.has(id)) {
+      groups.set(id, []);
+    }
+
+    groups.get(id).push(entry);
+    lastTestRow = index + 2;
+  });
+
+  if (!groups.size) {
+    throw new Error("No OUT test IDs were found.");
+  }
+
+  // Reset previous results before running the tests.
+  const results = Array.from(
+    { length: lastTestRow - 1 },
+    () => ["", "Not run"]
+  );
+
+  sheet
+    .getRange(2, actualIndex + 1, results.length, 2)
+    .setValues(results);
+
+  SpreadsheetApp.flush();
+
+  // These are the headers expected from the production writer.
+  const outputHeaders = [
+    "Rank",
+    "Primary Artist",
+    "Track Name",
+    "ISRC",
+    "Primary Genre",
+    "Radio Station",
+    "Station Format",
+    "Market",
+    "Recommendation Score",
+    "Recommendation Level",
+    "Recommendation Reason",
+    "Confidence Level",
+    "Review Notes",
+    "Program Director",
+    "Contact Info",
+    "Sources"
+  ];
+
+  const trim = value =>
+    String(value || "").trim();
+
+  // Fail the test if actual values differ from expected values.
+  function check(actual, expected, message) {
+    if (
+      JSON.stringify(actual) !== JSON.stringify(expected)
+    ) {
       throw new Error(
-        "Test Cases needs Actual Result and Status columns."
+        message +
+        "; expected " +
+        JSON.stringify(expected) +
+        ", got " +
+        JSON.stringify(actual)
       );
     }
-  
-    // Find the spreadsheet row belonging to each case ID.
-    const caseRows = [];
-  
-    for (
-      let i = headerIndex + 1;
-      i < caseValues.length;
-      i++
-    ) {
-      if (/^C\d+$/.test(String(caseValues[i][0]))) {
-        caseRows.push({
-          id: String(caseValues[i][0]),
-          row: i + 1
-        });
-      }
-    }
-  
-    // Write a result into the matching test-case row.
-    function recordResult(entry, status, message) {
-      caseSheet
-        .getRange(entry.row, actualColumn)
-        .setValue(message);
-  
-      caseSheet
-        .getRange(entry.row, statusColumn)
-        .setValue(status);
-    }
-  
-    // Clear previous results so old passes are not reused.
-    caseRows.forEach(entry => {
-      recordResult(
-        entry,
-        "Not run",
-        "Not executed in this run."
-      );
-    });
-  
+  }
+
+  // Read the output currently in the spreadsheet.
+  function readOutput() {
     SpreadsheetApp.flush();
-  
-    // Read the dataset's existing tables.
-    const tracks = readPhase1Table_(ss, "Tracks", 1);
-  
-    const stations = readPhase1Table_(
-      ss,
-      "Stations",
-      1
+
+    const output = ss.getSheetByName(
+      RECOMMENDATION_OUTPUT_SHEET
     );
-  
-    // Score Fixtures has its headers on row 5.
-    const fixtures = readPhase1Table_(
-      ss,
-      "Score Fixtures",
-      5
-    );
-  
-    /**
-     * Build one recommendation from selected dataset records.
-     * Scores come from fixtures; this does not calculate relevance.
-     */
-    function makeRecommendation(
-      trackId,
-      stationId,
-      fixtureId
+
+    return output
+      ? output.getDataRange().getValues()
+      : [];
+  }
+
+  // Build one expected output row from its visible test record.
+  function expectedRow(entry) {
+    const record = entry.record;
+    const input = entry.input;
+
+    if (
+      typeof record["Expected Rank"] !== "number" ||
+      typeof record["Expected Score"] !== "number"
     ) {
-      const track = findPhase1Record_(
-        tracks,
-        "Track ID",
-        trackId
-      );
-  
-      const station = findPhase1Record_(
-        stations,
-        "Station ID",
-        stationId
-      );
-  
-      const fixture = findPhase1Record_(
-        fixtures,
-        "Fixture ID",
-        fixtureId
-      );
-  
-      const score = fixture["Expected Score"];
-  
-      if (
-        typeof score !== "number" ||
-        !Number.isFinite(score)
-      ) {
-        throw new Error(
-          "Missing numeric test score for " + fixtureId
-        );
-      }
-  
-      return {
-        primaryArtist: track["Primary Artist"],
-        trackName: track["Track Name"],
-        isrc: "",
-        primaryGenre: track["Primary Genre"],
-        radioStation: station["Radio Station"],
-        stationFormat: station["Station Format"],
-  
-        market: [
-          station["Market City"],
-          station["Market State / Region"],
-          station["Market Country"]
-        ]
-          .filter(value => value !== "")
-          .join(", "),
-  
-        recommendationScore: score,
-  
-        recommendationReason:
-          "Synthetic output test using " + fixtureId,
-  
-        confidenceLevel: "High",
-  
-        reviewNotes:
-          "Fixture score supplied manually; not generated analysis.",
-  
-        programDirector: station["Program Director"],
-        contactInfo: station["Contact Info"],
-        sources: station["Sources"]
-      };
-    }
-  
-    // Create three recommendations in deliberately unsorted order.
-    function baseline() {
-      return [
-        makeRecommendation("T01", "S01", "F06"),
-        makeRecommendation("T01", "S08", "F07"),
-        makeRecommendation("T01", "S03", "F02")
-      ];
-    }
-  
-    // Read the actual output written to the spreadsheet.
-    function readOutput() {
-      SpreadsheetApp.flush();
-  
-      const sheet = ss.getSheetByName(
-        RECOMMENDATION_OUTPUT_SHEET
-      );
-  
-      return sheet
-        ? sheet.getDataRange().getValues()
-        : [];
-    }
-  
-    // Call the real writer, then read its output.
-    function writeAndRead(items) {
-      writeRecommendationOutput(items);
-      return readOutput();
-    }
-  
-    // Fail a test when actual values differ from expected values.
-    function equal(actual, expected, message) {
-      if (
-        JSON.stringify(actual) !==
-        JSON.stringify(expected)
-      ) {
-        throw new Error(
-          message +
-          "; expected " +
-          JSON.stringify(expected) +
-          ", got " +
-          JSON.stringify(actual)
-        );
-      }
-    }
-  
-    /**
-     * Verify that invalid input is rejected with the expected error
-     * and does not change the existing output.
-     */
-    function rejects(items, expectedMessage) {
-      const before = readOutput();
-      let rejected = false;
-  
-      try {
-        writeRecommendationOutput(items);
-      } catch (error) {
-        if (
-          !expectedMessage.test(String(error.message))
-        ) {
-          throw error;
-        }
-  
-        rejected = true;
-      }
-  
-      if (!rejected) {
-        throw new Error(
-          "Invalid recommendation was accepted."
-        );
-      }
-  
-      equal(
-        readOutput(),
-        before,
-        "Validation changed existing output"
+      throw new Error(
+        "Expected Rank and Expected Score must be numeric " +
+        "for accepted records."
       );
     }
-  
-    // Each function returns the Actual Result text if it passes.
-    const tests = {
-      C16: function() {
-        const values = writeAndRead(baseline());
-  
-        equal(
-          values[0],
-          RECOMMENDATION_OUTPUT_HEADERS,
-          "Incorrect headers"
-        );
-  
-        const actual = values.slice(1).map(row => [
-          row[0],  // Rank
-          row[5],  // Station
-          row[8],  // Score
-          row[9],  // Level
-          row[14], // Contact
-          row[15]  // Source
-        ]);
-  
-        const expected = [
-          [
-            1,
-            "TEST Country Three",
-            80,
-            "Strong Match",
-            "pd03@example.com",
-            "Synthetic station directory S03"
-          ],
-          [
-            2,
-            "TEST Country One",
-            77.5,
-            "Good Match",
-            "pd01@example.com",
-            "Synthetic station directory S01"
-          ],
-          [
-            3,
-            "TEST Country Eight",
-            77.5,
-            "Good Match",
-            "pd08@example.com",
-            "Synthetic station directory S08"
-          ]
-        ];
-  
-        equal(
-          actual,
-          expected,
-          "Sorting, ranks, levels or station details differ"
-        );
-  
-        return (
-          "S03,S01,S08; scores 80,77.5,77.5; ranks 1,2,3. " +
-          "Headers, levels, contacts and sources match."
-        );
-      },
-  
-      C10: function() {
-        rejects(
-          [
-            makeRecommendation(
-              "T04",
-              "S01",
-              "F06"
-            )
-          ],
-          /required output field/
-        );
-  
-        return (
-          "Writer rejected missing primary genre and preserved " +
-          "previous output. Recommendation-generation " +
-          "validation was not tested."
-        );
-      },
-  
-      C11: function() {
-        rejects(
-          [
-            makeRecommendation(
-              "T06",
-              "S01",
-              "F06"
-            )
-          ],
-          /required output field/
-        );
-  
-        rejects(
-          [
-            makeRecommendation(
-              "T07",
-              "S01",
-              "F06"
-            )
-          ],
-          /required output field/
-        );
-  
-        return (
-          "Writer rejected missing artist and missing track; " +
-          "previous output was unchanged."
-        );
-      },
-  
-      C17: function() {
-        const item = makeRecommendation(
-          "T01",
-          "S01",
-          "F06"
-        );
-  
-        item.primaryArtist = "  Avery Stone  ";
-        item.trackName = "  Neon Skies  ";
-  
-        const values = writeAndRead([item]);
-  
-        equal(
-          values.length,
-          2,
-          "Old recommendation rows remain"
-        );
-  
-        equal(
-          [values[1][1], values[1][2]],
-          ["Avery Stone", "Neon Skies"],
-          "Names were not trimmed"
-        );
-  
-        equal(
-          values[0],
-          RECOMMENDATION_OUTPUT_HEADERS,
-          "Headers changed"
-        );
-  
-        return (
-          "Artist and track trimmed correctly; one output row " +
-          "remains with unchanged headers."
-        );
-      },
-  
-      C18: function() {
-        const invalidScores = [
-          "   ",
-          false,
-          null,
-          undefined,
-          "abc",
-          -1,
-          101
-        ];
-  
-        invalidScores.forEach(score => {
-          const item = makeRecommendation(
-            "T01",
-            "S01",
-            "F06"
-          );
-  
-          item.recommendationScore = score;
-  
-          rejects(
-            [item],
-            /score from 0 to 100/
-          );
-        });
-  
-        // Numeric strings should be converted to numbers.
-        const numericString = makeRecommendation(
-          "T01",
-          "S01",
-          "F06"
-        );
-  
-        numericString.recommendationScore = "77.5";
-  
-        equal(
-          writeAndRead([numericString])[1][8],
-          77.5,
-          "Numeric string was not converted"
-        );
-  
-        // Zero is a valid score.
-        const zero = makeRecommendation(
-          "T01",
-          "S01",
-          "F05"
-        );
-  
-        const zeroRow = writeAndRead([zero])[1];
-  
-        equal(
-          [zeroRow[8], zeroRow[9]],
-          [0, "Weak Match"],
-          "Valid zero was not handled correctly"
-        );
-  
-        return (
-          "Blank, boolean, null, undefined, nonnumeric and " +
-          "out-of-range scores rejected without changing output. " +
-          "Numeric string and zero accepted."
-        );
-      },
-  
-      C19: function() {
-        const missingReason = makeRecommendation(
-          "T01",
-          "S01",
-          "F06"
-        );
-  
-        missingReason.recommendationReason = "   ";
-  
-        rejects(
-          [missingReason],
-          /required output field/
-        );
-  
-        const invalidConfidence = makeRecommendation(
-          "T01",
-          "S01",
-          "F06"
-        );
-  
-        invalidConfidence.confidenceLevel = "Certain";
-  
-        rejects(
-          [invalidConfidence],
-          /High, Medium, or Low confidence/
-        );
-  
-        return (
-          "Blank reason and invalid confidence rejected; " +
-          "previous output unchanged."
-        );
-      },
-  
-      C20: function() {
-        const item = makeRecommendation(
-          "T01",
-          "S01",
-          "F06"
-        );
-  
-        item.sources = "";
-  
-        rejects(
-          [item],
-          /source when contact details are included/
-        );
-  
-        return (
-          "Contact details without a source rejected; " +
-          "previous output unchanged."
-        );
-      },
-  
-      C21: function() {
-        const item = makeRecommendation(
-          "T01",
-          "S02",
-          "F06"
-        );
-  
-        item.confidenceLevel = "Medium";
-  
-        const row = writeAndRead([item])[1];
-  
-        equal(
-          [row[13], row[14], row[11]],
-          ["", "", "Medium"],
-          "Optional contact cells or confidence are incorrect"
-        );
-  
-        return (
-          "Missing optional contacts accepted; contact cells blank " +
-          "and Medium confidence retained. Score supplied by F06."
-        );
-      },
-  
-      C22: function() {
-        writeAndRead(baseline());
-  
-        equal(
-          writeAndRead([]),
-          [RECOMMENDATION_OUTPUT_HEADERS],
-          "Empty input did not leave only headers"
-        );
-  
-        return (
-          "Empty array removed old recommendation rows " +
-          "and retained headers."
-        );
-      },
-  
-      C26: function() {
-        const item = makeRecommendation(
-          "T01",
-          "S01",
-          "F06"
-        );
-  
-        item.primaryArtist = "";
-        item.featuredArtist = "Guest Artist";
-  
-        rejects(
-          [item],
-          /required output field/
-        );
-  
-        return (
-          "Featured artist did not substitute for missing primary " +
-          "artist; previous output unchanged."
-        );
-      }
-    };
-  
-    // These cases need a defined rule before they can be evaluated.
-    const decisions = {
-      C12:
-        "Missing-location scoring needs an agreed missing-factor " +
-        "rule and the analysis function.",
-  
-      C13:
-        "Unknown station-format treatment needs an agreed rule " +
-        "and the analysis function.",
-  
-      C15:
-        "Define missing-factor scoring before calculating an " +
-        "expected numeric score.",
-  
-      C24:
-        "Decide whether production calls are per track or " +
-        "rankings reset per track."
-    };
-  
-    // Explain why unsupported cases are not being run.
-    caseRows.forEach(entry => {
-      if (decisions[entry.id]) {
-        recordResult(
-          entry,
-          "Needs decision",
-          decisions[entry.id]
-        );
-  
-      } else if (!tests[entry.id]) {
-        let reason =
-          "Not automated: recommendation matching/scoring " +
-          "function is not connected to this runner.";
-  
-        if (entry.id === "C23") {
-          reason =
-            "Not automated: full workflow integration requires a " +
-            "separate test; this runner calls only the output writer.";
-        }
-  
-        if (entry.id === "C27") {
-          reason =
-            "Not automated: simulate write failure in the local " +
-            "mock tests. Current writer clears existing data " +
-            "before writing.";
-        }
-  
-        recordResult(
-          entry,
-          "Not run",
-          reason
-        );
-      }
-    });
-  
-    let passed = 0;
-    let failed = 0;
-  
-    // Start with the main sorting test.
-    const orderedIds = [
-      "C16",
-      "C10",
-      "C11",
-      "C17",
-      "C18",
-      "C19",
-      "C20",
-      "C21",
-      "C22",
-      "C26"
+
+    return [
+      record["Expected Rank"],
+      trim(input.primaryArtist),
+      trim(input.trackName),
+      input.isrc || "",
+      trim(input.primaryGenre),
+      trim(input.radioStation),
+      input.stationFormat || "",
+      input.market || "",
+      record["Expected Score"],
+      record["Expected Level"],
+      trim(input.recommendationReason),
+      trim(input.confidenceLevel),
+      input.reviewNotes || "",
+      input.programDirector || "",
+      input.contactInfo || "",
+      trim(input.sources)
     ];
-  
-    // Run every supported case and record Pass or Fail.
-    orderedIds.forEach(id => {
-      const entry = caseRows.find(
-        row => row.id === id
-      );
-  
-      if (!entry) {
-        throw new Error(
-          "Missing test case row: " + id
-        );
-      }
-  
-      try {
-        const message = tests[id]();
-  
-        recordResult(
-          entry,
-          "Pass",
-          message
-        );
-  
-        passed++;
-  
-        console.log(
-          "PASS " + id + ": " + message
-        );
-  
-      } catch (error) {
-        recordResult(
-          entry,
-          "Fail",
-          String(error.message)
-        );
-  
-        failed++;
-  
-        console.log(
-          "FAIL " + id + ": " + error.message
-        );
-      }
-    });
-  
-    // Leave the three baseline recommendations visible afterward.
+  }
+
+  // Find a valid test group to use as previous output.
+  // Rejection tests must preserve these existing records.
+  const baseline = Array.from(groups.values()).find(
+    entries =>
+      entries[0].record["Expected Outcome"] === "Accept" &&
+      entries[0].record["Input Mode"] === "Rows"
+  );
+
+  if (!baseline) {
+    throw new Error(
+      "Keep at least one accepted Rows test as the baseline."
+    );
+  }
+
+  const baselineInput = baseline.map(
+    entry => entry.input
+  );
+
+  let passed = 0;
+  let failed = 0;
+
+  // Run each test group.
+  groups.forEach((entries, id) => {
+    let status = "Pass";
+    let message;
+
     try {
-      writeAndRead(baseline());
-  
-    } catch (error) {
-      console.log(
-        "Could not restore sample output: " +
-        error.message
-      );
-  
-      throw error;
-    }
-  
-    SpreadsheetApp.flush();
-  
-    console.log(
-      "Finished: " +
-      passed +
-      " passed; " +
-      failed +
-      " failed."
-    );
-  
-    console.log(
-      "See Test Cases for Actual Result and Status. " +
-      "Other cases were not passed automatically."
-    );
-  
-    // Make the execution show a failure if any automated test failed.
-    if (failed) {
-      throw new Error(
-        failed +
-        " automated writer test(s) failed. See Test Cases."
-      );
-    }
-  }
-  
-  /**
-   * Converts spreadsheet rows into objects using the header names.
-   */
-  function readPhase1Table_(ss, tabName, headerRow) {
-    const sheet = ss.getSheetByName(tabName);
-  
-    if (!sheet) {
-      throw new Error(
-        "Missing dataset tab: " + tabName
-      );
-    }
-  
-    const values = sheet.getDataRange().getValues();
-  
-    if (values.length < headerRow) {
-      throw new Error(
-        "Missing header row in " + tabName
-      );
-    }
-  
-    const headers = values[headerRow - 1].map(
-      value => String(value).trim()
-    );
-  
-    return values.slice(headerRow)
-      .filter(row => row[0] !== "")
-      .map(row => {
-        const record = {};
-  
-        headers.forEach((header, index) => {
-          if (header) {
-            record[header] = row[index];
-          }
-        });
-  
-        return record;
+      const first = entries[0].record;
+      const mode = first["Input Mode"];
+      const outcome = first["Expected Outcome"];
+
+      // Rows within one group must use the same test settings.
+      entries.forEach(entry => {
+        check(
+          entry.record["Input Mode"],
+          mode,
+          "Mixed input modes in " + id
+        );
+
+        check(
+          entry.record["Expected Outcome"],
+          outcome,
+          "Mixed expected outcomes in " + id
+        );
+
+        check(
+          entry.record[errorHeader],
+          first[errorHeader],
+          "Mixed error expectations in " + id
+        );
       });
-  }
-  
-  /**
-   * Finds one record by its track, station or fixture ID.
-   */
-  function findPhase1Record_(records, idField, id) {
-    const record = records.find(
-      row => row[idField] === id
-    );
-  
-    if (!record) {
-      throw new Error(
-        "Missing " + idField + ": " + id
-      );
+
+      const allowedModes = [
+        "Rows",
+        "Text score",
+        "Empty array",
+        "Not an array"
+      ];
+
+      if (!allowedModes.includes(mode)) {
+        throw new Error(
+          "Unknown Input Mode: " + mode
+        );
+      }
+
+      if (!["Accept", "Reject"].includes(outcome)) {
+        throw new Error(
+          "Unknown Expected Outcome: " + outcome
+        );
+      }
+
+      // Ensure the numeric-string test really receives text.
+      if (
+        mode === "Text score" &&
+        entries.some(
+          entry =>
+            typeof entry.input.recommendationScore !== "string"
+        )
+      ) {
+        throw new Error(
+          "Setup error: format the Recommendation Score cell " +
+          "as plain text and enter 77.5 again."
+        );
+      }
+
+      // Build the argument described by Input Mode.
+      let input;
+
+      if (mode === "Empty array") {
+        input = [];
+
+      } else if (mode === "Not an array") {
+        input = null;
+
+      } else {
+        input = entries.map(entry => entry.input);
+      }
+
+      // Start each case with known previous output.
+      writeRecommendationOutput(baselineInput);
+
+      const before = readOutput();
+      let writerError = null;
+
+      // Call the actual production function.
+      try {
+        writeRecommendationOutput(input);
+
+      } catch (error) {
+        writerError = error;
+      }
+
+      if (outcome === "Reject") {
+        // A rejection case passes only with the expected error.
+        if (!writerError) {
+          throw new Error(
+            "Writer accepted input that should be rejected."
+          );
+        }
+
+        const expectedError = String(
+          first[errorHeader] || ""
+        );
+
+        if (
+          !expectedError ||
+          !String(writerError.message).includes(expectedError)
+        ) {
+          throw new Error(
+            "Wrong error: " + writerError.message
+          );
+        }
+
+        // Invalid input must not erase or change previous output.
+        check(
+          readOutput(),
+          before,
+          "Rejected input changed previous output"
+        );
+
+        message =
+          "Rejected: " +
+          writerError.message +
+          " Previous output unchanged.";
+
+      } else {
+        // An acceptance case must complete without an error.
+        if (writerError) {
+          throw writerError;
+        }
+
+        const expected =
+          mode === "Empty array"
+            ? []
+            : entries
+                .map(expectedRow)
+                .sort((a, b) => a[0] - b[0]);
+
+        // Check the spreadsheet's expected ranks are valid.
+        expected.forEach((row, index) => {
+          check(
+            row[0],
+            index + 1,
+            "Expected ranks must be 1,2,3..."
+          );
+        });
+
+        const actual = readOutput();
+
+        check(
+          actual[0],
+          outputHeaders,
+          "Output headers differ"
+        );
+
+        // Compare every output field, not just the score.
+        check(
+          actual.slice(1),
+          expected,
+          "Output rows differ"
+        );
+
+        const detail = actual.slice(1).map(row =>
+          row[5] +
+          "=" +
+          row[8] +
+          " (rank " +
+          row[0] +
+          ", " +
+          row[9] +
+          ")"
+        ).join("; ");
+
+        message =
+          actual.length === 1
+            ? "Accepted empty array; only headers remain."
+            : "All output fields match. " + detail;
+      }
+
+      passed++;
+
+    } catch (error) {
+      status = "Fail";
+      message = String(error.message);
+      failed++;
     }
-  
-    return record;
+
+    // All rows in the same test group receive its result.
+    entries.forEach(entry => {
+      results[entry.sheetRow - 2] = [
+        message,
+        status
+      ];
+    });
+
+    console.log(
+      status.toUpperCase() +
+      " " +
+      id +
+      ": " +
+      message
+    );
+  });
+
+  // Update only Actual Result and Status.
+  // Inputs and expected results are left unchanged.
+  sheet
+    .getRange(2, actualIndex + 1, results.length, 2)
+    .setValues(results);
+
+  sheet
+    .getRange(2, actualIndex + 1, results.length, 2)
+    .setWrap(true);
+
+  sheet.autoResizeRows(2, results.length);
+
+  SpreadsheetApp.flush();
+
+  // Leave the baseline recommendations visible after testing.
+  writeRecommendationOutput(baselineInput);
+
+  SpreadsheetApp.flush();
+
+  console.log(
+    passed +
+    " passed; " +
+    failed +
+    " failed. Results are in Output Tests."
+  );
+
+  if (failed) {
+    throw new Error(
+      failed +
+      " test group(s) failed. See Output Tests."
+    );
   }
+}
