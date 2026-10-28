@@ -54,6 +54,41 @@ function normalizeDeclarationValue(
   throw new Error(`Unsupported declaration value: ${value}`);
 }
 
+function isValidDate(value: string): boolean {
+  const match = /^(0[1-9]|1[0-2])\/(0[1-9]|[12]\d|3[01])\/(\d{4})$/.exec(
+    value
+  );
+  if (!match) {
+    return false;
+  }
+
+  const month = Number(match[1]);
+  const day = Number(match[2]);
+  const year = Number(match[3]);
+  if (year === 0) {
+    return false;
+  }
+
+  const isLeapYear =
+    year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [
+    31,
+    isLeapYear ? 29 : 28,
+    31,
+    30,
+    31,
+    30,
+    31,
+    31,
+    30,
+    31,
+    30,
+    31
+  ];
+
+  return day <= daysInMonth[month - 1];
+}
+
 async function fillTextIfPresent(
   page: Page,
   label: string,
@@ -116,13 +151,17 @@ export async function prepareMediabaseForm(
     throw new Error("Artist and title are required.");
   }
 
-  if (
-    !record.officialReleaseDate ||
-    !/^(0[1-9]|1[0-2])\/(0[1-9]|[12]\d|3[01])\/\d{4}$/.test(
-      record.officialReleaseDate
-    )
-  ) {
+  if (!record.officialReleaseDate || !isValidDate(record.officialReleaseDate)) {
     throw new Error("Official release date is required in mm/dd/yyyy format.");
+  }
+
+  if (
+    record.albumReleaseDate !== null &&
+    record.albumReleaseDate !== undefined &&
+    record.albumReleaseDate !== "" &&
+    !isValidDate(record.albumReleaseDate)
+  ) {
+    throw new Error("Album release date must be a valid mm/dd/yyyy date.");
   }
 
   if (record.isrc && !/^[A-Z]{2}[A-Z0-9]{3}[0-9]{7}$/.test(record.isrc)) {
@@ -182,7 +221,11 @@ export async function prepareMediabaseForm(
   await fillTextIfPresent(page, "Hide Until", record.hideUntil ?? null);
 
   const audioFileInput = page.locator('#audio-file');
-  await expect(audioFileInput).not.toHaveAttribute("multiple", "");
+  expect(
+    await audioFileInput.evaluate(
+      (input: HTMLInputElement) => input.multiple
+    )
+  ).toBe(false);
   if (record.audioFilePath) {
     await audioFileInput.setInputFiles(record.audioFilePath);
   }
