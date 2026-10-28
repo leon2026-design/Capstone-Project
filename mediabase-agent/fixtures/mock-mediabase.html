@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Mediabase Mock Form</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 600px;
+      margin: 40px auto;
+      padding: 20px;
+    }
+
+    label {
+      display: block;
+      margin-top: 18px;
+    }
+
+    input {
+      box-sizing: border-box;
+      width: 100%;
+      padding: 10px;
+      margin-top: 6px;
+    }
+
+    button {
+      margin-top: 24px;
+      padding: 10px 20px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Mediabase Mock Form</h1>
+  <p>Local test using fabricated song information.</p>
+
+  <form id="mediabase-form" data-submit-count="0">
+    <label for="artist">Exact Artist</label>
+    <input id="artist" name="artist" required>
+
+    <label for="title">Exact Title</label>
+    <input id="title" name="title" required>
+
+    <label for="version">Version/Mix</label>
+    <input id="version" name="version">
+
+    <label for="isrc">Track ISRC</label>
+    <input id="isrc" name="isrc">
+
+    <button id="submit" type="submit" data-click-count="0">
+      Submit
+    </button>
+  </form>
+
+  <script>
+    const form = document.getElementById("mediabase-form");
+    const submitButton = document.getElementById("submit");
+
+    submitButton.addEventListener("click", () => {
+      submitButton.dataset.clickCount =
+        String(Number(submitButton.dataset.clickCount) + 1);
+    });
+
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+
+      form.dataset.submitCount =
+        String(Number(form.dataset.submitCount) + 1);
+    });
+  </script>
+</body>
+</html>
