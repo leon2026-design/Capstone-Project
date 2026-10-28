@@ -135,10 +135,7 @@ async function fillDeclaration(
   await expect(option).toBeChecked();
 }
 
-export async function prepareMediabaseForm(
-  page: Page,
-  record: DemoRecording
-) {
+export function validateRecordForPreparation(record: DemoRecording): void {
   if (record.approvalStatus !== "APPROVED") {
     throw new Error("Recording must be approved before form preparation.");
   }
@@ -167,6 +164,30 @@ export async function prepareMediabaseForm(
   if (record.isrc && !/^[A-Z]{2}[A-Z0-9]{3}[0-9]{7}$/.test(record.isrc)) {
     throw new Error("ISRC must have a valid normalized 12-character format.");
   }
+}
+
+export function reviewAndApproveRecord(
+  record: DemoRecording,
+  reviewData: Partial<DemoRecording> = {}
+): DemoRecording {
+  const approved: DemoRecording = {
+    ...record,
+    ...reviewData,
+    approvalStatus: "APPROVED"
+  };
+
+  validateRecordForPreparation(approved);
+  return approved;
+}
+
+export const approveRecordForPreparation = reviewAndApproveRecord;
+export const ensureReadyForBrowserPreparation = validateRecordForPreparation;
+
+export async function prepareMediabaseForm(
+  page: Page,
+  record: DemoRecording
+) {
+  validateRecordForPreparation(record);
 
   await fillTextIfPresent(page, "Name", record.submitterName ?? null);
   await fillTextIfPresent(page, "Company", record.company ?? null);
