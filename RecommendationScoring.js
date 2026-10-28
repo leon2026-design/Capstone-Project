@@ -199,18 +199,46 @@ const PHASE1_FORMAT_RULES = {
       const director = p1Text(station.programDirector);
       const contact = p1Text(station.contactInfo);
       if ((director || contact) && !sources) throw new Error(name + ': contact details need Sources.');
-      // dataVerified must be set by your verification workflow/user, never guessed here.
-      const verified = station.dataVerified === true && Boolean(sources);
-      const coreComplete = Boolean(market && p1Country(station.country) && geography[0] !== null);
-      const confidence = !verified || !coreComplete ? 'Low' : missing.length ? 'Medium' : 'High';
-      const notes = [
-        'Assessed weight: ' + assessedWeight + '/100. Score = ' + weightedPoints + '/' + assessedWeight + ' × 100.',
-        missing.length ? 'Provisional score; unassessed: ' + missing.join(', ') + '.' : '',
-        !verified ? 'Current source verification has not been confirmed.' : '',
-        !coreComplete ? 'Core market/geographic information is incomplete.' : '',
-        p1Text(station.reviewNotes)
-      ].filter(Boolean).join(' ');
-  
+
+// Check whether the station has a usable source reference.
+// A URL supports review, but does not prove the information is verified.
+const hasSourceReference =
+/https?:\/\/[^\s]+/i.test(sources);
+
+// Check the information needed to support geographic matching.
+const coreComplete = Boolean(
+market &&
+p1Country(station.country) &&
+geography[0] !== null
+);
+
+// Current inputs do not establish that sources are current and verified.
+// Use Medium for complete, sourced records; otherwise use Low.
+// Missing optional scoring factors do not affect this decision.
+const confidence =
+coreComplete && hasSourceReference ? "Medium" : "Low";
+
+// Explain scoring coverage and confidence separately.
+const notes = [
+"Assessed weight: " + assessedWeight + "/100. " +
+  "Score = " + weightedPoints + "/" +
+  assessedWeight + " × 100.",
+
+missing.length
+  ? "Provisional score; unassessed: " +
+    missing.join(", ") + "."
+  : "",
+
+!hasSourceReference
+  ? "A supporting source URL is needed."
+  : "Source currency and accuracy still need verification.",
+
+!coreComplete
+  ? "Market or geographic information is incomplete."
+  : "",
+
+p1Text(station.reviewNotes)
+].filter(Boolean).join(" ");
       // Property names match your existing RecommendationOutput.js.
       recommendations.push({
         primaryArtist: p1Text(release.primaryArtist), trackName: p1Text(release.trackName),
