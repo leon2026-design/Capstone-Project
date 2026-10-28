@@ -6,26 +6,83 @@
   <style>
     body {
       font-family: Arial, sans-serif;
-      max-width: 600px;
+      max-width: 800px;
       margin: 40px auto;
       padding: 20px;
     }
 
-    label {
-      display: block;
-      margin-top: 18px;
+    form {
+      display: grid;
+      gap: 12px;
     }
 
-    input {
+    fieldset {
+      border: 1px solid #ccc;
+      border-radius: 8px;
+      padding: 16px;
+      margin-top: 12px;
+    }
+
+    legend {
+      font-weight: 600;
+      padding: 0 8px;
+    }
+
+    label {
+      display: block;
+      margin-top: 10px;
+      font-weight: 500;
+    }
+
+    input, textarea {
       box-sizing: border-box;
       width: 100%;
       padding: 10px;
       margin-top: 6px;
+      font: inherit;
+    }
+
+    textarea {
+      min-height: 100px;
+      resize: vertical;
+    }
+
+    .radio-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    .radio-row input {
+      width: auto;
+      margin: 0;
+    }
+
+    .declaration-group {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 8px;
+    }
+
+    .declaration-group label {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      margin-top: 0;
+      font-weight: normal;
+    }
+
+    .declaration-group input {
+      width: auto;
+      margin: 0;
     }
 
     button {
       margin-top: 24px;
       padding: 10px 20px;
+      width: fit-content;
     }
   </style>
 </head>
@@ -34,17 +91,111 @@
   <p>Local test using fabricated song information.</p>
 
   <form id="mediabase-form" data-submit-count="0">
-    <label for="artist">Exact Artist</label>
-    <input id="artist" name="artist" required>
+    <fieldset>
+      <legend>Submitter information</legend>
 
-    <label for="title">Exact Title</label>
-    <input id="title" name="title" required>
+      <label for="submitter-name">Name</label>
+      <input id="submitter-name" name="submitterName" required>
 
-    <label for="version">Version/Mix</label>
-    <input id="version" name="version">
+      <label for="company">Company</label>
+      <input id="company" name="company">
 
-    <label for="isrc">Track ISRC</label>
-    <input id="isrc" name="isrc">
+      <label for="phone">Phone #</label>
+      <input id="phone" name="phone" type="tel">
+
+      <label for="email">Email</label>
+      <input id="email" name="email" type="email" required>
+
+      <div class="radio-row">
+        <span>Remember Me:</span>
+        <label><input name="rememberInformation" type="radio" value="false"> No</label>
+        <label><input name="rememberInformation" type="radio" value="true"> Yes</label>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Artist and track information</legend>
+
+      <label for="artist">Exact Artist</label>
+      <input id="artist" name="artist" required>
+
+      <label for="featured-artist">Featured Artist</label>
+      <input id="featured-artist" name="featuredArtist">
+
+      <label for="title">Exact Title</label>
+      <input id="title" name="title" required>
+
+      <label for="version">Version/Mix</label>
+      <input id="version" name="version">
+
+      <label for="isrc">Track ISRC</label>
+      <input id="isrc" name="isrc">
+    </fieldset>
+
+    <fieldset>
+      <legend>Release information</legend>
+
+      <label for="label">Label Listing</label>
+      <input id="label" name="label">
+
+      <label for="official-release-date">Official Release Date (mm/dd/yyyy)</label>
+      <input id="official-release-date" name="officialReleaseDate" type="text" inputmode="numeric" placeholder="mm/dd/yyyy" required>
+
+      <label for="album-title">Album Title (if applicable)</label>
+      <input id="album-title" name="albumTitle">
+
+      <label for="album-upc">Album UPC</label>
+      <input id="album-upc" name="albumUPC">
+
+      <label for="album-release-date">Album Release Date (mm/dd/yyyy)</label>
+      <input id="album-release-date" name="albumReleaseDate" type="text" inputmode="numeric" placeholder="mm/dd/yyyy">
+    </fieldset>
+
+    <fieldset>
+      <legend>Additional information</legend>
+
+      <label>Was generative AI used to create any of the audio?</label>
+      <div class="declaration-group">
+        <label><input type="radio" name="generativeAiAudioDeclaration" value="yes"> Yes</label>
+        <label><input type="radio" name="generativeAiAudioDeclaration" value="no"> No</label>
+      </div>
+
+      <label>Independent Label?</label>
+      <div class="declaration-group">
+        <label><input type="radio" name="independentLabelDeclaration" value="yes"> Yes</label>
+        <label><input type="radio" name="independentLabelDeclaration" value="no"> No</label>
+      </div>
+
+      <label>Christmas/Hanukah Music?</label>
+      <div class="declaration-group">
+        <label><input type="radio" name="christmasHanukkahDeclaration" value="yes"> Yes</label>
+        <label><input type="radio" name="christmasHanukkahDeclaration" value="no"> No</label>
+      </div>
+
+      <label>Canadian Content (CanCon)?</label>
+      <div class="declaration-group">
+        <label><input type="radio" name="canadianContentDeclaration" value="yes"> Yes</label>
+        <label><input type="radio" name="canadianContentDeclaration" value="no"> No</label>
+      </div>
+
+      <label for="artist-website">Artist website URL</label>
+      <input id="artist-website" name="artistWebsite" type="url">
+
+      <label for="comments">Additional comments about this song?</label>
+      <textarea id="comments" name="comments"></textarea>
+
+      <label for="hide-until">Hide Until</label>
+      <span>Specify date/time &amp; time zone or "Until Further Notice"</span>
+      <input id="hide-until" name="hideUntil" type="text">
+    </fieldset>
+
+    <fieldset>
+      <legend>Audio</legend>
+
+      <label for="audio-file">Upload song audio here.</label>
+      <span>Note: Only 1 audio file may be uploaded per submission.</span>
+      <input id="audio-file" name="audioFile" type="file" accept="audio/*" aria-label="Upload song audio here.">
+    </fieldset>
 
     <button id="submit" type="submit" data-click-count="0">
       Submit
