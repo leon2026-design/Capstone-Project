@@ -2,6 +2,12 @@ import { expect, type Page } from "@playwright/test";
 
 export type DeclarationValue = "yes" | "no" | "unanswered" | null;
 
+export type IsrcValidation = {
+  status: "valid" | "missing" | "invalid";
+  originalValue: string | null;
+  reviewed: boolean;
+};
+
 export type DemoRecording = {
   recordingId: string;
   submitterName?: string | null;
@@ -14,6 +20,7 @@ export type DemoRecording = {
   title: string;
   version?: string | null;
   isrc?: string | null;
+  isrcValidation?: IsrcValidation;
   label?: string | null;
   officialReleaseDate?: string | null;
   albumTitle?: string | null;
@@ -135,6 +142,12 @@ async function fillDeclaration(
   await expect(option).toBeChecked();
 }
 
+const NORMALIZED_ISRC_PATTERN = /^[A-Z]{2}[A-Z0-9]{3}[0-9]{7}$/;
+
+export type RecordReviewOptions = {
+  confirmMissingIsrc?: boolean;
+};
+
 export function validateRecordForPreparation(record: DemoRecording): void {
   if (record.approvalStatus !== "APPROVED") {
     throw new Error("Recording must be approved before form preparation.");
@@ -161,18 +174,65 @@ export function validateRecordForPreparation(record: DemoRecording): void {
     throw new Error("Album release date must be a valid mm/dd/yyyy date.");
   }
 
-  if (record.isrc && !/^[A-Z]{2}[A-Z0-9]{3}[0-9]{7}$/.test(record.isrc)) {
+  if (record.isrcValidation?.status === "invalid") {
+    throw new Error("Invalid Orchard ISRC must be corrected before approval.");
+  }
+
+  if (
+    record.isrcValidation?.status === "missing" &&
+    !record.isrcValidation.reviewed
+  ) {
+    throw new Error("Missing Orchard ISRC must be explicitly reviewed before approval.");
+  }
+
+  if (record.isrc && !NORMALIZED_ISRC_PATTERN.test(record.isrc)) {
     throw new Error("ISRC must have a valid normalized 12-character format.");
+  }
+
+  if (record.isrcValidation?.status === "valid" && !record.isrc) {
+    throw new Error("Validated ISRC metadata is inconsistent with the recording.");
   }
 }
 
 export function reviewAndApproveRecord(
   record: DemoRecording,
-  reviewData: Partial<DemoRecording> = {}
+  reviewData: Partial<DemoRecording> = {},
+  options: RecordReviewOptions = {}
 ): DemoRecording {
+  const { isrcValidation: ignoredValidation, ...reviewedFields } = reviewData;
+  void ignoredValidation;
+  const candidateIsrc = reviewedFields.isrc !== undefined
+    ? reviewedFields.isrc?.trim() || null
+    : record.isrc?.trim() || null;
+  let isrcValidation = record.isrcValidation;
+
+  if (candidateIsrc !== null) {
+    if (!NORMALIZED_ISRC_PATTERN.test(candidateIsrc)) {
+      throw new Error("ISRC must have a valid normalized 12-character format.");
+    }
+    isrcValidation = {
+      status: "valid",
+      originalValue: record.isrcValidation?.originalValue ?? record.isrc ?? candidateIsrc,
+      reviewed: true
+    };
+  } else if (record.isrcValidation?.status === "invalid") {
+    throw new Error("Invalid Orchard ISRC must be corrected before approval.");
+  } else if (record.isrcValidation) {
+    if (!options.confirmMissingIsrc) {
+      throw new Error("Missing Orchard ISRC must be explicitly reviewed before approval.");
+    }
+    isrcValidation = {
+      status: "missing",
+      originalValue: record.isrcValidation.originalValue,
+      reviewed: true
+    };
+  }
+
   const approved: DemoRecording = {
     ...record,
-    ...reviewData,
+    ...reviewedFields,
+    isrc: candidateIsrc,
+    isrcValidation,
     approvalStatus: "APPROVED"
   };
 

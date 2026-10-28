@@ -6,6 +6,7 @@ export type OrchardIssueSeverity = "warning" | "error";
 export type OrchardImportIssue = {
   row: number;
   code:
+    | "artist-conflict"
     | "duplicate-source-row"
     | "invalid-isrc"
     | "missing-isrc"
@@ -24,6 +25,7 @@ export type OrchardImportReport = {
   issues: OrchardImportIssue[];
   sourceRows: Array<{
     row: number;
+    productArtist: string | null;
     trackArtist: string | null;
     rawIsrc: string | null;
   }>;
@@ -36,7 +38,7 @@ export type OrchardImportResult = {
 
 type CsvRow = Record<string, string>;
 
-const REQUIRED_HEADERS = ["TRACK", "PRODUCT ARTIST"];
+const REQUIRED_HEADERS = ["TRACK"];
 
 function normalizeHeader(value: string): string {
   return value
@@ -60,6 +62,7 @@ function parseCsv(input: string): { headers: string[]; rows: string[][]; error?:
   let row: string[] = [];
   let field = "";
   let quoted = false;
+  let closedQuotedField = false;
 
   for (let index = 0; index < input.length; index += 1) {
     const character = input[index];
@@ -70,9 +73,29 @@ function parseCsv(input: string): { headers: string[]; rows: string[][]; error?:
           index += 1;
         } else {
           quoted = false;
+          closedQuotedField = true;
         }
       } else {
         field += character;
+      }
+    } else if (closedQuotedField) {
+      if (character === ",") {
+        row.push(field);
+        field = "";
+        closedQuotedField = false;
+      } else if (character === "\r" || character === "\n") {
+        if (character === "\r" && input[index + 1] === "\n") index += 1;
+        row.push(field);
+        rows.push(row);
+        row = [];
+        field = "";
+        closedQuotedField = false;
+      } else {
+        return {
+          headers: [],
+          rows: [],
+          error: "Unexpected character after a closing quoted CSV field."
+        };
       }
     } else if (character === '"') {
       if (field.length !== 0) {
@@ -96,7 +119,7 @@ function parseCsv(input: string): { headers: string[]; rows: string[][]; error?:
   if (quoted) {
     return { headers: [], rows: [], error: "Unclosed quoted CSV field." };
   }
-  if (field !== "" || row.length > 0) {
+  if (field !== "" || row.length > 0 || closedQuotedField) {
     row.push(field);
     rows.push(row);
   }
@@ -197,6 +220,15 @@ export function importOrchardCsv(
       });
     }
   }
+  if (!headerSet.has("TRACK ARTIST") && !headerSet.has("PRODUCT ARTIST")) {
+    issues.push({
+      row: 1,
+      code: "missing-required-field",
+      field: "TRACK ARTIST/PRODUCT ARTIST",
+      message: "A TRACK ARTIST or PRODUCT ARTIST Orchard column is required.",
+      severity: "error"
+    });
+  }
 
   const records: DemoRecording[] = [];
   const sourceRows: OrchardImportReport["sourceRows"] = [];
@@ -222,11 +254,28 @@ export function importOrchardCsv(
     seenRows.set(key, duplicateOccurrence);
 
     const rawIsrc = valueFor(row, "ISRC");
+    const productArtist = valueFor(row, "PRODUCT ARTIST");
+    const trackArtist = valueFor(row, "TRACK ARTIST");
     sourceRows.push({
       row: rowNumber,
-      trackArtist: valueFor(row, "TRACK ARTIST"),
+      productArtist,
+      trackArtist,
       rawIsrc
     });
+    if (
+      trackArtist !== null &&
+      productArtist !== null &&
+      trackArtist.toUpperCase() !== productArtist.toUpperCase()
+    ) {
+      issues.push({
+        row: rowNumber,
+        code: "artist-conflict",
+        field: "TRACK ARTIST",
+        message: "TRACK ARTIST was used for the recording, but differs from PRODUCT ARTIST; verify the artist mapping.",
+        rawValue: trackArtist,
+        severity: "warning"
+      });
+    }
     const isrc = normalizeIsrc(rawIsrc);
     if (rawIsrc === null) {
       issues.push({
@@ -248,9 +297,9 @@ export function importOrchardCsv(
       });
     }
 
-    const artist = valueFor(row, "PRODUCT ARTIST") ?? "";
+    const artist = trackArtist ?? productArtist ?? "";
     const title = valueFor(row, "TRACK") ?? "";
-    for (const [field, value] of [["PRODUCT ARTIST", artist], ["TRACK", title]] as const) {
+    for (const [field, value] of [["TRACK ARTIST/PRODUCT ARTIST", artist], ["TRACK", title]] as const) {
       if (!value) {
         issues.push({
           row: rowNumber,
@@ -276,6 +325,11 @@ export function importOrchardCsv(
       title,
       version: valueFor(row, "VERSION", "VERSION/MIX", "MIX", "TRACK VERSION", "RECORDING VERSION"),
       isrc,
+      isrcValidation: {
+        status: rawIsrc === null ? "missing" : isrc === null ? "invalid" : "valid",
+        originalValue: rawIsrc,
+        reviewed: isrc !== null
+      },
       label: valueFor(row, "LABEL IMPRINT"),
       officialReleaseDate: null,
       albumTitle: isSingleProduct(productType) ? null : product,
