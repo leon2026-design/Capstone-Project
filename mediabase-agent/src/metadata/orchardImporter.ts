@@ -1,5 +1,8 @@
 import { createHash } from "node:crypto";
 import type { DemoRecording } from "../browser/mediabaseForm";
+import {
+  createArtistAttributionDecision
+} from "./artistAttribution";
 
 export type OrchardIssueSeverity = "warning" | "error";
 
@@ -262,16 +265,13 @@ export function importOrchardCsv(
       trackArtist,
       rawIsrc
     });
-    if (
-      trackArtist !== null &&
-      productArtist !== null &&
-      trackArtist.toUpperCase() !== productArtist.toUpperCase()
-    ) {
+    const artistAttribution = createArtistAttributionDecision(trackArtist, productArtist);
+    if (artistAttribution.status === "CONFLICT") {
       issues.push({
         row: rowNumber,
         code: "artist-conflict",
-        field: "TRACK ARTIST",
-        message: "TRACK ARTIST was used for the recording, but differs from PRODUCT ARTIST; verify the artist mapping.",
+        field: "TRACK ARTIST/PRODUCT ARTIST",
+        message: "TRACK ARTIST (track performer) differs from PRODUCT ARTIST (main release entity); the Mediabase Exact Artist was left blank and must be explicitly confirmed before approval.",
         rawValue: trackArtist,
         severity: "warning"
       });
@@ -297,10 +297,13 @@ export function importOrchardCsv(
       });
     }
 
-    const artist = trackArtist ?? productArtist ?? "";
+    // The Mediabase Exact Artist stays blank until a reviewer explicitly confirms it.
+    const artist = "";
     const title = valueFor(row, "TRACK") ?? "";
     for (const [field, value] of [["TRACK ARTIST/PRODUCT ARTIST", artist], ["TRACK", title]] as const) {
-      if (!value) {
+      const awaitingArtistConfirmation =
+        field === "TRACK ARTIST/PRODUCT ARTIST" && artistAttribution.status !== "MISSING";
+      if (!value && !awaitingArtistConfirmation) {
         issues.push({
           row: rowNumber,
           code: "missing-required-field",
@@ -321,6 +324,7 @@ export function importOrchardCsv(
       email: null,
       rememberInformation: false,
       artist,
+      artistAttribution,
       featuredArtist: null,
       title,
       version: valueFor(row, "VERSION", "VERSION/MIX", "MIX", "TRACK VERSION", "RECORDING VERSION"),
