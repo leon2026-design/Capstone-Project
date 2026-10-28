@@ -38,3 +38,18 @@ rendered form. Production-side validation, upload processing, submission
 behavior, account requirements, and the exact accepted syntax for the Hide
 Until date/time and time-zone text still require manual verification. This
 mock intentionally does not claim to reproduce those undocumented behaviors.
+
+## Orchard CSV import review policy
+
+The Orchard importer uses `TRACK ARTIST` as the provisional track-level
+`artist` value when it is populated and falls back to `PRODUCT ARTIST` only
+when the track artist is absent. Both source values remain in the import
+report. When both are present and differ, the importer emits an
+`artist-conflict` warning for human verification. `PRODUCT ARTIST` is never
+automatically mapped to `featuredArtist`. This mapping remains subject to
+sponsor confirmation.
+
+Imported ISRC state is retained separately from the validated form value.
+Malformed nonempty source values block approval until corrected and
+revalidated. A genuinely missing source ISRC may remain blank only after the
+reviewer explicitly confirms it during approval.
