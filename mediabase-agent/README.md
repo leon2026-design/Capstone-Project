@@ -308,11 +308,151 @@ empty fields (company, phone, version, website, comments, Hide Until) are not
 reported. An empty Featured Artist is informational only; it is never assumed
 to be required.
 
+## Gemini metadata research framework (MB-05B.1, offline)
+
+`src/metadata/metadataResearch.ts` turns MB-05A reports into focused research
+tasks and validates structured provider responses. It is runtime-neutral and
+does not load Playwright. No Gemini SDK, API key, model selection, live
+research, retries, or cost tracking is implemented.
+
+```ts
+import { analyzeMetadataGaps } from "./src/metadata/metadataGapAnalyzer";
+import {
+  buildMetadataResearchTasks,
+  researchMetadata
+} from "./src/metadata/metadataResearch";
+import { MockMetadataResearchProvider } from "./src/metadata/mockResearchProvider";
+
+const report = analyzeMetadataGaps(record);
+const tasks = buildMetadataResearchTasks(record, report);
+const { proposals, failures } = await researchMetadata(tasks, new MockMetadataResearchProvider());
+// No fixture => INSUFFICIENT_EVIDENCE, suggestedValue: null, PENDING_REVIEW.
+// Neither the record nor the original report is changed.
+```
+
+### Research requests and provider contract
+
+Each task has a stable `taskId`, `recordingId`, `gapId`, one researched `field`,
+a focused question, public identifying metadata, original source evidence,
+allowed source categories, and explicit restrictions. Tasks require both the
+gap's `researchEligible` flag and an allowlisted gap-code/field combination.
+Supported fields are `isrc`, `label`, `officialReleaseDate`, `albumTitle`,
+`albumUPC`, and `albumReleaseDate`. Mechanical corrections are skipped, as are
+Brad's artist decisions, Featured Artist (Vydia), declarations, approval,
+submitter details, and audio selection.
+
+Only public recording/release fields and Orchard Track/Product Artist names
+are included as context; names are identifiers, not proposed hierarchy
+decisions. Contact details, comments, websites, approval state, audio paths,
+and unrelated evidence are omitted. Emails and absolute Windows, UNC, and
+POSIX paths embedded in included text are redacted again at this boundary.
+Sensitive identifiers cause explicit errors rather than silently changing the
+recording/gap linkage. Original records retain their full operational data.
+
+`MetadataResearchProvider.research(task)` returns `Promise<unknown>`.
+`validateMetadataResearchResponse` validates that untrusted value against
+`MetadataResearchResponse`. A future Gemini adapter must parse its structured
+JSON into an object before returning it; JSON strings are not accepted here.
+Responses contain exactly:
+
+| Property | Contract |
+| --- | --- |
+| `recordingId`, `gapId`, `field` | Must exactly match the request |
+| `suggestedValue` | String or `null`; ISRC, UPC, and dates reuse existing validators |
+| `evidence` | Source claims: `{ sourceId, url, category, quote, supportedValue }` |
+| `explanation` | Nonempty explanation; remains provider-authored, not independently verified prose |
+| `confidence` | `LOW`, `MEDIUM`, `HIGH`, or `UNKNOWN`; never proof |
+| `conflictingEvidence` | Claims supporting alternative values |
+| `outcome` | `PROPOSED`, `INSUFFICIENT_EVIDENCE`, or `CONFLICTING_EVIDENCE` |
+
+Source categories are `official-artist`, `official-label`, `distributor`,
+`identifier-registry`, and `published-catalog`. A citation needs a source
+identifier and quotation; a URL is optional, but when supplied must be a
+well-formed HTTPS URL without credentials or sensitive data. Categories and
+URL syntax are **not** source verification or a production domain allowlist.
+Unknown keys, unrelated IDs/fields, approval/artist patches, fabricated
+verification flags, malformed values, and sensitive response text are rejected.
+Validation errors and provider errors are surfaced per task, not silently converted
+into successful proposals or allowed to discard other tasks' results.
+
+`researchMetadata` returns `{ proposals, failures }`. Each array is ordered by
+`taskId`, regardless of input order. Successful proposals retain strict validation.
+Each failure contains `taskId`, `recordingId`, `gapId`, `errorCode`
+(`PROVIDER_ERROR` or `INVALID_RESPONSE`), a fixed safe `description`,
+`status: "UNRESOLVED"`, and `retryEligible: true`. Identifiers are sanitized;
+raw exceptions, provider payloads, validation details, prompts, and API keys
+are never copied into failure descriptions. Failed tasks produce no proposal,
+do not change their source gap, and can be passed to a future retry using their
+original task IDs. No automatic retries are implemented. Duplicate task IDs
+remain a batch-input error and are rejected before contacting the provider.
+
+### Evidence trust and unresolved proposals
+
+A provider-supplied URL, quotation, or source category is only a
+`PROVIDER_CLAIM`. A plausible or invented URL is never treated as verified just
+because it is well formed, and a high-confidence claim without adequate
+evidence becomes `INSUFFICIENT_EVIDENCE` with `suggestedValue: null`. Claimed
+candidate values remain visible in evidence for later investigation.
+
+The optional third argument to `researchMetadata` is a trusted caller-owned
+`VerifiedResearchEvidence[]`, obtained independently of the research provider.
+Each attestation includes `verificationId` and must match the exact recording,
+field, source identifier, URL, category, quotation, and supported value.
+Only matched claims become `INDEPENDENTLY_VERIFIED`. At least one exact,
+verified supporting claim is required for `PROPOSED`; high confidence never
+substitutes for this. Verification is separate from Brad's approval.
+
+This phase implements the **verification contract**, not a live verifier.
+Never populate the trusted array by copying or trusting provider output.
+Tests use fictional independent attestations and `example.test` citations,
+not claims of real-world research. A future verifier must check actual source
+content, identity, release/version, relevance, and provenance before issuing
+an attestation. Restrict its inputs to the current recording/task and refresh
+them if metadata changes.
+
+Conflicting claims remain `CONFLICTING_EVIDENCE`, even if the provider calls
+them `PROPOSED`; contradictory trusted attestations cannot be hidden by
+omitting them from a response. ISRC-conflict tasks always remain conflicting
+and human-resolved, even with verified supporting evidence. Research can
+suggest a supported candidate but cannot choose the authoritative ISRC.
+Without verified support, no suggested value is accepted.
+
+### Offline mock and future exception-based review
+
+`MockMetadataResearchProvider` accepts fictional response fixtures keyed by
+`taskId`. It clones inputs/outputs, returns stable results, and makes no network
+requests. Missing fixtures explicitly report insufficient evidence. Fixtures
+can also contain invalid output to exercise rejection tests; they never grant
+evidence verification by themselves.
+
+Every accepted `MetadataResearchProposal` contains a stable `proposalId`,
+validated evidence with verification status, `unresolvedReasons`, and:
+
+- `reviewStatus: "PENDING_REVIEW"`
+- `requiresHumanReview: true`
+- `agentMayResolve: false`
+- `conflictRequiresHumanResolution: true` for conflicting outcomes
+
+`MetadataReviewAction` defines the future review interface's intents:
+`APPROVE_SUGGESTED_VALUE`, `EDIT_SUGGESTED_VALUE` (requires `editedValue`),
+`REJECT_SUGGESTION`, and `DEFER_DECISION`, linked to the proposal/recording/gap/
+field. These are contracts only: there is no action executor, approval change,
+or record mutation. Approving a suggestion must not implicitly approve a
+record or acknowledge an ISRC conflict.
+
+The future UI should display completed evidence-backed proposals, alternatives,
+and verification/uncertainty labels so Brad reviews exceptions rather than
+filling blank forms. Remaining integrations are the Gemini adapter, approved
+source policy and independent verifier, task/proposal persistence and stale
+result handling, and a human-review UI with controlled application and renewed
+MB-05A validation. No Sheets, emails, live Mediabase, or production Apps Script
+integration is included.
+
 ## Running checks
 
 ```sh
 npm run typecheck
-npm test
+npx playwright test --reporter=line
 ```
 
 Audio tests generate minimal fictional WAV/MP3 files at runtime

@@ -234,7 +234,7 @@ function hasValidGtinCheckDigit(digits: string): boolean {
   return (10 - (sum % 10)) % 10 === Number(digits[digits.length - 1]);
 }
 
-function isValidUpc(value: string): boolean {
+export function isValidUpc(value: string): boolean {
   return /^\d{12,13}$/.test(value) && hasValidGtinCheckDigit(value);
 }
 
