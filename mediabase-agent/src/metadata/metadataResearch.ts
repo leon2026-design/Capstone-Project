@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { normalizeIsrcValue } from "../audio/audioMetadata";
 import {
   RESEARCH_AGENT_POLICY,
@@ -26,6 +27,8 @@ export type MetadataResearchTask = {
   gapCode: MetadataGapCode;
   field: ResearchField;
   existingMetadata: Partial<Record<ResearchField | "artist" | "title" | "version" | "trackArtist" | "productArtist", string>>;
+  /** Snapshot of the identifying metadata; verification is only valid for this exact identity. */
+  identityFingerprint: string;
   originalEvidence: GapEvidence[];
   question: string;
   allowedSourceCategories: ResearchSourceCategory[];
@@ -58,12 +61,13 @@ export type MetadataResearchResponse = {
 
 /**
  * Trusted caller input from a separate verifier, never from the provider.
- * Attests to this exact recording/version, field, value, quotation, and source.
- * This milestone supplies no live verifier. Tests use fictional attestations.
+ * Attests to this exact recording identity snapshot, field, value, quotation, and source.
+ * Produced by `verifyResearchEvidence` (src/research/sourceVerifier.ts) after retrieving the source.
  */
 export type VerifiedResearchEvidence = ResearchEvidenceClaim & {
   recordingId: string;
   field: ResearchField;
+  identityFingerprint: string;
   verificationId: string;
 };
 
@@ -106,10 +110,24 @@ export type MetadataResearchFailure = {
   taskId: string;
   recordingId: string;
   gapId: string;
-  errorCode: "PROVIDER_ERROR" | "INVALID_RESPONSE";
+  errorCode:
+    | "PROVIDER_ERROR"
+    | "INVALID_RESPONSE"
+    | "RATE_LIMITED"
+    | "QUOTA_EXHAUSTED"
+    | "TIMEOUT"
+    | "AUTHENTICATION_ERROR"
+    | "CONFIGURATION_ERROR"
+    | "BUDGET_EXHAUSTED"
+    | "BATCH_ABORTED";
   description: string;
   status: "UNRESOLVED";
   retryEligible: true;
+  diagnostics?: {
+    httpStatus: number | null;
+    category: MetadataResearchFailure["errorCode"] | "TRANSIENT";
+    retryable: boolean;
+  };
 };
 
 export type MetadataResearchBatchResult = {
@@ -158,8 +176,25 @@ function safeIdentifier(value: string): boolean {
   return value.length > 0 && value.length <= 1000 && sanitize(value) === value;
 }
 
+/** Shared redaction for anything that leaves the research boundary (prompts, reports, errors). */
+export function redactResearchText(value: string): string {
+  return sanitize(value);
+}
+
 function compare(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
+}
+
+export const RESEARCH_IDENTITY_FIELDS = ["artist", "title", "version", "trackArtist", "productArtist"] as const;
+
+/** Changing any identifying field changes the fingerprint and invalidates earlier verification. */
+export function researchIdentityFingerprint(
+  recordingId: string,
+  existingMetadata: MetadataResearchTask["existingMetadata"]
+): string {
+  const identity = [recordingId, ...RESEARCH_IDENTITY_FIELDS.map((field) =>
+    (existingMetadata[field] ?? "").normalize("NFKC").replace(/\s+/g, " ").trim().toLowerCase())];
+  return `IDENTITY-${createHash("sha256").update(JSON.stringify(identity)).digest("hex").slice(0, 16).toUpperCase()}`;
 }
 
 export function buildMetadataResearchTasks(
@@ -181,6 +216,7 @@ export function buildMetadataResearchTasks(
     const value = record.artistAttribution?.[field]?.trim();
     if (value) existingMetadata[field] = sanitize(value);
   }
+  const identityFingerprint = researchIdentityFingerprint(record.recordingId, existingMetadata);
   const tasks: MetadataResearchTask[] = [];
   const seen = new Set<string>();
   for (const gap of report.gaps) {
@@ -200,6 +236,7 @@ export function buildMetadataResearchTasks(
         gapCode: gap.code,
         field,
         existingMetadata: { ...existingMetadata },
+        identityFingerprint,
         originalEvidence: gap.evidence
           .filter((item) => EVIDENCE_SOURCES.has(item.source) && EVIDENCE_FIELDS.has(item.field))
           .map((item) => ({
@@ -285,14 +322,20 @@ function validValue(field: ResearchField, value: string): boolean {
   return true;
 }
 
+function attestationApplies(task: MetadataResearchTask, entry: VerifiedResearchEvidence): boolean {
+  return entry.recordingId === task.recordingId && entry.field === task.field &&
+    safeText(entry.verificationId) &&
+    entry.identityFingerprint === researchIdentityFingerprint(task.recordingId, task.existingMetadata) &&
+    entry.identityFingerprint === task.identityFingerprint;
+}
+
 function verifyClaim(
   task: MetadataResearchTask,
   evidence: ResearchEvidenceClaim,
   verifiedEvidence: readonly VerifiedResearchEvidence[]
 ): ProposalEvidence {
   const verified = verifiedEvidence.find((entry) =>
-    entry.recordingId === task.recordingId && entry.field === task.field &&
-    safeText(entry.verificationId) && sameClaim(entry, evidence)
+    attestationApplies(task, entry) && sameClaim(entry, evidence)
   );
   return {
     ...evidence,
@@ -339,7 +382,7 @@ export function validateMetadataResearchResponse(
     verifyClaim(task, item, verifiedEvidence));
   // An attested conflicting value must not disappear merely because the provider omitted it.
   for (const entry of verifiedEvidence) {
-    if (response.suggestedValue === null || entry.recordingId !== task.recordingId || entry.field !== task.field ||
+    if (response.suggestedValue === null || !attestationApplies(task, entry) ||
       entry.supportedValue === response.suggestedValue) continue;
     const sourceClaim: ResearchEvidenceClaim = {
       sourceId: entry.sourceId, url: entry.url, category: entry.category,

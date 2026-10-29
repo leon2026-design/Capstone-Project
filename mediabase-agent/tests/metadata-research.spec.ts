@@ -64,6 +64,7 @@ function verified(task: MetadataResearchTask, claim = evidence()): VerifiedResea
     ...claim,
     recordingId: task.recordingId,
     field: task.field,
+    identityFingerprint: task.identityFingerprint,
     verificationId: "fictional-independent-verifier-001"
   };
 }

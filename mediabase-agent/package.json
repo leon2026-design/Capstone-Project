@@ -4,7 +4,9 @@
   "main": "index.js",
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
-    "test": "playwright test"
+    "test": "playwright test",
+    "research:demo": "tsx scripts/liveResearchDemo.ts",
+    "research:demo:live": "tsx scripts/liveResearchDemo.ts --live"
   },
   "keywords": [],
   "author": "",
@@ -13,9 +15,11 @@
   "devDependencies": {
     "@playwright/test": "^1.64.1",
     "@types/node": "^26.6.5",
+    "tsx": "^4.23.15",
     "typescript": "^7.0.2"
   },
   "dependencies": {
+    "@google/genai": "^2.32.0",
     "music-metadata": "^12.3.2"
   }
 }
