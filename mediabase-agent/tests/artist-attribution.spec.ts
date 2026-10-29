@@ -5,7 +5,8 @@ import {
   validateRecordForPreparation,
   type DemoRecording
 } from "../src/browser/mediabaseForm";
-import { importOrchardCsv } from "../src/metadata/orchardImporter";
+import { importOrchardCsv, isOrchardRecordingId } from "../src/metadata/orchardImporter";
+import { isLegacyManualRecord } from "../src/metadata/recordValidation";
 
 const headers = "TRACK,PRODUCT ARTIST,TRACK ARTIST,ISRC,VERSION/MIX";
 const reviewData = {
@@ -13,6 +14,8 @@ const reviewData = {
   email: "casey@example.test",
   officialReleaseDate: "11/15/2026"
 };
+const missingAttributionMessage =
+  "Recording has no artist attribution decision and is not marked as a legacy manual record; the Mediabase Exact Artist must be explicitly confirmed before approval.";
 
 function importOne(row: string): DemoRecording {
   return importOrchardCsv(`${headers}\n${row}`, "attribution.csv").records[0];
@@ -52,7 +55,8 @@ test("keeps TRACK ARTIST and PRODUCT ARTIST as distinct source concepts", () => 
     primaryArtist: null,
     secondaryArtist: null,
     tertiaryArtist: null,
-    featuredArtistSource: "VYDIA"
+    featuredArtistSource: "VYDIA",
+    confirmedSource: null
   });
   expect(records.every((record) => record.featuredArtist === null)).toBeTruthy();
   expect(records.every((record) => record.artistAttribution?.primaryArtist === null)).toBeTruthy();
@@ -201,6 +205,100 @@ test("preserves an explicitly confirmed artist selection", () => {
 test("keeps previously approved fixtures without attribution decisions valid", () => {
   const fixture = JSON.parse(readFileSync("fixtures/example-record.json", "utf8")) as DemoRecording;
   expect(fixture.artistAttribution).toBeUndefined();
+  expect(fixture.recordSource).toBe("MANUAL");
+  expect(isLegacyManualRecord(fixture)).toBe(true);
   expect(() => validateRecordForPreparation(fixture)).not.toThrow();
   expect(reviewAndApproveRecord(fixture).artist).toBe("Example Artist");
+
+  // The exception is explicit: dropping the marker fails closed.
+  const { recordSource, ...unmarked } = fixture;
+  void recordSource;
+  expect(isLegacyManualRecord(unmarked)).toBe(false);
+  expect(() => validateRecordForPreparation(unmarked)).toThrow(missingAttributionMessage);
+});
+
+test("cannot bypass Orchard artist confirmation by omitting the attribution decision", () => {
+  const draft = importOne(`"Glass Coast","Northbound Collective","Mara Quill",USAAA2600010,Radio Edit`);
+  expect(draft.recordSource).toBe("ORCHARD");
+  expect(isOrchardRecordingId(draft.recordingId)).toBe(true);
+  const { artistAttribution, ...withoutAttribution } = draft;
+  void artistAttribution;
+  const missingMessage = missingAttributionMessage;
+
+  expect(() => reviewAndApproveRecord(withoutAttribution, { ...reviewData, artist: "Mara Quill" })).toThrow(missingMessage);
+  expect(() =>
+    validateRecordForPreparation({ ...withoutAttribution, ...reviewData, artist: "Mara Quill", approvalStatus: "APPROVED" })
+  ).toThrow(missingMessage);
+  expect(() =>
+    validateRecordForPreparation({
+      ...draft,
+      ...reviewData,
+      artist: "Mara Quill",
+      artistAttribution: undefined,
+      approvalStatus: "APPROVED"
+    })
+  ).toThrow(missingMessage);
+  // Provenance does not depend on the mutable recording ID.
+  const renamed = { ...withoutAttribution, ...reviewData, recordingId: "TEST-001", artist: "Mara Quill", approvalStatus: "APPROVED" as const };
+  expect(() => validateRecordForPreparation(renamed)).toThrow(missingMessage);
+  expect(() => validateRecordForPreparation({ ...renamed, recordSource: undefined })).toThrow(missingMessage);
+  // A legacy marker cannot be combined with an importer-format ID or set through review data.
+  expect(() =>
+    validateRecordForPreparation({ ...withoutAttribution, ...reviewData, recordSource: "MANUAL", artist: "Mara Quill", approvalStatus: "APPROVED" })
+  ).toThrow(missingMessage);
+  expect(() =>
+    reviewAndApproveRecord({ ...withoutAttribution, recordingId: "TEST-001" }, { ...reviewData, artist: "Mara Quill", recordSource: "MANUAL" })
+  ).toThrow(missingMessage);
+  // An explicit human confirmation is still accepted.
+  expect(
+    reviewAndApproveRecord(withoutAttribution, reviewData, { confirmArtistAttribution: { exactArtist: "Mara Quill" } })
+  ).toMatchObject({ artist: "Mara Quill", artistAttribution: { confirmed: true } });
+});
+
+test("rejects forged or inconsistent attribution decisions", () => {
+  const draft = importOne(`"Glass Coast","Northbound Collective","Mara Quill",USAAA2600010,Radio Edit`);
+  const approved = reviewAndApproveRecord(draft, reviewData, { confirmArtistAttribution: { exactArtist: "Mara Quill" } });
+  const inconsistent =
+    "Artist attribution data is inconsistent with the Orchard artist values; the Exact Artist must be confirmed again.";
+
+  // Hand-set `confirmed` without going through confirmArtistAttribution.
+  expect(() =>
+    validateRecordForPreparation({
+      ...approved,
+      artistAttribution: { ...draft.artistAttribution!, confirmed: true, confirmedExactArtist: "Mara Quill" }
+    })
+  ).toThrow(inconsistent);
+  // A conflict relabelled as agreement.
+  expect(() =>
+    validateRecordForPreparation({ ...approved, artistAttribution: { ...approved.artistAttribution!, status: "AGREES" } })
+  ).toThrow(inconsistent);
+  expect(() =>
+    validateRecordForPreparation({ ...approved, artistAttribution: { ...approved.artistAttribution!, confirmedExactArtist: " " } })
+  ).toThrow(inconsistent);
+});
+
+test("invalidates a confirmation when the Orchard artist values change", () => {
+  const draft = importOne(`"Glass Coast","Northbound Collective","Mara Quill",USAAA2600010,Radio Edit`);
+  const approved = reviewAndApproveRecord(draft, reviewData, { confirmArtistAttribution: { exactArtist: "Mara Quill" } });
+  expect(approved.artistAttribution?.confirmedSource).toEqual({
+    trackArtist: "Mara Quill",
+    productArtist: "Northbound Collective"
+  });
+  expect(() => validateRecordForPreparation(approved)).not.toThrow();
+  // Unrelated edits keep the confirmation valid.
+  expect(() => validateRecordForPreparation({ ...approved, comments: "Updated note." })).not.toThrow();
+
+  const changed: DemoRecording = {
+    ...approved,
+    artistAttribution: { ...approved.artistAttribution!, productArtist: "Harbor Collective" }
+  };
+  expect(() => validateRecordForPreparation(changed)).toThrow(
+    "Orchard artist values changed after the Exact Artist was confirmed; a new explicit confirmation is required."
+  );
+  expect(
+    reviewAndApproveRecord(changed, {}, { confirmArtistAttribution: { exactArtist: "Mara Quill" } }).artistAttribution
+  ).toMatchObject({
+    status: "CONFLICT",
+    confirmedSource: { trackArtist: "Mara Quill", productArtist: "Harbor Collective" }
+  });
 });

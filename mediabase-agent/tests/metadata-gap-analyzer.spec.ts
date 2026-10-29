@@ -1,6 +1,6 @@
 import { expect, test, type TestInfo } from "@playwright/test";
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join, sep } from "node:path";
 import {
   applyAudioMatch,
   confirmAudioSelection,
@@ -13,7 +13,9 @@ import { confirmArtistAttribution, createArtistAttributionDecision } from "../sr
 import {
   analyzeMetadataGaps,
   analyzeMetadataGapsBatch,
+  audioFileId,
   METADATA_GAP_SHEET_COLUMNS,
+  RESEARCH_AGENT_POLICY,
   toMetadataGapSheetRows,
   type MetadataGapReport
 } from "../src/metadata/metadataGapAnalyzer";
@@ -141,12 +143,12 @@ test("lists every gap in an incomplete Orchard draft", () => {
   expect(gap(report, "missing-required-field", "submitterName")).toMatchObject({ severity: "blocking", researchEligible: false });
   expect(gap(report, "missing-required-field", "officialReleaseDate")).toMatchObject({
     severity: "blocking",
-    resolution: "external-research",
+    resolvedBy: "human",
     researchEligible: true,
     requiresHumanConfirmation: true
   });
   expect(gap(report, "missing-label")).toMatchObject({ severity: "warning", researchEligible: true });
-  expect(gap(report, "approval-pending")).toMatchObject({ resolution: "human-review", researchEligible: false });
+  expect(gap(report, "approval-pending")).toMatchObject({ resolvedBy: "human", researchEligible: false });
   // Optional, empty fields are not reported.
   for (const field of ["company", "phone", "artistWebsite", "comments", "hideUntil", "version"]) {
     expect(report.gaps.some((entry) => entry.fields.includes(field))).toBe(false);
@@ -160,7 +162,7 @@ test("classifies missing ISRCs by review state and available evidence", async ({
   expect(gap(unreviewed, "missing-isrc")).toMatchObject({
     severity: "blocking",
     category: "missing",
-    resolution: "external-research",
+    resolvedBy: "human",
     researchEligible: true,
     requiresHumanConfirmation: true
   });
@@ -180,7 +182,7 @@ test("classifies missing ISRCs by review state and available evidence", async ({
     audioExtractions: [await extractAudioMetadata(path)]
   });
   expect(gap(withEmbedded, "missing-isrc")).toMatchObject({
-    resolution: "human-review",
+    resolvedBy: "human",
     evidence: [{ source: "audio-metadata", field: "ISRC", value: ISRC }]
   });
   expect(gap(withEmbedded, "missing-isrc").recommendedAction).toContain(ISRC);
@@ -200,7 +202,7 @@ test("reports invalid ISRCs with deterministic suggestions only when unambiguous
 
   const unnormalized = analyzeMetadataGaps(completeRecord(null, { isrc: "usaaa-2600010", isrcValidation: undefined }));
   expect(gap(unnormalized, "invalid-isrc")).toMatchObject({
-    resolution: "deterministic",
+    resolvedBy: "deterministic-rule",
     researchEligible: false,
     requiresHumanConfirmation: false,
     suggestedValue: ISRC
@@ -216,7 +218,7 @@ test("blocks conflicting embedded audio ISRCs until a reviewer acknowledges them
   expect(gap(conflicting, "audio-isrc-conflict")).toMatchObject({
     severity: "blocking",
     category: "conflicting",
-    resolution: "human-review",
+    resolvedBy: "human",
     requiresHumanConfirmation: true
   });
   expect(gap(conflicting, "audio-isrc-conflict").evidence).toEqual(
@@ -243,7 +245,7 @@ test("requires explicit human artist confirmation and never routes it to researc
   expect(gap(unconfirmed, "artist-unconfirmed")).toMatchObject({
     severity: "blocking",
     category: "needs-human-review",
-    resolution: "human-review",
+    resolvedBy: "human",
     researchEligible: false,
     fields: ["artist", "artistAttribution"]
   });
@@ -298,7 +300,7 @@ test("reports missing, unmatched, unverified, and unreadable audio", async ({}, 
   expect(missing.readiness).toBe("BLOCKED");
 
   const unverified = analyzeMetadataGaps(completeRecord(missingPath));
-  expect(gap(unverified, "audio-file-unverified")).toMatchObject({ severity: "warning", resolution: "deterministic" });
+  expect(gap(unverified, "audio-file-unverified")).toMatchObject({ severity: "warning", resolvedBy: "deterministic-rule" });
 });
 
 test("leaves ambiguous audio candidates and conflicting audio metadata to a human", async ({}, testInfo) => {
@@ -313,12 +315,12 @@ test("leaves ambiguous audio candidates and conflicting audio metadata to a huma
   expect(gap(report, "audio-ambiguous")).toMatchObject({
     severity: "blocking",
     category: "needs-human-review",
-    resolution: "human-review",
+    resolvedBy: "human",
     researchEligible: false
   });
-  expect(gap(report, "audio-ambiguous").evidence.filter((item) => item.field === "candidateFilePath").map((item) => item.value)).toEqual([
-    first,
-    second
+  expect(gap(report, "audio-ambiguous").evidence.filter((item) => item.field === "candidateFile")).toEqual([
+    { source: "audio-match", field: "candidateFile", value: "glass-coast-a.wav", fileId: audioFileId(first) },
+    { source: "audio-match", field: "candidateFile", value: "glass-coast-b.wav", fileId: audioFileId(second) }
   ]);
 
   const remix = wav(testInfo, "glass-coast-remix.wav", { ...tags, isrc: undefined, version: "Club Remix" });
@@ -340,7 +342,7 @@ test("flags unanswered and unsupported declarations for human answers only", () 
   const unanswered = report.gaps.filter((entry) => entry.code === "declaration-unanswered");
   expect(unanswered.map((entry) => entry.fields[0])).toEqual(["canadianContentDeclaration", "christmasHanukkahDeclaration"]);
   for (const entry of unanswered) {
-    expect(entry).toMatchObject({ severity: "warning", resolution: "human-review", researchEligible: false });
+    expect(entry).toMatchObject({ severity: "warning", resolvedBy: "human", researchEligible: false });
   }
   expect(gap(report, "invalid-field-format", "independentLabelDeclaration").severity).toBe("blocking");
 });
@@ -356,14 +358,14 @@ test("distinguishes missing, malformed, reformattable, and inconsistent release 
   const iso = analyzeMetadataGaps(completeRecord(null, { officialReleaseDate: "2026-11-15" }));
   expect(gap(iso, "invalid-field-format", "officialReleaseDate")).toMatchObject({
     category: "invalid",
-    resolution: "deterministic",
+    resolvedBy: "deterministic-rule",
     suggestedValue: "11/15/2026",
     requiresHumanConfirmation: false
   });
 
   const impossible = analyzeMetadataGaps(completeRecord(null, { officialReleaseDate: "02/30/2026", albumReleaseDate: "13/01/2026" }));
   expect(gap(impossible, "invalid-field-format", "officialReleaseDate")).toMatchObject({
-    resolution: "external-research",
+    resolvedBy: "human",
     suggestedValue: null
   });
   expect(gap(impossible, "invalid-field-format", "albumReleaseDate").severity).toBe("blocking");
@@ -455,4 +457,199 @@ test("produces identical output regardless of record and context order", async (
   expect(rows.every((row) => row.length === METADATA_GAP_SHEET_COLUMNS.length)).toBe(true);
   expect(rows.every((row) => row.every((cell) => typeof cell === "string" || typeof cell === "boolean"))).toBe(true);
   expect(toMetadataGapSheetRows([{ ...forward[0], gaps: [] }])[0].slice(0, 3)).toEqual(["ORCHARD-A", forward[0].readiness, ""]);
+});
+
+function importOrchardRecord(): DemoRecording {
+  const csv = `TRACK,PRODUCT ARTIST,TRACK ARTIST,ISRC,VERSION/MIX\n"Glass Coast","Mara Quill","Mara Quill",${ISRC},Radio Edit\n`;
+  return importOrchardCsv(csv, "single.csv").records[0];
+}
+
+function readyFromOrchard(draft: DemoRecording, overrides: Partial<DemoRecording> = {}): DemoRecording {
+  const { recordingId, artistAttribution, isrcValidation, title, version, isrc } = draft;
+  return completeRecord(null, { recordingId, artistAttribution, isrcValidation, title, version, isrc, ...overrides });
+}
+
+test("blocks Orchard recordings whose attribution decision is omitted, forged, or stale", () => {
+  const draft = importOrchardRecord();
+  const confirmed = confirmArtistAttribution(draft.artistAttribution!, { exactArtist: "Mara Quill" });
+  const ready = readyFromOrchard(draft, { artistAttribution: confirmed });
+  expect(analyzeMetadataGaps(ready).readiness).toBe("READY");
+  expect(() => validateRecordForPreparation(ready)).not.toThrow();
+
+  const { artistAttribution, ...omitted } = ready;
+  void artistAttribution;
+  const cases: Array<[DemoRecording, string]> = [
+    [omitted, "artist-attribution-missing"],
+    [{ ...ready, artistAttribution: undefined }, "artist-attribution-missing"],
+    [{ ...ready, artistAttribution: { ...draft.artistAttribution!, confirmed: true, confirmedExactArtist: "Mara Quill" } }, "artist-attribution-inconsistent"],
+    [{ ...ready, artistAttribution: { ...confirmed, trackArtist: "Juniper Vale" } }, "artist-confirmation-stale"]
+  ];
+  for (const [record, code] of cases) {
+    const report = analyzeMetadataGaps(record);
+    expect(gap(report, code)).toMatchObject({ severity: "blocking", resolvedBy: "human", researchEligible: false });
+    expect(report.readiness).toBe("BLOCKED");
+    expect(() => validateRecordForPreparation(record)).toThrow();
+  }
+  // Changing the mutable recording ID does not grant the legacy exception.
+  for (const recordingId of ["TEST-001", "MANUAL-42"]) {
+    const renamed = analyzeMetadataGaps({ ...omitted, recordingId });
+    expect(codes(renamed)).toContain("artist-attribution-missing");
+    expect(renamed.readiness).toBe("BLOCKED");
+  }
+  // Only the explicit legacy marker keeps the documented exception, and not with an importer-format ID.
+  expect(analyzeMetadataGaps({ ...omitted, recordingId: "TEST-001", recordSource: "MANUAL" }).readiness).toBe("READY");
+  expect(analyzeMetadataGaps({ ...omitted, recordSource: "MANUAL" }).readiness).toBe("BLOCKED");
+});
+
+test("detects a stale automatic audio match and agrees with form validation", async ({}, testInfo) => {
+  const radio = wav(testInfo, "glass-coast.wav", tags);
+  const base = completeRecord(null, { audioMatch: undefined });
+  const original = matchAudioToRecording(base, await extractAudioMetadataBatch([radio]));
+  const approved = applyAudioMatch(base, original);
+  expect(approved.audioMatch?.status).toBe("AUTO_MATCHED");
+  expect(analyzeMetadataGaps(approved, { audioMatchResults: [original] }).readiness).toBe("READY");
+
+  const extra = wav(testInfo, "glass-coast-alt.wav", tags);
+  const extractions = await extractAudioMetadataBatch([radio, extra]);
+  const current = matchAudioToRecording(base, extractions);
+  const report = analyzeMetadataGaps(approved, { audioExtractions: extractions, audioMatchResults: [current] });
+  expect(codes(report)).toEqual(expect.arrayContaining(["audio-ambiguous", "audio-match-stale"]));
+  expect(gap(report, "audio-match-stale")).toMatchObject({ severity: "blocking", resolvedBy: "deterministic-rule" });
+  expect(report.readiness).toBe("BLOCKED");
+  expect(() => validateRecordForPreparation(approved, { audioMatchResult: current })).toThrow();
+
+  const corrected = confirmAudioSelection(applyAudioMatch(approved, current), current, radio);
+  const fixed = analyzeMetadataGaps(corrected, { audioExtractions: extractions, audioMatchResults: [current] });
+  expect(fixed.readiness).toBe("READY");
+  expect(() => validateRecordForPreparation(corrected, { audioMatchResult: current })).not.toThrow();
+
+  const newCandidate = analyzeMetadataGaps(confirmAudioSelection(approved, original, radio), {
+    audioExtractions: extractions,
+    audioMatchResults: [current]
+  });
+  expect(gap(newCandidate, "audio-selection-new-candidates")).toMatchObject({ severity: "blocking", resolvedBy: "human" });
+});
+
+test("keeps research-eligible gaps under mandatory human resolution", async ({}, testInfo) => {
+  const path = wav(testInfo, "glass-coast.wav", { ...tags, isrc: "USAAA2699999" });
+  const extraction = await extractAudioMetadata(path);
+  const report = analyzeMetadataGaps(completeRecord(path, { audioMatch: undefined, label: null }), {
+    audioExtractions: [extraction]
+  });
+  expect(gap(report, "audio-isrc-conflict")).toMatchObject({
+    severity: "blocking",
+    researchEligible: true,
+    agentMayResolve: false,
+    resolvedBy: "human",
+    requiresHumanConfirmation: true,
+    suggestedValue: null
+  });
+  expect(report.readiness).toBe("BLOCKED");
+
+  // Once a human acknowledges the conflict it is resolved and no longer open for research.
+  const result = matchAudioToRecording(completeRecord(path, { audioMatch: undefined }), [extraction]);
+  const acknowledged = analyzeMetadataGaps(
+    confirmAudioSelection(completeRecord(path, { audioMatch: undefined }), result, path, { acknowledgeConflicts: true }),
+    { audioExtractions: [extraction], audioMatchResults: [result] }
+  );
+  expect(gap(acknowledged, "audio-isrc-conflict")).toMatchObject({ severity: "informational", researchEligible: false });
+  // Research eligibility never changes the stored ISRC or suggests an authoritative value.
+  expect(gap(report, "audio-isrc-conflict").evidence).toEqual(
+    expect.arrayContaining([
+      { source: "record", field: "isrc", value: ISRC },
+      { source: "audio-metadata", field: "ISRC", value: "USAAA2699999" }
+    ])
+  );
+  const drafts = importOrchardCsv(
+    "TRACK,PRODUCT ARTIST,TRACK ARTIST,ISRC,PRODUCT,PRODUCT TYPE\nSalt Lines,Tidewater Collective,Mara Quill,,Low Tide Atlas,Album\n",
+    "draft.csv"
+  ).records;
+  for (const entry of [...report.gaps, ...drafts.flatMap((draft) => analyzeMetadataGaps(draft).gaps)]) {
+    expect(entry.agentMayResolve).toBe(false);
+    if (entry.researchEligible) expect(entry).toMatchObject({ resolvedBy: "human", requiresHumanConfirmation: true });
+  }
+  expect(RESEARCH_AGENT_POLICY.mustNot.join(" ")).toMatch(/approve/i);
+});
+
+test("redacts submitter emails and local audio paths from exported reports", async ({}, testInfo) => {
+  const path = wav(testInfo, "glass-coast.wav", { ...tags, isrc: "USAAA2699999" });
+  const second = wav(testInfo, "glass-coast-b.wav", tags);
+  const extractions = await extractAudioMetadataBatch([path, second]);
+  const missingPath = join(testInfo.outputPath("audio"), "deleted.wav");
+  const records = [
+    completeRecord(path, { audioMatch: undefined, email: "casey@example" }),
+    completeRecord(missingPath, { recordingId: "ORCHARD-MISSING", comments: "Contact casey@example.test about C:\\private\\take.wav" }),
+    completeRecord(null, { recordingId: "ORCHARD-AMBIGUOUS", audioMatch: undefined })
+  ];
+  const results = matchAudioToRecordings(records, extractions);
+  const reports = analyzeMetadataGapsBatch(records, {
+    audioExtractions: [...extractions, await extractAudioMetadata(missingPath)],
+    audioMatchResults: results
+  });
+  const serialized = JSON.stringify({ reports, rows: toMetadataGapSheetRows(reports) });
+  const audioDirectory = testInfo.outputPath("audio");
+
+  expect(serialized).not.toContain("casey@example");
+  expect(serialized).not.toContain(JSON.stringify(audioDirectory).slice(1, -1));
+  expect(serialized).not.toContain(audioDirectory);
+  expect(gap(reports.find((report) => report.recordingId === "ORCHARD-COMPLETE")!, "invalid-field-format", "email").evidence).toEqual([
+    { source: "record", field: "email", value: "[redacted email]" }
+  ]);
+  const unreadable = gap(reports.find((report) => report.recordingId === "ORCHARD-MISSING")!, "audio-file-unreadable");
+  expect(unreadable.evidence[0]).toEqual({
+    source: "record",
+    field: "audioFilePath",
+    value: "deleted.wav",
+    fileId: audioFileId(missingPath)
+  });
+  expect(audioFileId(missingPath)).toMatch(/^AUDIO-[0-9A-F]{12}$/);
+  // The original records keep full paths for matching and file attachment.
+  expect(records[1].audioFilePath).toBe(missingPath);
+});
+
+test("loads the gap analyzer without importing Playwright or browser modules", () => {
+  const visited = new Set<string>();
+  const external: string[] = [];
+  const visit = (file: string) => {
+    if (visited.has(file)) return;
+    visited.add(file);
+    const source = readFileSync(file, "utf8");
+    for (const match of source.matchAll(/^\s*(?:import|export)\s+(type\s+)?[^;]*?from\s+"([^"]+)"/gm)) {
+      if (match[1]) continue;
+      const specifier = match[2];
+      if (specifier.startsWith(".")) visit(join(dirname(file), `${specifier}.ts`));
+      else external.push(specifier);
+    }
+  };
+  visit(join(__dirname, "..", "src", "metadata", "metadataGapAnalyzer.ts"));
+
+  expect([...visited].some((file) => file.includes(`${sep}browser${sep}`))).toBe(false);
+  expect(external.filter((specifier) => specifier.includes("playwright"))).toEqual([]);
+  expect(visited.has(join(__dirname, "..", "src", "metadata", "recordValidation.ts"))).toBe(true);
+});
+
+test("reports READY only when form validation also accepts the record", async ({}, testInfo) => {
+  const path = wav(testInfo, "glass-coast.wav", tags);
+  const extraction = await extractAudioMetadata(path);
+  const variants: DemoRecording[] = [
+    completeRecord(path),
+    completeRecord(path, { approvalStatus: "DRAFT" }),
+    completeRecord(path, { email: "not-an-email" }),
+    completeRecord(path, { officialReleaseDate: "02/30/2026" }),
+    completeRecord(path, { artist: "Someone Else" }),
+    completeRecord(path, { audioFilePath: null }),
+    completeRecord(null, { isrc: "bad", isrcValidation: undefined }),
+    readyFromOrchard(importOrchardRecord())
+  ];
+  for (const record of variants) {
+    const result = matchAudioToRecording(record, [extraction]);
+    const report = analyzeMetadataGaps(record, { audioExtractions: [extraction], audioMatchResults: [result] });
+    let accepted = true;
+    try {
+      validateRecordForPreparation(record, { audioMatchResult: result });
+    } catch {
+      accepted = false;
+    }
+    expect(report.readiness === "READY", `${record.recordingId}: ${codes(report).join(", ")}`).toBe(accepted);
+  }
 });

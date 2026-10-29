@@ -1,22 +1,26 @@
-import { resolve } from "node:path";
+import { createHash } from "node:crypto";
+import { basename, resolve } from "node:path";
 import {
+  assessAudioDecision,
   matchAudioToRecording,
-  type AudioMatchDecisionStatus,
+  type AudioDecisionProblem,
   type AudioMatchResult
 } from "../audio/audioMatcher";
 import { normalizeIsrcValue, type AudioExtractionResult, type AudioMetadata } from "../audio/audioMetadata";
 import {
+  getArtistAttributionProblem,
   isValidDate,
   normalizeDeclarationValue,
   validateRecordForPreparation,
   type DemoRecording
-} from "../browser/mediabaseForm";
+} from "./recordValidation";
 
 /**
  * Read-only metadata gap analysis run before any research agent is invoked.
  * The analyzer never mutates its inputs, never touches the filesystem or
- * network, and never approves records. Research-eligible gaps only mean an
- * external agent may *propose* evidence; a human must confirm every change.
+ * network, and never approves records. Reports are safe to share: submitter
+ * emails are redacted and audio files are identified by file name and an
+ * opaque `fileId`, never by absolute path.
  */
 
 export type GapSeverity = "blocking" | "warning" | "informational";
@@ -29,8 +33,17 @@ export type GapArea =
   | "release"
   | "declarations"
   | "approval";
-/** How a gap should be resolved. External research never confirms on its own. */
-export type GapResolution = "deterministic" | "external-research" | "human-review";
+/**
+ * Who has authority to apply a fix. `deterministic-rule` fixes are mechanical
+ * (formatting, normalization, re-running a local step); everything else needs
+ * a human. A research agent is never a resolver.
+ */
+export type GapResolver = "deterministic-rule" | "human";
+/**
+ * `READY` means the record passes the current prototype workflow checks,
+ * including `validateRecordForPreparation`. It is not cryptographically
+ * verified human approval: `approvalStatus` is mutable prototype state.
+ */
 export type ReadinessStatus = "READY" | "AWAITING_APPROVAL" | "BLOCKED";
 export type ArtistRole = "primary" | "secondary" | "tertiary";
 
@@ -45,6 +58,9 @@ export type MetadataGapCode =
   | "audio-isrc-malformed"
   | "missing-album-upc"
   | "invalid-album-upc"
+  | "artist-attribution-missing"
+  | "artist-attribution-inconsistent"
+  | "artist-confirmation-stale"
   | "artist-unconfirmed"
   | "artist-conflict"
   | "artist-confirmation-mismatch"
@@ -55,6 +71,10 @@ export type MetadataGapCode =
   | "audio-no-match"
   | "audio-ambiguous"
   | "audio-needs-review"
+  | "audio-match-stale"
+  | "audio-selection-new-candidates"
+  | "audio-selection-new-conflicts"
+  | "audio-selection-rejected"
   | "audio-selection-mismatch"
   | "audio-file-unverified"
   | "audio-file-unreadable"
@@ -75,7 +95,14 @@ export type GapEvidenceSource =
   | "audio-metadata"
   | "audio-match";
 
-export type GapEvidence = { source: GapEvidenceSource; field: string; value: string | null };
+export type GapEvidence = {
+  source: GapEvidenceSource;
+  field: string;
+  /** Sanitized value: audio files appear by file name; emails are redacted. */
+  value: string | null;
+  /** Opaque audio file identifier; resolve locally with `audioFileId`. */
+  fileId?: string;
+};
 
 export type MetadataGap = {
   /** Stable identifier: `<recordingId>:<code>:<fields>`. */
@@ -87,10 +114,17 @@ export type MetadataGap = {
   severity: GapSeverity;
   category: GapCategory;
   description: string;
-  resolution: GapResolution;
-  /** True when an external research agent could reasonably propose evidence. */
+  /** Who may apply the fix. A research agent is never a resolver. */
+  resolvedBy: GapResolver;
+  /**
+   * The gap is open and a research agent may investigate it and propose
+   * evidence-backed suggestions. This is independent of `resolvedBy` and
+   * grants no authority to choose values, edit records, or approve.
+   */
   researchEligible: boolean;
-  /** False only for deterministic fixes; research output always needs a human. */
+  /** Always false: research agents may propose but never resolve or apply. */
+  agentMayResolve: false;
+  /** True for human-resolved gaps and for any gap where research output could be proposed. */
   requiresHumanConfirmation: boolean;
   /** Deterministically derived replacement value, never applied automatically. */
   suggestedValue: string | null;
@@ -109,13 +143,32 @@ export type MetadataGapReport = {
 export type MetadataGapContext = {
   /** Local audio extraction results; matched to the selected file by resolved path. */
   audioExtractions?: readonly AudioExtractionResult[];
-  /** Matcher results, matched to recordings by `recordingId`. */
+  /** Current matcher results, matched to recordings by `recordingId`. */
   audioMatchResults?: readonly AudioMatchResult[];
   /** Artist roles the workflow explicitly expects Brad to supply. Default: none. */
   expectedArtistRoles?: readonly ArtistRole[];
 };
 
-type GapInput = Omit<MetadataGap, "gapId" | "requiresHumanConfirmation" | "suggestedValue" | "evidence"> & {
+/** What a future research agent may and must not do with research-eligible gaps. */
+export const RESEARCH_AGENT_POLICY = {
+  may: [
+    "Investigate research-eligible gaps, including conflicting ISRCs.",
+    "Search approved sources for supporting information.",
+    "Explain discrepancies between sources.",
+    "Suggest possible corrections with cited evidence."
+  ],
+  mustNot: [
+    "Choose an authoritative value.",
+    "Overwrite or edit existing metadata.",
+    "Resolve conflicts without human confirmation.",
+    "Approve recordings or override human decisions."
+  ]
+} as const;
+
+type GapInput = Omit<
+  MetadataGap,
+  "gapId" | "agentMayResolve" | "requiresHumanConfirmation" | "suggestedValue" | "evidence"
+> & {
   suggestedValue?: string | null;
   evidence?: GapEvidence[];
 };
@@ -123,6 +176,8 @@ type GapInput = Omit<MetadataGap, "gapId" | "requiresHumanConfirmation" | "sugge
 const SEVERITY_RANK: Record<GapSeverity, number> = { blocking: 0, warning: 1, informational: 2 };
 const ARTIST_ROLES: ArtistRole[] = ["primary", "secondary", "tertiary"];
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const EMAIL_ANYWHERE = /[^\s@"'<>()]+@[^\s@"'<>()]+\.[^\s@"'<>()]+/g;
+const REDACTED_EMAIL = "[redacted email]";
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
 const DECLARATIONS = [
   ["generativeAiAudioDeclaration", "Generative AI audio declaration"],
@@ -132,6 +187,11 @@ const DECLARATIONS = [
 ] as const;
 const AUDIO_ISRC_CONFLICT = /^(Embedded ISRC|File embeds multiple ISRCs)/;
 
+/** Opaque, stable identifier for a local audio file; reveals no directory names. */
+export function audioFileId(filePath: string): string {
+  return `AUDIO-${createHash("sha256").update(resolve(filePath)).digest("hex").slice(0, 12).toUpperCase()}`;
+}
+
 function text(value: string | null | undefined): string | null {
   const trimmed = value?.trim() ?? "";
   return trimmed ? trimmed : null;
@@ -139,6 +199,12 @@ function text(value: string | null | undefined): string | null {
 
 function ev(source: GapEvidenceSource, field: string, value: string | null | undefined): GapEvidence {
   return { source, field, value: value ?? null };
+}
+
+function fileEv(source: GapEvidenceSource, field: string, filePath: string | null | undefined, note?: string): GapEvidence {
+  if (!filePath) return ev(source, field, null);
+  const name = basename(filePath);
+  return { source, field, value: note ? `${name} (${note})` : name, fileId: audioFileId(filePath) };
 }
 
 function compareText(left: string, right: string): number {
@@ -172,10 +238,6 @@ function isValidUpc(value: string): boolean {
   return /^\d{12,13}$/.test(value) && hasValidGtinCheckDigit(value);
 }
 
-function decisionStatus(result: AudioMatchResult): AudioMatchDecisionStatus {
-  return result.status === "MATCHED" ? "AUTO_MATCHED" : result.status;
-}
-
 function findMatchResult(
   recordingId: string,
   results: readonly AudioMatchResult[] | undefined
@@ -195,13 +257,30 @@ function findExtraction(
   return (extractions ?? []).find((extraction) => extraction.filePath === absolutePath) ?? null;
 }
 
+/** Replaces known local paths with file names and redacts email addresses. */
+function createSanitizer(record: DemoRecording, paths: Iterable<string | null | undefined>): (value: string) => string {
+  const known = new Map<string, string>();
+  for (const path of paths) {
+    if (!path) continue;
+    known.set(path, basename(path));
+    known.set(resolve(path), basename(path));
+  }
+  const ordered = [...known.entries()].sort((left, right) => right[0].length - left[0].length);
+  const email = text(record.email);
+  return (value) => {
+    let result = value;
+    for (const [path, name] of ordered) result = result.split(path).join(name);
+    if (email) result = result.split(email).join(REDACTED_EMAIL);
+    return result.replace(EMAIL_ANYWHERE, REDACTED_EMAIL);
+  };
+}
+
 class GapCollector {
   readonly gaps: MetadataGap[] = [];
 
   constructor(private readonly recordingId: string) {}
 
   add(input: GapInput): void {
-    const suggestedValue = input.suggestedValue ?? null;
     this.gaps.push({
       gapId: `${this.recordingId}:${input.code}:${input.fields.join("+")}`,
       code: input.code,
@@ -210,10 +289,11 @@ class GapCollector {
       severity: input.severity,
       category: input.category,
       description: input.description,
-      resolution: input.resolution,
+      resolvedBy: input.resolvedBy,
       researchEligible: input.researchEligible,
-      requiresHumanConfirmation: input.resolution !== "deterministic",
-      suggestedValue,
+      agentMayResolve: false,
+      requiresHumanConfirmation: input.resolvedBy === "human" || input.researchEligible,
+      suggestedValue: input.suggestedValue ?? null,
       evidence: input.evidence ?? [],
       recommendedAction: input.recommendedAction
     });
@@ -234,7 +314,7 @@ function checkSubmission(record: DemoRecording, gaps: GapCollector): void {
         severity: "blocking",
         category: "missing",
         description: `${label} is required for the Mediabase submission.`,
-        resolution: "human-review",
+        resolvedBy: "human",
         researchEligible: false,
         recommendedAction: `Enter the ${label.toLowerCase()} of the person submitting the form.`
       });
@@ -249,9 +329,9 @@ function checkSubmission(record: DemoRecording, gaps: GapCollector): void {
       severity: "warning",
       category: "invalid",
       description: "Submitter email does not look like a valid email address.",
-      resolution: "human-review",
+      resolvedBy: "human",
       researchEligible: false,
-      evidence: [ev("record", "email", record.email)],
+      evidence: [ev("record", "email", REDACTED_EMAIL)],
       recommendedAction: "Correct the submitter email address."
     });
   }
@@ -268,7 +348,7 @@ function checkTextFormat(record: DemoRecording, field: "artist" | "title", gaps:
     severity: "warning",
     category: "invalid",
     description: `${label} has surrounding whitespace or control characters.`,
-    resolution: "deterministic",
+    resolvedBy: "deterministic-rule",
     researchEligible: false,
     suggestedValue: value.replace(/[\u0000-\u001f\u007f]/g, "").trim(),
     evidence: [ev("record", field, value)],
@@ -289,91 +369,129 @@ function checkArtistAttribution(
         ev("artist-attribution", "status", attribution.status)
       ]
     : [];
+  const humanOnly = { resolvedBy: "human", researchEligible: false, area: "artist-attribution" } as const;
+  const problem = getArtistAttributionProblem(record);
 
-  if (attribution && !attribution.confirmed) {
-    if (attribution.status === "CONFLICT") {
+  switch (problem?.code) {
+    case "attribution-missing":
       gaps.add({
+        ...humanOnly,
+        code: "artist-attribution-missing",
+        fields: ["artist", "artistAttribution"],
+        severity: "blocking",
+        category: "missing",
+        description: `${problem.message} An Exact Artist value alone is not a confirmation.`,
+        evidence: text(record.artist) ? [ev("record", "artist", record.artist)] : [],
+        recommendedAction: "Re-import the recording from Orchard, then Brad confirms the Exact Artist with confirmArtistAttribution."
+      });
+      break;
+    case "conflict-unconfirmed":
+      gaps.add({
+        ...humanOnly,
         code: "artist-conflict",
-        area: "artist-attribution",
         fields: ["artist", "artistAttribution"],
         severity: "blocking",
         category: "conflicting",
         description:
           "Orchard TRACK ARTIST (track performer) differs from PRODUCT ARTIST (main release entity); the Exact Artist is unconfirmed.",
-        resolution: "human-review",
-        researchEligible: false,
         evidence: sourceEvidence,
-        recommendedAction:
-          "Brad selects the Mediabase Exact Artist and artist hierarchy with confirmArtistAttribution."
+        recommendedAction: "Brad selects the Mediabase Exact Artist and artist hierarchy with confirmArtistAttribution."
       });
-    } else if (attribution.status === "MISSING") {
+      break;
+    case "unconfirmed":
+      gaps.add(
+        attribution?.status === "MISSING"
+          ? {
+              ...humanOnly,
+              code: "missing-required-field",
+              fields: ["artist"],
+              severity: "blocking",
+              category: "missing",
+              description: "Orchard supplied neither TRACK ARTIST nor PRODUCT ARTIST; the Exact Artist is unknown.",
+              evidence: sourceEvidence,
+              recommendedAction: "Brad supplies and confirms the Mediabase Exact Artist."
+            }
+          : {
+              ...humanOnly,
+              code: "artist-unconfirmed",
+              fields: ["artist", "artistAttribution"],
+              severity: "blocking",
+              category: "needs-human-review",
+              description: "The Mediabase Exact Artist has not been explicitly confirmed from the Orchard artist values.",
+              evidence: sourceEvidence,
+              recommendedAction: "Brad confirms the Exact Artist with confirmArtistAttribution; candidates are suggestions only."
+            }
+      );
+      break;
+    case "attribution-inconsistent":
       gaps.add({
-        code: "missing-required-field",
-        area: "artist-attribution",
-        fields: ["artist"],
+        ...humanOnly,
+        code: "artist-attribution-inconsistent",
+        fields: ["artistAttribution"],
         severity: "blocking",
-        category: "missing",
-        description: "Orchard supplied neither TRACK ARTIST nor PRODUCT ARTIST; the Exact Artist is unknown.",
-        resolution: "human-review",
-        researchEligible: false,
-        evidence: sourceEvidence,
-        recommendedAction: "Brad supplies and confirms the Mediabase Exact Artist."
+        category: "conflicting",
+        description: problem.message,
+        evidence: [...sourceEvidence, ev("artist-attribution", "confirmedExactArtist", attribution?.confirmedExactArtist)],
+        recommendedAction: "Brad confirms the Exact Artist again with confirmArtistAttribution."
       });
-    } else {
+      break;
+    case "confirmation-stale":
       gaps.add({
-        code: "artist-unconfirmed",
-        area: "artist-attribution",
+        ...humanOnly,
+        code: "artist-confirmation-stale",
         fields: ["artist", "artistAttribution"],
         severity: "blocking",
         category: "needs-human-review",
-        description: "The Mediabase Exact Artist has not been explicitly confirmed from the Orchard artist values.",
-        resolution: "human-review",
-        researchEligible: false,
-        evidence: sourceEvidence,
-        recommendedAction: "Brad confirms the Exact Artist with confirmArtistAttribution; candidates are suggestions only."
+        description: problem.message,
+        evidence: [
+          ...sourceEvidence,
+          ev("artist-attribution", "confirmedSource.trackArtist", attribution?.confirmedSource?.trackArtist),
+          ev("artist-attribution", "confirmedSource.productArtist", attribution?.confirmedSource?.productArtist)
+        ],
+        recommendedAction: "Brad reviews the changed Orchard artist values and confirms the Exact Artist again."
       });
-    }
-  } else if (attribution?.confirmed && record.artist !== attribution.confirmedExactArtist) {
-    gaps.add({
-      code: "artist-confirmation-mismatch",
-      area: "artist-attribution",
-      fields: ["artist", "artistAttribution"],
-      severity: "blocking",
-      category: "conflicting",
-      description: "Exact Artist differs from the confirmed artist attribution.",
-      resolution: "human-review",
-      researchEligible: false,
-      evidence: [ev("record", "artist", record.artist), ev("artist-attribution", "confirmedExactArtist", attribution.confirmedExactArtist)],
-      recommendedAction: "Restore the confirmed Exact Artist or record a new explicit confirmation."
-    });
-  } else if (!text(record.artist)) {
-    gaps.add({
-      code: "missing-required-field",
-      area: "artist-attribution",
-      fields: ["artist"],
-      severity: "blocking",
-      category: "missing",
-      description: "Exact Artist is required.",
-      resolution: "human-review",
-      researchEligible: false,
-      recommendedAction: "Brad supplies and confirms the Mediabase Exact Artist."
-    });
-  } else {
-    checkTextFormat(record, "artist", gaps);
+      break;
+    case "artist-mismatch":
+      gaps.add({
+        ...humanOnly,
+        code: "artist-confirmation-mismatch",
+        fields: ["artist", "artistAttribution"],
+        severity: "blocking",
+        category: "conflicting",
+        description: problem.message,
+        evidence: [
+          ev("record", "artist", record.artist),
+          ev("artist-attribution", "confirmedExactArtist", attribution?.confirmedExactArtist)
+        ],
+        recommendedAction: "Restore the confirmed Exact Artist or record a new explicit confirmation."
+      });
+      break;
+    default:
+      if (!text(record.artist)) {
+        gaps.add({
+          ...humanOnly,
+          code: "missing-required-field",
+          fields: ["artist"],
+          severity: "blocking",
+          category: "missing",
+          description: "Exact Artist is required.",
+          recommendedAction: "Brad supplies and confirms the Mediabase Exact Artist."
+        });
+      } else {
+        checkTextFormat(record, "artist", gaps);
+      }
   }
 
   for (const role of ARTIST_ROLES.filter((entry) => expectedRoles.includes(entry))) {
     const field = `${role}Artist` as const;
     if (!text(attribution?.[field])) {
       gaps.add({
+        ...humanOnly,
         code: "artist-role-missing",
-        area: "artist-attribution",
         fields: [`artistAttribution.${field}`],
         severity: "blocking",
         category: "missing",
         description: `The workflow expects a ${role} artist, but none has been recorded.`,
-        resolution: "human-review",
-        researchEligible: false,
         evidence: sourceEvidence,
         recommendedAction: `Brad records the ${role} artist; it is never inferred from Orchard columns.`
       });
@@ -382,26 +500,22 @@ function checkArtistAttribution(
 
   if (!text(record.featuredArtist)) {
     gaps.add({
+      ...humanOnly,
       code: "featured-artist-unavailable",
-      area: "artist-attribution",
       fields: ["featuredArtist"],
       severity: "informational",
       category: "missing",
       description: "No Featured Artist is recorded. A featured artist is not assumed to be required.",
-      resolution: "human-review",
-      researchEligible: false,
       recommendedAction: "No action unless Vydia lists a featured artist for this recording."
     });
   } else if (record.approvalStatus !== "APPROVED") {
     gaps.add({
+      ...humanOnly,
       code: "featured-artist-unverified",
-      area: "artist-attribution",
       fields: ["featuredArtist"],
       severity: "informational",
       category: "needs-human-review",
       description: "Featured Artist has not been verified during approval.",
-      resolution: "human-review",
-      researchEligible: false,
       evidence: [ev("record", "featuredArtist", record.featuredArtist)],
       recommendedAction: "Verify the Featured Artist against Vydia before approval."
     });
@@ -417,7 +531,7 @@ function checkTitle(record: DemoRecording, audio: AudioMetadata | null, gaps: Ga
       severity: "blocking",
       category: "missing",
       description: "Exact Title is required.",
-      resolution: "human-review",
+      resolvedBy: "human",
       researchEligible: false,
       evidence: audio?.title ? [ev("audio-metadata", "title", audio.title)] : [],
       recommendedAction: "Supply the exact title from the Orchard source or the label."
@@ -444,11 +558,11 @@ function checkIdentifiers(record: DemoRecording, audio: AudioMetadata | null, ga
       severity: "blocking",
       category: "invalid",
       description: "The Orchard ISRC is malformed and must be corrected before approval.",
-      resolution: "external-research",
+      resolvedBy: "human",
       researchEligible: true,
       evidence: [...orchardEvidence, ...embeddedEvidence],
       recommendedAction:
-        "Research the published ISRC for this recording; a reviewer must confirm the corrected value."
+        "Research may propose the published ISRC with evidence; a reviewer confirms and enters the corrected value."
     });
   } else if (isrc !== null && normalizeIsrcValue(isrc) !== isrc) {
     const normalized = normalizeIsrcValue(isrc);
@@ -459,13 +573,13 @@ function checkIdentifiers(record: DemoRecording, audio: AudioMetadata | null, ga
       severity: "blocking",
       category: "invalid",
       description: "ISRC is not in the normalized 12-character format.",
-      resolution: normalized ? "deterministic" : "external-research",
+      resolvedBy: normalized ? "deterministic-rule" : "human",
       researchEligible: normalized === null,
       suggestedValue: normalized,
       evidence: [ev("record", "isrc", record.isrc), ...orchardEvidence],
       recommendedAction: normalized
         ? `Normalize the ISRC to ${normalized}.`
-        : "Research the published ISRC; a reviewer must confirm the corrected value."
+        : "Research may propose the published ISRC with evidence; a reviewer confirms the corrected value."
     });
   } else if (validation?.status === "valid" && isrc === null) {
     gaps.add({
@@ -475,7 +589,7 @@ function checkIdentifiers(record: DemoRecording, audio: AudioMetadata | null, ga
       severity: "blocking",
       category: "conflicting",
       description: "ISRC validation reports a valid ISRC, but the recording has none.",
-      resolution: "human-review",
+      resolvedBy: "human",
       researchEligible: false,
       evidence: orchardEvidence,
       recommendedAction: "Re-run the ISRC review for this recording."
@@ -489,7 +603,7 @@ function checkIdentifiers(record: DemoRecording, audio: AudioMetadata | null, ga
         severity: "informational",
         category: "missing",
         description: "A reviewer confirmed that this recording has no ISRC.",
-        resolution: "human-review",
+        resolvedBy: "human",
         researchEligible: false,
         evidence: [...orchardEvidence, ...embeddedEvidence],
         recommendedAction: "No action; the reviewer decision stands."
@@ -505,13 +619,13 @@ function checkIdentifiers(record: DemoRecording, audio: AudioMetadata | null, ga
         description: unreviewed
           ? "The Orchard ISRC is missing and has not been reviewed."
           : "The recording has no ISRC.",
-        resolution: embeddedValid.length === 1 ? "human-review" : "external-research",
+        resolvedBy: "human",
         researchEligible: true,
         evidence: [...orchardEvidence, ...embeddedEvidence],
         recommendedAction:
           embeddedValid.length === 1
             ? `Confirm whether the embedded audio ISRC ${embeddedValid[0]} belongs to this recording, or confirm that no ISRC exists.`
-            : "Research the published ISRC, or have a reviewer confirm that no ISRC exists."
+            : "Research may propose the published ISRC with evidence; a reviewer confirms it or confirms that no ISRC exists."
       });
     }
   }
@@ -525,6 +639,7 @@ function checkIdentifiers(record: DemoRecording, audio: AudioMetadata | null, ga
       embeddedValid.every(
         (value) => value === recordIsrc || decision.acknowledgedConflicts.some((conflict) => conflict.includes(value))
       );
+    // Research may explain the discrepancy, but only a human decides which ISRC is authoritative.
     gaps.add({
       code: "audio-isrc-conflict",
       area: "identifiers",
@@ -534,12 +649,12 @@ function checkIdentifiers(record: DemoRecording, audio: AudioMetadata | null, ga
       description: acknowledged
         ? "Embedded audio ISRC differs from the recording ISRC; a reviewer acknowledged the conflict."
         : "Embedded audio ISRC differs from the recording ISRC or the file embeds several ISRCs.",
-      resolution: "human-review",
+      resolvedBy: "human",
       researchEligible: !acknowledged,
       evidence: [ev("record", "isrc", record.isrc), ...orchardEvidence, ...embeddedEvidence],
       recommendedAction: acknowledged
         ? "No action; the reviewer acknowledged the conflict."
-        : "A reviewer decides which ISRC is authoritative or selects a different audio file."
+        : "Research may gather evidence for each ISRC; a reviewer decides which is authoritative or selects a different audio file."
     });
   }
   const malformed = (audio?.rawIsrcs ?? []).filter((value) => normalizeIsrcValue(value) === null);
@@ -551,7 +666,7 @@ function checkIdentifiers(record: DemoRecording, audio: AudioMetadata | null, ga
       severity: "warning",
       category: "invalid",
       description: "The selected audio file embeds a malformed ISRC tag.",
-      resolution: "human-review",
+      resolvedBy: "human",
       researchEligible: false,
       evidence: malformed.map((value) => ev("audio-metadata", "ISRC", value)),
       recommendedAction: "Ignore the embedded tag or ask the label for a corrected master."
@@ -569,13 +684,13 @@ function checkIdentifiers(record: DemoRecording, audio: AudioMetadata | null, ga
       severity: "warning",
       category: "invalid",
       description: "Album UPC is not a 12- or 13-digit code with a valid check digit.",
-      resolution: normalized ? "deterministic" : "external-research",
+      resolvedBy: normalized ? "deterministic-rule" : "human",
       researchEligible: normalized === null,
       suggestedValue: normalized,
       evidence: [ev("record", "albumUPC", record.albumUPC)],
       recommendedAction: normalized
         ? `Normalize the Album UPC to ${normalized}.`
-        : "Research the published UPC for this release; a reviewer must confirm the value."
+        : "Research may propose the published UPC with evidence; a reviewer confirms the value."
     });
   } else if (!upc && text(record.albumTitle)) {
     gaps.add({
@@ -585,12 +700,38 @@ function checkIdentifiers(record: DemoRecording, audio: AudioMetadata | null, ga
       severity: "warning",
       category: "missing",
       description: "An album title is recorded, but the Album UPC is missing.",
-      resolution: "external-research",
+      resolvedBy: "human",
       researchEligible: true,
       evidence: [ev("record", "albumTitle", record.albumTitle)],
-      recommendedAction: "Research the published album UPC; a reviewer must confirm the value."
+      recommendedAction: "Research may propose the published album UPC with evidence; a reviewer confirms the value."
     });
   }
+}
+
+function checkReleaseDate(
+  record: DemoRecording,
+  field: "officialReleaseDate" | "albumReleaseDate",
+  label: string,
+  gaps: GapCollector
+): void {
+  const value = text(record[field]);
+  if (!value || isValidDate(value)) return;
+  const suggestion = suggestDate(value);
+  gaps.add({
+    code: "invalid-field-format",
+    area: "release",
+    fields: [field],
+    severity: "blocking",
+    category: "invalid",
+    description: `${label} is not a valid mm/dd/yyyy date.`,
+    resolvedBy: suggestion ? "deterministic-rule" : "human",
+    researchEligible: suggestion === null,
+    suggestedValue: suggestion,
+    evidence: [ev("record", field, record[field])],
+    recommendedAction: suggestion
+      ? `Reformat the ${label.toLowerCase()} as ${suggestion}.`
+      : `Research may propose the published ${label.toLowerCase()} with evidence; a reviewer confirms it.`
+  });
 }
 
 function checkReleaseMetadata(record: DemoRecording, audio: AudioMetadata | null, gaps: GapCollector): void {
@@ -603,49 +744,18 @@ function checkReleaseMetadata(record: DemoRecording, audio: AudioMetadata | null
       severity: "blocking",
       category: "missing",
       description: "Official release date is required.",
-      resolution: "external-research",
+      resolvedBy: "human",
       researchEligible: true,
-      recommendedAction: "Research the published release date; a reviewer must confirm it in mm/dd/yyyy format."
-    });
-  } else if (!isValidDate(official)) {
-    const suggestion = suggestDate(official);
-    gaps.add({
-      code: "invalid-field-format",
-      area: "release",
-      fields: ["officialReleaseDate"],
-      severity: "blocking",
-      category: "invalid",
-      description: "Official release date is not a valid mm/dd/yyyy date.",
-      resolution: suggestion ? "deterministic" : "external-research",
-      researchEligible: suggestion === null,
-      suggestedValue: suggestion,
-      evidence: [ev("record", "officialReleaseDate", record.officialReleaseDate)],
-      recommendedAction: suggestion
-        ? `Reformat the official release date as ${suggestion}.`
-        : "Research the published release date; a reviewer must confirm it."
+      recommendedAction:
+        "Research may propose the published release date with evidence; a reviewer confirms it in mm/dd/yyyy format."
     });
   }
+  checkReleaseDate(record, "officialReleaseDate", "Official release date", gaps);
+  checkReleaseDate(record, "albumReleaseDate", "Album release date", gaps);
 
   const album = text(record.albumReleaseDate);
   const albumTitle = text(record.albumTitle);
-  if (album && !isValidDate(album)) {
-    const suggestion = suggestDate(album);
-    gaps.add({
-      code: "invalid-field-format",
-      area: "release",
-      fields: ["albumReleaseDate"],
-      severity: "blocking",
-      category: "invalid",
-      description: "Album release date is not a valid mm/dd/yyyy date.",
-      resolution: suggestion ? "deterministic" : "external-research",
-      researchEligible: suggestion === null,
-      suggestedValue: suggestion,
-      evidence: [ev("record", "albumReleaseDate", record.albumReleaseDate)],
-      recommendedAction: suggestion
-        ? `Reformat the album release date as ${suggestion}.`
-        : "Research the published album release date; a reviewer must confirm it."
-    });
-  } else if (!album && albumTitle) {
+  if (!album && albumTitle) {
     gaps.add({
       code: "missing-album-release-date",
       area: "release",
@@ -653,10 +763,10 @@ function checkReleaseMetadata(record: DemoRecording, audio: AudioMetadata | null
       severity: "warning",
       category: "missing",
       description: "An album title is recorded, but the album release date is missing.",
-      resolution: "external-research",
+      resolvedBy: "human",
       researchEligible: true,
       evidence: [ev("record", "albumTitle", record.albumTitle)],
-      recommendedAction: "Research the published album release date; a reviewer must confirm it."
+      recommendedAction: "Research may propose the published album release date with evidence; a reviewer confirms it."
     });
   }
 
@@ -668,14 +778,14 @@ function checkReleaseMetadata(record: DemoRecording, audio: AudioMetadata | null
       severity: "warning",
       category: "missing",
       description: "An album release date is recorded, but the album title is missing.",
-      resolution: "external-research",
+      resolvedBy: "human",
       researchEligible: true,
       evidence: [
         ev("record", "albumReleaseDate", record.albumReleaseDate),
         ev("record", "albumUPC", record.albumUPC),
         ...(audio?.album ? [ev("audio-metadata", "album", audio.album)] : [])
       ],
-      recommendedAction: "Research the album title; a reviewer must confirm it."
+      recommendedAction: "Research may propose the album title with evidence; a reviewer confirms it."
     });
   }
 
@@ -687,7 +797,7 @@ function checkReleaseMetadata(record: DemoRecording, audio: AudioMetadata | null
       severity: "warning",
       category: "needs-human-review",
       description: "The official release date is later than the album release date.",
-      resolution: "human-review",
+      resolvedBy: "human",
       researchEligible: false,
       evidence: [
         ev("record", "officialReleaseDate", record.officialReleaseDate),
@@ -705,9 +815,9 @@ function checkReleaseMetadata(record: DemoRecording, audio: AudioMetadata | null
       severity: "warning",
       category: "missing",
       description: "Label Listing is empty.",
-      resolution: "external-research",
+      resolvedBy: "human",
       researchEligible: true,
-      recommendedAction: "Research the releasing label; a reviewer must confirm the listing."
+      recommendedAction: "Research may propose the releasing label with evidence; a reviewer confirms the listing."
     });
   }
 }
@@ -726,7 +836,7 @@ function checkDeclarations(record: DemoRecording, gaps: GapCollector): void {
         severity: "blocking",
         category: "invalid",
         description: `${label} has an unsupported value.`,
-        resolution: "human-review",
+        resolvedBy: "human",
         researchEligible: false,
         evidence: [ev("record", field, String(value))],
         recommendedAction: `Answer the ${label.toLowerCase()} with yes or no.`
@@ -741,11 +851,105 @@ function checkDeclarations(record: DemoRecording, gaps: GapCollector): void {
         severity: "warning",
         category: "needs-human-review",
         description: `${label} is unanswered.`,
-        resolution: "human-review",
+        resolvedBy: "human",
         researchEligible: false,
         recommendedAction: `A human answers the ${label.toLowerCase()}; it is never researched or inferred.`
       });
     }
+  }
+}
+
+function addAudioDecisionGap(
+  record: DemoRecording,
+  problem: AudioDecisionProblem,
+  status: string | null,
+  gaps: GapCollector
+): void {
+  const files = problem.filePaths.map((path) => fileEv("audio-match", "candidateFile", path));
+  const conflicts = problem.conflicts.map((conflict) => ev("audio-match", "conflict", conflict));
+  const humanOnly = { area: "audio", resolvedBy: "human", researchEligible: false } as const;
+  switch (problem.code) {
+    case "unresolved": {
+      const ambiguous = status === "AMBIGUOUS";
+      gaps.add({
+        ...humanOnly,
+        code: ambiguous ? "audio-ambiguous" : "audio-needs-review",
+        fields: ["audioFilePath", "audioMatch"],
+        severity: "blocking",
+        category: "needs-human-review",
+        description: ambiguous
+          ? "Several audio files could match this recording."
+          : "One audio file was suggested from partial, filename, or conflicting evidence.",
+        evidence: [...files, ...conflicts],
+        recommendedAction: "A human selects the correct file (or confirms no audio) with confirmAudioSelection."
+      });
+      break;
+    }
+    case "path-mismatch":
+      gaps.add({
+        ...humanOnly,
+        code: "audio-selection-mismatch",
+        fields: ["audioFilePath", "audioMatch"],
+        severity: "blocking",
+        category: "conflicting",
+        description: problem.message,
+        evidence: [
+          fileEv("record", "audioFilePath", record.audioFilePath),
+          fileEv("audio-match", "filePath", record.audioMatch?.filePath)
+        ],
+        recommendedAction: "Re-confirm the audio selection with confirmAudioSelection."
+      });
+      break;
+    case "stale-automatic-match":
+      gaps.add({
+        ...humanOnly,
+        resolvedBy: "deterministic-rule",
+        code: "audio-match-stale",
+        fields: ["audioFilePath", "audioMatch"],
+        severity: "blocking",
+        category: "conflicting",
+        description: problem.message,
+        evidence: [ev("audio-match", "storedStatus", record.audioMatch?.status ?? null), ev("audio-match", "currentStatus", status), ...files],
+        recommendedAction:
+          "Apply the current match result with applyAudioMatch; any resulting ambiguity then needs a human selection."
+      });
+      break;
+    case "selection-new-candidates":
+      gaps.add({
+        ...humanOnly,
+        code: "audio-selection-new-candidates",
+        fields: ["audioFilePath", "audioMatch"],
+        severity: "blocking",
+        category: "needs-human-review",
+        description: problem.message,
+        evidence: [fileEv("audio-match", "selectedFile", record.audioMatch?.filePath), ...files],
+        recommendedAction: "A human reviews the new candidates and re-confirms the selection with confirmAudioSelection."
+      });
+      break;
+    case "selection-new-conflicts":
+      gaps.add({
+        ...humanOnly,
+        code: "audio-selection-new-conflicts",
+        fields: ["audioFilePath", "audioMatch"],
+        severity: "blocking",
+        category: "conflicting",
+        description: problem.message,
+        evidence: [...files, ...conflicts],
+        recommendedAction: "A human re-confirms the file with acknowledgeConflicts or selects a different file."
+      });
+      break;
+    case "selection-rejected":
+      gaps.add({
+        ...humanOnly,
+        code: "audio-selection-rejected",
+        fields: ["audioFilePath", "audioMatch"],
+        severity: "blocking",
+        category: "missing",
+        description: problem.message,
+        evidence: files,
+        recommendedAction: "Restore the file or select a different audio file."
+      });
+      break;
   }
 }
 
@@ -755,48 +959,13 @@ function checkAudio(
   extraction: AudioExtractionResult | null,
   gaps: GapCollector
 ): void {
-  const decision = record.audioMatch;
-  const status = decision?.status ?? (matchResult ? decisionStatus(matchResult) : null);
+  const assessment = assessAudioDecision(record, matchResult);
   const selectedPath = text(record.audioFilePath);
-  const candidatePaths = decision?.candidateFilePaths ?? matchResult?.candidates.map((candidate) => candidate.filePath) ?? [];
-  const candidateEvidence = candidatePaths.map((path) => ev("audio-match", "candidateFilePath", path));
-
-  if (decision && (decision.filePath ?? null) !== (record.audioFilePath ?? null)) {
-    gaps.add({
-      code: "audio-selection-mismatch",
-      area: "audio",
-      fields: ["audioFilePath", "audioMatch"],
-      severity: "blocking",
-      category: "conflicting",
-      description: "Audio file path differs from the reviewed audio match.",
-      resolution: "human-review",
-      researchEligible: false,
-      evidence: [ev("record", "audioFilePath", record.audioFilePath), ev("audio-match", "filePath", decision.filePath)],
-      recommendedAction: "Re-confirm the audio selection with confirmAudioSelection."
-    });
+  for (const problem of assessment.problems) {
+    addAudioDecisionGap(record, problem, assessment.status, gaps);
   }
 
-  if (status === "AMBIGUOUS" || status === "NEEDS_REVIEW") {
-    const ambiguous = status === "AMBIGUOUS";
-    const conflicts = (matchResult?.candidates ?? []).flatMap((candidate) =>
-      candidate.conflicts.map((conflict) => ev("audio-match", candidate.fileName, conflict))
-    );
-    gaps.add({
-      code: ambiguous ? "audio-ambiguous" : "audio-needs-review",
-      area: "audio",
-      fields: ["audioFilePath", "audioMatch"],
-      severity: "blocking",
-      category: "needs-human-review",
-      description: ambiguous
-        ? "Several audio files could match this recording."
-        : "One audio file was suggested from partial, filename, or conflicting evidence.",
-      resolution: "human-review",
-      researchEligible: false,
-      evidence: [...candidateEvidence, ...conflicts],
-      recommendedAction:
-        "A human selects the correct file (or confirms no audio) with confirmAudioSelection."
-    });
-  } else if (!selectedPath && status === "NO_MATCH") {
+  if (!selectedPath && assessment.status === "NO_MATCH") {
     gaps.add({
       code: "audio-no-match",
       area: "audio",
@@ -804,12 +973,12 @@ function checkAudio(
       severity: "warning",
       category: "missing",
       description: "No local audio file matched this recording.",
-      resolution: "human-review",
+      resolvedBy: "human",
       researchEligible: false,
-      evidence: (matchResult?.rejectedFiles ?? []).map((file) => ev("audio-match", "rejectedFile", `${file.filePath} (${file.error})`)),
+      evidence: (matchResult?.rejectedFiles ?? []).map((file) => fileEv("audio-match", "rejectedFile", file.filePath, file.error)),
       recommendedAction: "Locate the audio master or confirm that no audio will be attached."
     });
-  } else if (!selectedPath && status === null) {
+  } else if (!selectedPath && assessment.status === null) {
     gaps.add({
       code: "audio-not-evaluated",
       area: "audio",
@@ -817,7 +986,7 @@ function checkAudio(
       severity: "informational",
       category: "missing",
       description: "Audio matching has not been run for this recording.",
-      resolution: "deterministic",
+      resolvedBy: "deterministic-rule",
       researchEligible: false,
       recommendedAction: "Run matchAudioToRecordings against the local audio files."
     });
@@ -832,9 +1001,9 @@ function checkAudio(
       severity: "warning",
       category: "needs-human-review",
       description: "The selected audio file has not been read to confirm it exists and is valid.",
-      resolution: "deterministic",
+      resolvedBy: "deterministic-rule",
       researchEligible: false,
-      evidence: [ev("record", "audioFilePath", record.audioFilePath)],
+      evidence: [fileEv("record", "audioFilePath", selectedPath)],
       recommendedAction: "Run extractAudioMetadata on the selected file and re-analyze."
     });
     return;
@@ -847,9 +1016,9 @@ function checkAudio(
       severity: "blocking",
       category: extraction.error === "MISSING_FILE" ? "missing" : "invalid",
       description: `The selected audio file cannot be used: ${extraction.message}`,
-      resolution: "human-review",
+      resolvedBy: "human",
       researchEligible: false,
-      evidence: [ev("record", "audioFilePath", record.audioFilePath), ev("audio-metadata", "error", extraction.error)],
+      evidence: [fileEv("record", "audioFilePath", selectedPath), ev("audio-metadata", "error", extraction.error)],
       recommendedAction: "Restore the file or select a different audio file."
     });
     return;
@@ -859,8 +1028,9 @@ function checkAudio(
   const conflicts = candidate
     ? candidate.conflicts.filter((conflict) => !AUDIO_ISRC_CONFLICT.test(conflict))
     : ["Selected audio file shares no title, filename, or ISRC evidence with this recording."];
-  const acknowledged = decision?.humanConfirmed ? decision.acknowledgedConflicts : [];
+  const acknowledged = record.audioMatch?.humanConfirmed ? record.audioMatch.acknowledgedConflicts : [];
   const audioEvidence = [
+    fileEv("audio-metadata", "file", selectedPath),
     ev("audio-metadata", "artist", extraction.metadata.artist),
     ev("audio-metadata", "title", extraction.metadata.title),
     ev("audio-metadata", "version", extraction.metadata.version),
@@ -877,7 +1047,7 @@ function checkAudio(
       severity: "blocking",
       category: "conflicting",
       description: "Selected audio metadata conflicts with the recording artist, title, or version.",
-      resolution: "human-review",
+      resolvedBy: "human",
       researchEligible: false,
       evidence: [...unacknowledged.map((conflict) => ev("audio-match", "conflict", conflict)), ...audioEvidence],
       recommendedAction: "A human confirms the file with acknowledgeConflicts or selects a different file."
@@ -891,12 +1061,22 @@ function checkAudio(
       severity: "informational",
       category: "conflicting",
       description: "A reviewer acknowledged conflicting audio metadata for the selected file.",
-      resolution: "human-review",
+      resolvedBy: "human",
       researchEligible: false,
       evidence: resolvedConflicts.map((conflict) => ev("audio-match", "acknowledgedConflict", conflict)),
       recommendedAction: "No action; the reviewer decision stands."
     });
   }
+}
+
+function sanitizeGap(gap: MetadataGap, sanitize: (value: string) => string): MetadataGap {
+  return {
+    ...gap,
+    description: sanitize(gap.description),
+    recommendedAction: sanitize(gap.recommendedAction),
+    suggestedValue: gap.suggestedValue === null ? null : sanitize(gap.suggestedValue),
+    evidence: gap.evidence.map((item) => ({ ...item, value: item.value === null ? null : sanitize(item.value) }))
+  };
 }
 
 /**
@@ -929,7 +1109,7 @@ export function analyzeMetadataGaps(
       severity: "blocking",
       category: "needs-human-review",
       description: `Recording is ${record.approvalStatus}; explicit human approval is required.`,
-      resolution: "human-review",
+      resolvedBy: "human",
       researchEligible: false,
       evidence: [ev("record", "approvalStatus", record.approvalStatus)],
       recommendedAction: "A reviewer approves the record with reviewAndApproveRecord after resolving blocking gaps."
@@ -939,7 +1119,7 @@ export function analyzeMetadataGaps(
   // Safety net: the analyzer may be stricter than the preparation gate but never looser.
   if (!gaps.hasBlocking(["approval-pending"])) {
     try {
-      validateRecordForPreparation({ ...record, approvalStatus: "APPROVED" });
+      validateRecordForPreparation({ ...record, approvalStatus: "APPROVED" }, { audioMatchResult: matchResult });
     } catch (error) {
       gaps.add({
         code: "preparation-validation-failed",
@@ -948,16 +1128,24 @@ export function analyzeMetadataGaps(
         severity: "blocking",
         category: "invalid",
         description: error instanceof Error ? error.message : String(error),
-        resolution: "human-review",
+        resolvedBy: "human",
         researchEligible: false,
         recommendedAction: "Resolve the preparation validation error before approval."
       });
     }
   }
 
-  const sorted = [...gaps.gaps].sort(
-    (left, right) => SEVERITY_RANK[left.severity] - SEVERITY_RANK[right.severity] || compareText(left.gapId, right.gapId)
-  );
+  const sanitize = createSanitizer(record, [
+    record.audioFilePath,
+    record.audioMatch?.filePath,
+    ...(record.audioMatch?.candidateFilePaths ?? []),
+    ...(matchResult?.candidates.map((candidate) => candidate.filePath) ?? []),
+    ...(matchResult?.rejectedFiles.map((file) => file.filePath) ?? []),
+    ...(context.audioExtractions ?? []).map((item) => item.filePath)
+  ]);
+  const sorted = gaps.gaps
+    .map((gap) => sanitizeGap(gap, sanitize))
+    .sort((left, right) => SEVERITY_RANK[left.severity] - SEVERITY_RANK[right.severity] || compareText(left.gapId, right.gapId));
   const count = (severity: GapSeverity) => sorted.filter((gap) => gap.severity === severity).length;
   const readiness: ReadinessStatus = gaps.hasBlocking(["approval-pending"])
     ? "BLOCKED"
@@ -1000,8 +1188,9 @@ export const METADATA_GAP_SHEET_COLUMNS = [
   "area",
   "code",
   "fields",
-  "resolution",
+  "resolvedBy",
   "researchEligible",
+  "agentMayResolve",
   "requiresHumanConfirmation",
   "description",
   "recommendedAction",
@@ -1011,6 +1200,10 @@ export const METADATA_GAP_SHEET_COLUMNS = [
 
 export type MetadataGapSheetRow = Array<string | boolean>;
 
+function formatEvidence(item: GapEvidence): string {
+  return `${item.source}.${item.field}=${item.value ?? ""}${item.fileId ? ` [${item.fileId}]` : ""}`;
+}
+
 /**
  * Flattens reports into spreadsheet rows matching METADATA_GAP_SHEET_COLUMNS.
  * Recordings without gaps still produce one row so their readiness is visible.
@@ -1018,7 +1211,7 @@ export type MetadataGapSheetRow = Array<string | boolean>;
 export function toMetadataGapSheetRows(reports: readonly MetadataGapReport[]): MetadataGapSheetRow[] {
   return reports.flatMap((report) =>
     report.gaps.length === 0
-      ? [[report.recordingId, report.readiness, "", "", "", "", "", "", "", false, false, "", "", "", ""]]
+      ? [[report.recordingId, report.readiness, "", "", "", "", "", "", "", false, false, false, "", "", "", ""]]
       : report.gaps.map((gap) => [
           report.recordingId,
           report.readiness,
@@ -1028,13 +1221,14 @@ export function toMetadataGapSheetRows(reports: readonly MetadataGapReport[]): M
           gap.area,
           gap.code,
           gap.fields.join(", "),
-          gap.resolution,
+          gap.resolvedBy,
           gap.researchEligible,
+          gap.agentMayResolve,
           gap.requiresHumanConfirmation,
           gap.description,
           gap.recommendedAction,
           gap.suggestedValue ?? "",
-          gap.evidence.map((item) => `${item.source}.${item.field}=${item.value ?? ""}`).join("; ")
+          gap.evidence.map(formatEvidence).join("; ")
         ])
   );
 }

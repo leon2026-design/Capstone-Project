@@ -18,6 +18,7 @@ test("imports complete metadata and preserves the Mediabase record shape", () =>
 
   expect(records).toHaveLength(1);
   expect(records[0]).toMatchObject({
+    recordSource: "ORCHARD",
     artist: "",
     artistAttribution: {
       trackArtist: "The Harbor Lights",
@@ -46,7 +47,7 @@ test("imports complete metadata and preserves the Mediabase record shape", () =>
     "christmasHanukkahDeclaration", "comments", "company",
     "email", "featuredArtist", "generativeAiAudioDeclaration",
     "hideUntil", "independentLabelDeclaration", "isrc", "isrcValidation", "label",
-    "officialReleaseDate", "phone", "recordingId", "rememberInformation",
+    "officialReleaseDate", "phone", "recordSource", "recordingId", "rememberInformation",
     "submitterName", "title", "version"
   ].sort());
   expect(report.issues).toEqual([

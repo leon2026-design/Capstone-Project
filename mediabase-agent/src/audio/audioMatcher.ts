@@ -1,5 +1,5 @@
 import { basename, extname, resolve } from "node:path";
-import type { DemoRecording } from "../browser/mediabaseForm";
+import type { DemoRecording } from "../metadata/recordValidation";
 import {
   normalizeIsrcValue,
   type AudioExtractionErrorCode,
@@ -331,6 +331,130 @@ export type AudioSelectionOptions = {
   /** Required when the chosen candidate has conflicting evidence. */
   acknowledgeConflicts?: boolean;
 };
+
+export type AudioDecisionProblemCode =
+  | "unresolved"
+  | "path-mismatch"
+  | "stale-automatic-match"
+  | "selection-new-candidates"
+  | "selection-new-conflicts"
+  | "selection-rejected";
+
+export type AudioDecisionProblem = {
+  code: AudioDecisionProblemCode;
+  message: string;
+  /** Files involved; absolute paths for internal use only. */
+  filePaths: string[];
+  conflicts: string[];
+};
+
+export type AudioDecisionAssessment = {
+  /** Effective status after reconciling the stored decision with current evidence. */
+  status: AudioMatchDecisionStatus | null;
+  /** `automatic` decisions follow current evidence; `human` selections are preserved but may be flagged. */
+  source: "human" | "automatic" | "manual-path" | "none";
+  filePath: string | null;
+  problems: AudioDecisionProblem[];
+};
+
+function sameMembers(left: readonly string[], right: readonly string[]): boolean {
+  const set = new Set(left);
+  return set.size === new Set(right).size && right.every((value) => set.has(value));
+}
+
+/**
+ * Reconciles a recording's stored audio decision with the current matcher
+ * result (if supplied). Shared by form preparation and gap analysis so both
+ * use the same effective audio decision. Never modifies the record.
+ */
+export function assessAudioDecision(
+  record: DemoRecording,
+  current: AudioMatchResult | null = null
+): AudioDecisionAssessment {
+  if (current && current.recordingId !== record.recordingId) {
+    throw new Error("Audio match result belongs to a different recording.");
+  }
+  const decision = record.audioMatch;
+  const recordPath = record.audioFilePath ?? null;
+  const problems: AudioDecisionProblem[] = [];
+  const currentPaths = current?.candidates.map((candidate) => candidate.filePath) ?? [];
+  let assessment: Omit<AudioDecisionAssessment, "problems">;
+
+  if (decision?.humanConfirmed) {
+    assessment = { status: decision.status, source: "human", filePath: decision.filePath };
+    if (current) {
+      const known = new Set(decision.candidateFilePaths);
+      const added = currentPaths.filter((path) => !known.has(path) && path !== decision.filePath);
+      if (added.length > 0) {
+        problems.push({
+          code: "selection-new-candidates",
+          message: "New candidate audio files were found after the human audio selection; the selection must be confirmed again.",
+          filePaths: added,
+          conflicts: []
+        });
+      }
+      const selected = current.candidates.find((candidate) => candidate.filePath === decision.filePath);
+      const unacknowledged = selected?.conflicts.filter((conflict) => !decision.acknowledgedConflicts.includes(conflict)) ?? [];
+      if (selected && unacknowledged.length > 0) {
+        problems.push({
+          code: "selection-new-conflicts",
+          message: "The selected audio file now has conflicting evidence that was not acknowledged; the selection must be confirmed again.",
+          filePaths: [selected.filePath],
+          conflicts: unacknowledged
+        });
+      }
+      if (decision.filePath && current.rejectedFiles.some((file) => file.filePath === decision.filePath)) {
+        problems.push({
+          code: "selection-rejected",
+          message: "The selected audio file can no longer be read; select a different file or confirm no audio.",
+          filePaths: [decision.filePath],
+          conflicts: []
+        });
+      }
+    }
+  } else if (decision || (current && !recordPath)) {
+    const currentStatus = current ? decisionStatus(current.status) : null;
+    assessment = {
+      status: currentStatus ?? decision?.status ?? null,
+      source: "automatic",
+      filePath: current ? current.selectedFilePath : decision?.filePath ?? null
+    };
+    const outdated = decision
+      ? current !== null &&
+        (decision.status !== currentStatus ||
+          (decision.filePath ?? null) !== current.selectedFilePath ||
+          !sameMembers(decision.candidateFilePaths, currentPaths))
+      : current?.status === "MATCHED";
+    if (outdated) {
+      problems.push({
+        code: "stale-automatic-match",
+        message: `The stored automatic audio decision (${decision?.status ?? "not applied"}) no longer matches current evidence (${currentStatus}); apply the current match result before approval.`,
+        filePaths: [...new Set([decision?.filePath, current?.selectedFilePath].filter((path): path is string => !!path))],
+        conflicts: []
+      });
+    }
+  } else {
+    assessment = { status: null, source: recordPath ? "manual-path" : "none", filePath: recordPath };
+  }
+
+  if (assessment.status === "AMBIGUOUS" || assessment.status === "NEEDS_REVIEW") {
+    problems.unshift({
+      code: "unresolved",
+      message: "Audio match requires an explicit human selection before approval.",
+      filePaths: currentPaths.length > 0 ? currentPaths : decision?.candidateFilePaths ?? [],
+      conflicts: current?.candidates.flatMap((candidate) => candidate.conflicts) ?? []
+    });
+  }
+  if (decision && (decision.filePath ?? null) !== recordPath) {
+    problems.splice(problems[0]?.code === "unresolved" ? 1 : 0, 0, {
+      code: "path-mismatch",
+      message: "Audio file path differs from the reviewed audio match.",
+      filePaths: [decision.filePath, recordPath].filter((path): path is string => !!path),
+      conflicts: []
+    });
+  }
+  return { ...assessment, problems };
+}
 
 /**
  * Records an explicit human audio choice. Pass `null` to confirm that no audio
