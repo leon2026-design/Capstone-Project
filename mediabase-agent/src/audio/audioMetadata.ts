@@ -121,12 +121,16 @@ export async function extractAudioMetadata(filePath: string): Promise<AudioExtra
   }
 
   const header = Buffer.alloc(16);
-  const handle = await open(absolutePath, "r");
   let bytesRead: number;
   try {
-    ({ bytesRead } = await handle.read(header, 0, header.length, 0));
-  } finally {
-    await handle.close();
+    const handle = await open(absolutePath, "r");
+    try {
+      ({ bytesRead } = await handle.read(header, 0, header.length, 0));
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return failure("MISSING_FILE", "Audio file does not exist or cannot be read.");
   }
   const format = detectFormat(header.subarray(0, bytesRead));
   if (format === null) {

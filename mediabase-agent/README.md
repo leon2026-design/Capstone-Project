@@ -118,7 +118,10 @@ depth. WAV artist/title/album are read from RIFF `LIST/INFO` or an embedded
 
 Failures are returned, not thrown, as `{ status: "ERROR", error }` with
 `MISSING_FILE`, `UNSUPPORTED_FORMAT`, or `INVALID_AUDIO`.
-`extractAudioMetadataBatch(paths)` processes paths in sorted order.
+`MISSING_FILE` also covers files that become unreadable after the initial
+file check, including failures opening the file or reading its header.
+`extractAudioMetadataBatch(paths)` processes paths in sorted order and continues
+after a per-file error.
 
 ## Matching audio files to Orchard recordings
 

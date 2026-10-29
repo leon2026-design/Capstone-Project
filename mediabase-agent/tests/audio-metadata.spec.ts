@@ -1,6 +1,9 @@
 import { expect, test } from "@playwright/test";
 import { createHash } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
+import fsPromises, { type FileHandle } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
+import { mock } from "node:test";
 import { extractAudioMetadata, extractAudioMetadataBatch } from "../src/audio/audioMetadata";
 import { buildMp3, buildWav, writeFixture } from "./support/audioFixtures";
 
@@ -149,3 +152,45 @@ test("reports invalid, unsupported, and missing audio files without throwing", a
     ["truncated.wav", "INVALID_AUDIO"]
   ]);
 });
+
+for (const operation of ["open", "read"] as const) {
+  test(`returns a per-file error and continues the batch when ${operation} fails after stat`, async ({}, testInfo) => {
+    const failedPath = writeFixture(testInfo.outputPath("a-unreadable.wav"), buildWav());
+    const validPath = writeFixture(testInfo.outputPath("b-readable.wav"), buildWav());
+    const originalOpen = fsPromises.open;
+    let failedHandle: FileHandle | undefined;
+    const openMock = mock.method(
+      fsPromises,
+      "open",
+      async (...args: Parameters<typeof fsPromises.open>) => {
+        if (args[0] !== failedPath) return originalOpen(...args);
+        if (operation === "open") throw new Error("Cannot open audio file");
+        failedHandle = await originalOpen(...args);
+        mock.method(failedHandle, "read", async () => {
+          throw new Error("Cannot read audio header");
+        });
+        return failedHandle;
+      }
+    );
+    syncBuiltinESMExports();
+
+    try {
+      const results = await extractAudioMetadataBatch([validPath, failedPath]);
+
+      expect(results).toEqual([
+        {
+          status: "ERROR",
+          filePath: failedPath,
+          fileName: "a-unreadable.wav",
+          error: "MISSING_FILE",
+          message: "Audio file does not exist or cannot be read."
+        },
+        expect.objectContaining({ status: "OK", filePath: validPath })
+      ]);
+      if (operation === "read") expect(failedHandle?.fd).toBe(-1);
+    } finally {
+      openMock.mock.restore();
+      syncBuiltinESMExports();
+    }
+  });
+}
