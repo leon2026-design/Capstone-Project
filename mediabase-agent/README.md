@@ -168,6 +168,67 @@ artist attribution.
 local mock form attaches the file to its file input but is never submitted, and
 there is no live Mediabase automation.
 
+## Metadata gap analysis
+
+`analyzeMetadataGaps(record, context)` in `src/metadata/metadataGapAnalyzer.ts`
+is a read-only check run before any research agent. It is synchronous and pure:
+it never mutates inputs, reads files, calls the network, or changes
+`approvalStatus`. Audio evidence is supplied by the caller:
+
+```ts
+const extractions = await extractAudioMetadataBatch(audioPaths);
+const matches = matchAudioToRecordings(records, extractions);
+const reports = analyzeMetadataGapsBatch(records, {
+  audioExtractions: extractions, // used to verify the selected audioFilePath
+  audioMatchResults: matches,    // matched to records by recordingId
+  expectedArtistRoles: []        // e.g. ["primary"] only when Brad's workflow requires it
+});
+const sheetRows = [[...METADATA_GAP_SHEET_COLUMNS], ...toMetadataGapSheetRows(reports)];
+```
+
+Each report contains `recordingId`, `approvalStatus`, `readiness`, a severity
+`summary`, and sorted `gaps`. Batch reports are sorted by `recordingId`, so the
+output does not depend on record or context order.
+
+| `readiness` | Meaning |
+| --- | --- |
+| `BLOCKED` | At least one blocking gap other than pending approval |
+| `AWAITING_APPROVAL` | No other blocking gaps; a human must still approve the record |
+| `READY` | Approved and passes `validateRecordForPreparation`; warnings may remain |
+
+The analyzer re-runs `validateRecordForPreparation` as a safety net, so it may
+be stricter than the preparation gate but never looser. Each gap has:
+
+| Property | Values |
+| --- | --- |
+| `gapId` | Stable `<recordingId>:<code>:<fields>` |
+| `code` | Reuses Orchard codes (`missing-isrc`, `invalid-isrc`, `artist-conflict`, `missing-required-field`) plus analyzer codes such as `artist-unconfirmed`, `audio-ambiguous`, `audio-isrc-conflict`, `declaration-unanswered` |
+| `severity` | `blocking`, `warning`, `informational` |
+| `category` | `missing`, `invalid`, `conflicting`, `needs-human-review` |
+| `area` | `submission`, `identifiers`, `artist-attribution`, `audio`, `release`, `declarations`, `approval` |
+| `resolution` | `deterministic`, `external-research`, `human-review` |
+| `researchEligible` | Whether an external research agent could propose evidence |
+| `requiresHumanConfirmation` | `false` only for deterministic fixes |
+| `suggestedValue` | Deterministic replacement (e.g. `2026-11-15` → `11/15/2026`, normalized ISRC); never applied automatically |
+| `evidence` | `{ source, field, value }` from `record`, `orchard`, `artist-attribution`, `audio-metadata`, or `audio-match` |
+| `recommendedAction` | Next step for the reviewer |
+
+Research eligibility:
+
+- **Potentially researchable:** missing label, official/album release dates,
+  album title, album UPC, and missing or malformed ISRCs. Research results are
+  proposals only; a human confirms every value.
+- **Human-only:** Exact Artist confirmation and Brad's primary/secondary/
+  tertiary hierarchy, Featured Artist (Vydia), declarations, submitter details,
+  audio selection (ambiguous, conflicting, or missing files), and approval.
+- **Deterministic:** ISRC normalization, `mm/dd/yyyy` reformatting of ISO or
+  unpadded dates, whitespace cleanup, and UPC check-digit validation.
+
+No research agent may approve records or override a human decision. Optional
+empty fields (company, phone, version, website, comments, Hide Until) are not
+reported. An empty Featured Artist is informational only; it is never assumed
+to be required.
+
 ## Running checks
 
 ```sh

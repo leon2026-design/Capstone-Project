@@ -48,7 +48,7 @@ export type DemoRecording = {
   approvalStatus: "DRAFT" | "NEEDS_REVIEW" | "APPROVED";
 };
 
-function normalizeDeclarationValue(
+export function normalizeDeclarationValue(
   value: DeclarationValue | string | undefined | null
 ): DeclarationValue {
   if (value === undefined || value === null || value === "") {
@@ -72,7 +72,7 @@ function normalizeDeclarationValue(
   throw new Error(`Unsupported declaration value: ${value}`);
 }
 
-function isValidDate(value: string): boolean {
+export function isValidDate(value: string): boolean {
   const match = /^(0[1-9]|1[0-2])\/(0[1-9]|[12]\d|3[01])\/(\d{4})$/.exec(
     value
   );
