@@ -1,4 +1,11 @@
 import { expect, type Page } from "@playwright/test";
+import type { AudioMatchDecision } from "../audio/audioMatcher";
+import {
+  confirmArtistAttribution,
+  createArtistAttributionDecision,
+  type ArtistAttributionDecision,
+  type ArtistAttributionSelection
+} from "../metadata/artistAttribution";
 
 export type DeclarationValue = "yes" | "no" | "unanswered" | null;
 
@@ -15,7 +22,9 @@ export type DemoRecording = {
   phone?: string | null;
   email?: string | null;
   rememberInformation?: boolean;
+  /** Mediabase Exact Artist. */
   artist: string;
+  artistAttribution?: ArtistAttributionDecision;
   featuredArtist?: string | null;
   title: string;
   version?: string | null;
@@ -33,7 +42,9 @@ export type DemoRecording = {
   artistWebsite?: string | null;
   comments?: string | null;
   hideUntil?: string | null;
+  /** Local audio path only; it is never uploaded automatically. */
   audioFilePath?: string | null;
+  audioMatch?: AudioMatchDecision;
   approvalStatus: "DRAFT" | "NEEDS_REVIEW" | "APPROVED";
 };
 
@@ -146,7 +157,11 @@ const NORMALIZED_ISRC_PATTERN = /^[A-Z]{2}[A-Z0-9]{3}[0-9]{7}$/;
 
 export type RecordReviewOptions = {
   confirmMissingIsrc?: boolean;
+  /** Explicit human artist selection; required for every Orchard artist-attribution decision. */
+  confirmArtistAttribution?: ArtistAttributionSelection;
 };
+
+const UNRESOLVED_AUDIO_STATUSES = new Set(["NEEDS_REVIEW", "AMBIGUOUS"]);
 
 export function validateRecordForPreparation(record: DemoRecording): void {
   if (record.approvalStatus !== "APPROVED") {
@@ -155,6 +170,20 @@ export function validateRecordForPreparation(record: DemoRecording): void {
 
   if (!record.submitterName?.trim() || !record.email?.trim()) {
     throw new Error("Name and email are required.");
+  }
+
+  const attribution = record.artistAttribution;
+  // Gate on `confirmed`, not the stored `requiresConfirmation` flag, so an
+  // edited decision object cannot bypass the human selection.
+  if (attribution && !attribution.confirmed) {
+    throw new Error(
+      attribution.status === "CONFLICT"
+        ? "Conflicting Orchard artist attribution must be explicitly confirmed before approval."
+        : "Mediabase Exact Artist must be explicitly confirmed from the Orchard artist attribution before approval."
+    );
+  }
+  if (attribution?.confirmed && record.artist !== attribution.confirmedExactArtist) {
+    throw new Error("Exact Artist differs from the confirmed artist attribution.");
   }
 
   if (!record.artist.trim() || !record.title.trim()) {
@@ -192,6 +221,15 @@ export function validateRecordForPreparation(record: DemoRecording): void {
   if (record.isrcValidation?.status === "valid" && !record.isrc) {
     throw new Error("Validated ISRC metadata is inconsistent with the recording.");
   }
+
+  if (record.audioMatch) {
+    if (UNRESOLVED_AUDIO_STATUSES.has(record.audioMatch.status)) {
+      throw new Error("Audio match requires an explicit human selection before approval.");
+    }
+    if ((record.audioMatch.filePath ?? null) !== (record.audioFilePath ?? null)) {
+      throw new Error("Audio file path differs from the reviewed audio match.");
+    }
+  }
 }
 
 export function reviewAndApproveRecord(
@@ -199,8 +237,37 @@ export function reviewAndApproveRecord(
   reviewData: Partial<DemoRecording> = {},
   options: RecordReviewOptions = {}
 ): DemoRecording {
-  const { isrcValidation: ignoredValidation, ...reviewedFields } = reviewData;
+  const {
+    isrcValidation: ignoredValidation,
+    artistAttribution: ignoredAttribution,
+    audioMatch: ignoredAudioMatch,
+    ...reviewedFields
+  } = reviewData;
   void ignoredValidation;
+  void ignoredAttribution;
+  void ignoredAudioMatch;
+
+  let artistAttribution = record.artistAttribution;
+  const selection = options.confirmArtistAttribution;
+  if (selection) {
+    artistAttribution = confirmArtistAttribution(
+      artistAttribution ?? createArtistAttributionDecision(null, null),
+      selection
+    );
+    if (
+      reviewedFields.artist !== undefined &&
+      reviewedFields.artist.trim() !== artistAttribution.confirmedExactArtist
+    ) {
+      throw new Error("Reviewed artist must match the confirmed artist attribution.");
+    }
+    reviewedFields.artist = artistAttribution.confirmedExactArtist ?? "";
+  } else if (
+    artistAttribution?.confirmed &&
+    reviewedFields.artist !== undefined &&
+    reviewedFields.artist !== artistAttribution.confirmedExactArtist
+  ) {
+    throw new Error("Confirmed artist attribution cannot change without a new explicit confirmation.");
+  }
   const candidateIsrc = reviewedFields.isrc !== undefined
     ? reviewedFields.isrc?.trim() || null
     : record.isrc?.trim() || null;
@@ -233,6 +300,7 @@ export function reviewAndApproveRecord(
     ...reviewedFields,
     isrc: candidateIsrc,
     isrcValidation,
+    ...(artistAttribution ? { artistAttribution } : {}),
     approvalStatus: "APPROVED"
   };
 

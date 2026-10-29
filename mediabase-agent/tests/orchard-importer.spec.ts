@@ -18,7 +18,20 @@ test("imports complete metadata and preserves the Mediabase record shape", () =>
 
   expect(records).toHaveLength(1);
   expect(records[0]).toMatchObject({
-    artist: "The Harbor Lights",
+    artist: "",
+    artistAttribution: {
+      trackArtist: "The Harbor Lights",
+      productArtist: "North Star",
+      status: "CONFLICT",
+      candidateExactArtists: ["The Harbor Lights", "North Star"],
+      requiresConfirmation: true,
+      confirmed: false,
+      confirmedExactArtist: null,
+      primaryArtist: null,
+      secondaryArtist: null,
+      tertiaryArtist: null,
+      featuredArtistSource: "VYDIA"
+    },
     title: "Signal, Again",
     featuredArtist: null,
     version: "Radio Edit",
@@ -29,7 +42,7 @@ test("imports complete metadata and preserves the Mediabase record shape", () =>
   });
   expect(Object.keys(records[0]).sort()).toEqual([
     "albumReleaseDate", "albumTitle", "albumUPC", "approvalStatus", "artist",
-    "artistWebsite", "audioFilePath", "canadianContentDeclaration",
+    "artistAttribution", "artistWebsite", "audioFilePath", "canadianContentDeclaration",
     "christmasHanukkahDeclaration", "comments", "company",
     "email", "featuredArtist", "generativeAiAudioDeclaration",
     "hideUntil", "independentLabelDeclaration", "isrc", "isrcValidation", "label",
@@ -91,13 +104,15 @@ test("parses valid quoted content and rejects characters after closing quotes", 
   );
   expect(result.records[0]).toMatchObject({
     title: 'Title, "Again"\nPart 2',
-    artist: "Track Artist"
+    artist: "",
+    artistAttribution: { trackArtist: "Track Artist", productArtist: "Product Artist", status: "CONFLICT" }
   });
 
   expect(importOrchardCsv("").records).toEqual([]);
   expect(importOrchardCsv('TRACK,PRODUCT ARTIST\n"",Artist').records[0]).toMatchObject({
     title: "",
-    artist: "Artist"
+    artist: "",
+    artistAttribution: { status: "PRODUCT_ARTIST_ONLY", productArtist: "Artist", confirmed: false }
   });
   expect(importOrchardCsv('"TRACK","Artist\nTitle').report.issues[0]).toMatchObject({
     code: "malformed-csv"
@@ -139,7 +154,8 @@ test("imports Orchard CSV rows into draft recordings and prepares an approved fo
   });
   const remix = records.find((record) => record.version === "Remix");
   expect(remix).toMatchObject({
-    artist: "The Harbor Lights",
+    artist: "",
+    artistAttribution: { status: "CONFLICT", requiresConfirmation: true, confirmed: false },
     featuredArtist: null,
     title: "Signal, Again",
     version: "Remix",
@@ -154,7 +170,17 @@ test("imports Orchard CSV rows into draft recordings and prepares an approved fo
     submitterName: "Casey Morgan",
     email: "casey@example.test",
     officialReleaseDate: "11/15/2026"
+  }, {
+    confirmArtistAttribution: { exactArtist: "The Harbor Lights" }
   })).toThrow("Missing Orchard ISRC must be explicitly reviewed before approval.");
+  expect(() => reviewAndApproveRecord(remix, {
+    submitterName: "Casey Morgan",
+    email: "casey@example.test",
+    officialReleaseDate: "11/15/2026",
+    artist: "The Harbor Lights"
+  }, {
+    confirmMissingIsrc: true
+  })).toThrow("Conflicting Orchard artist attribution must be explicitly confirmed before approval.");
 
   const approved = reviewAndApproveRecord(remix, {
     submitterName: "Casey Morgan",
@@ -168,10 +194,17 @@ test("imports Orchard CSV rows into draft recordings and prepares an approved fo
     christmasHanukkahDeclaration: null,
     canadianContentDeclaration: "yes"
   }, {
-    confirmMissingIsrc: true
+    confirmMissingIsrc: true,
+    confirmArtistAttribution: { exactArtist: "The Harbor Lights" }
   });
 
   expect(approved.approvalStatus).toBe("APPROVED");
+  expect(approved.featuredArtist).toBeNull();
+  expect(approved.artistAttribution).toMatchObject({
+    confirmed: true,
+    confirmedExactArtist: "The Harbor Lights",
+    primaryArtist: null
+  });
   await page.setContent(readFileSync("fixtures/mock-mediabase.html", "utf8"));
   await prepareMediabaseForm(page, approved);
 
@@ -210,14 +243,15 @@ test("rejects an invalid imported ISRC until it is corrected and revalidated", a
   expect(report.issues).toContainEqual(
     expect.objectContaining({ code: "invalid-isrc", rawValue: "bad-isrc" })
   );
-  expect(() => reviewAndApproveRecord(imported, reviewData)).toThrow(
+  const artistConfirmation = { confirmArtistAttribution: { exactArtist: "Track Artist" } };
+  expect(() => reviewAndApproveRecord(imported, reviewData, artistConfirmation)).toThrow(
     "Invalid Orchard ISRC must be corrected before approval."
   );
 
   const approved = reviewAndApproveRecord(imported, {
     ...reviewData,
     isrc: "USAAA2600003"
-  });
+  }, artistConfirmation);
   expect(approved).toMatchObject({
     isrc: "USAAA2600003",
     approvalStatus: "APPROVED",
@@ -258,22 +292,25 @@ test("rejects unapproved drafts and missing required fields before browser prepa
       officialReleaseDate: null
     })
   ).toThrow("Name and email are required.");
+  expect(() => reviewAndApproveRecord(draft, requiredReviewData)).toThrow(
+    "Conflicting Orchard artist attribution must be explicitly confirmed before approval."
+  );
   expect(() =>
-    reviewAndApproveRecord(draft, {
-      ...requiredReviewData,
-      artist: ""
+    reviewAndApproveRecord(draft, requiredReviewData, {
+      confirmArtistAttribution: { exactArtist: "   " }
     })
-  ).toThrow("Artist and title are required.");
+  ).toThrow("Confirmed Mediabase Exact Artist must not be empty.");
+  const artistConfirmation = { confirmArtistAttribution: { exactArtist: "The Harbor Lights" } };
   expect(() =>
     reviewAndApproveRecord(draft, {
       ...requiredReviewData,
       title: ""
-    })
+    }, artistConfirmation)
   ).toThrow("Artist and title are required.");
   expect(() =>
     reviewAndApproveRecord(draft, {
       ...requiredReviewData,
       officialReleaseDate: null
-    })
+    }, artistConfirmation)
   ).toThrow("Official release date is required in mm/dd/yyyy format.");
 });
