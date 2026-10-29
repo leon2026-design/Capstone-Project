@@ -402,13 +402,14 @@ Only matched claims become `INDEPENDENTLY_VERIFIED`. At least one exact,
 verified supporting claim is required for `PROPOSED`; high confidence never
 substitutes for this. Verification is separate from Brad's approval.
 
-This phase implements the **verification contract**, not a live verifier.
+MB-05B.1 defined the **verification contract**; MB-05B.2 adds the live
+verifier described below (`src/research/sourceVerifier.ts`).
 Never populate the trusted array by copying or trusting provider output.
 Tests use fictional independent attestations and `example.test` citations,
-not claims of real-world research. A future verifier must check actual source
-content, identity, release/version, relevance, and provenance before issuing
-an attestation. Restrict its inputs to the current recording/task and refresh
-them if metadata changes.
+not claims of real-world research. Attestations carry the task's
+`identityFingerprint` (a hash of recording ID, artist, title, version, Track
+Artist, and Product Artist), so they stop applying as soon as any identifying
+metadata changes.
 
 Conflicting claims remain `CONFLICTING_EVIDENCE`, even if the provider calls
 them `PROPOSED`; contradictory trusted attestations cannot be hidden by
@@ -442,11 +443,183 @@ record or acknowledge an ISRC conflict.
 
 The future UI should display completed evidence-backed proposals, alternatives,
 and verification/uncertainty labels so Brad reviews exceptions rather than
-filling blank forms. Remaining integrations are the Gemini adapter, approved
-source policy and independent verifier, task/proposal persistence and stale
-result handling, and a human-review UI with controlled application and renewed
+filling blank forms. Remaining integrations after MB-05B.2 are an approved
+source list agreed with Brad, task/proposal persistence and stale-result
+handling, and a human-review UI with controlled application and renewed
 MB-05A validation. No Sheets, emails, live Mediabase, or production Apps Script
 integration is included.
+
+## Live Gemini research and evidence verification (MB-05B.2)
+
+Gemini investigates and prepares; Brad decides. MB-05B.2 connects the
+MB-05B.1 framework to Gemini through the official `@google/genai` SDK, adds an
+independent source verifier, and wraps both in a budgeted orchestrator. All
+MB-05B.1 restrictions still apply: every result is `PENDING_REVIEW`, nothing
+modifies a record, approval, artist hierarchy, declarations, or audio
+selection, and nothing touches live Mediabase.
+
+| Module | Role |
+| --- | --- |
+| `src/research/geminiResearchProvider.ts` | Gemini provider: config, prompt, response schema, grounding/usage extraction, safe error classification. |
+| `src/research/sourceVerifier.ts` | Fetches cited pages from approved hosts and checks quote, value, and recording identity. |
+| `src/research/researchOrchestrator.ts` | `runMetadataResearch()`: modes, retries, backoff, budgets, verification, per-task results. |
+| `src/research/researchProvider.ts` | Shared grounding/usage types and `ResearchProviderError` (safe codes only). |
+| `scripts/liveResearchDemo.ts` | Opt-in demonstration with a fictional recording. |
+
+### Configuration
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) | required for live mode | Gemini Developer API key. Put it in `mediabase-agent/.env` (git-ignored) or the shell environment. Never commit it. |
+| `MEDIABASE_GEMINI_MODEL` | `gemini-3.5-flash-lite` | Stable text model. Preview, experimental, `-latest`, and media models are rejected. |
+| `MEDIABASE_GEMINI_GOOGLE_SEARCH` | `true` | Enables the Google Search grounding tool. |
+| `MEDIABASE_GEMINI_TIMEOUT_MS` | `60000` | Per-request timeout (1000–300000). |
+| `MEDIABASE_GEMINI_MAX_OUTPUT_TOKENS` | `8192` | Output cap (256–65536). |
+| `MEDIABASE_APPROVED_SOURCES` | empty | Comma-separated `host=category`; prefix `*.` to include subdomains, e.g. `*.example-label.com=official-label,isrc.example.org=identifier-registry`. Categories: `official-artist`, `official-label`, `distributor`, `identifier-registry`, `published-catalog`. |
+
+Vertex AI / Enterprise mode is intentionally rejected. Configuration errors are
+raised before any request and never include the key.
+
+### How a task is researched
+
+```ts
+import { createGeminiResearchProviderFromEnv } from "./src/research/geminiResearchProvider";
+import { runMetadataResearch } from "./src/research/researchOrchestrator";
+import { parseApprovedSources, SourceVerifier } from "./src/research/sourceVerifier";
+
+const result = await runMetadataResearch(tasks, {
+  mode: "live",                       // or "mock" (offline provider) or "dry-run" (no calls)
+  provider: createGeminiResearchProviderFromEnv(),
+  verifier: new SourceVerifier({ approvedSources: parseApprovedSources(process.env.MEDIABASE_APPROVED_SOURCES) }),
+  limits: { maxTasks: 5, maxProviderCalls: 8, maxRetries: 2 }
+});
+// result.results[i]: { status, attempts, proposal, failure, grounding, verification, usage }
+```
+
+1. **Provider.** One `generateContent` call per attempt with the Google Search
+   tool, a JSON response schema pinned to the task's recording/gap/field, and a
+   system instruction that treats task data and web content as untrusted, asks
+   for verbatim quotes, and forbids invented citations or resolving ISRC
+   conflicts. SDK retries and automatic function-call continuation are off so
+   the orchestrator owns the call budget. The prompt contains only the redacted
+   task view (no emails, paths, approval state, or unrelated record data).
+   Grounding sources and search-query counts are copied exactly as returned;
+   none are synthesized.
+2. **Validation.** The parsed JSON goes through the unchanged MB-05B.1
+   `validateMetadataResearchResponse`. Only free-text `explanation` line breaks
+   are flattened; values, quotes, and URLs are never altered.
+3. **Independent verification.** For each cited claim the verifier requires:
+   an `https` URL without credentials or custom port; a host on the approved
+   list whose configured category equals the claimed category; a host that
+   search grounding actually returned (`requireGrounding`); public DNS results
+   for every hop (no loopback, private, link-local, CGNAT, or mapped private
+   addresses); manual redirects re-checked at every hop (max 3); a 10 s timeout;
+   a 1 MB streamed size cap; and a text/HTML/JSON content type. It then checks
+   that the retrieved visible text (scripts/styles removed) contains the quote,
+   that the quote contains the claimed value in a field-aware way (ISRC
+   alphanumerics, UPC/EAN digits, ISO or written-out dates, phrase match for
+   label/album), and that the recording identity (title or album, an artist,
+   and the version for recording-level fields) appears near the quote. Only
+   then is a `VerifiedResearchEvidence` attestation created, bound to the task's
+   `identityFingerprint`. Attestations are never copied from Gemini output.
+4. **Revalidation.** The response is validated again with those attestations.
+   A proposal stays `INSUFFICIENT_EVIDENCE` with `suggestedValue: null` unless a
+   supporting claim was independently verified; verified contradicting sources
+   force `CONFLICTING_EVIDENCE`; ISRC conflicts are always human-resolved.
+
+Per-source reports (`verification.reports`) use these statuses: `VERIFIED`,
+`NO_URL`, `UNSAFE_URL`, `SOURCE_NOT_APPROVED`, `CATEGORY_MISMATCH`,
+`NOT_GROUNDED`, `REDIRECT_BLOCKED`, `PRIVATE_ADDRESS`, `FETCH_FAILED`,
+`HTTP_ERROR`, `TIMEOUT`, `TOO_LARGE`, `UNSUPPORTED_CONTENT`, `QUOTE_NOT_FOUND`,
+`VALUE_NOT_IN_QUOTE`, `IDENTITY_NOT_FOUND`, `IDENTITY_SNAPSHOT_MISMATCH`, and
+`NOT_CHECKED_LIMIT`. Each report states its role (`SUPPORTING`/`CONFLICTING`)
+and whether it contradicts the suggestion. The task-level summary is
+`VERIFIED`, `PARTIALLY_VERIFIED`, `UNVERIFIED`, or `NOT_ATTEMPTED`, plus
+`verifiedOfficialSource` (verified support from a non-catalog category).
+
+### Retries, budgets, and failures
+
+| Limit | Default | Notes |
+| --- | --- | --- |
+| `maxTasks` | 10 | Tasks beyond this fail as `BUDGET_EXHAUSTED`. |
+| `maxProviderCalls` | 20 | Hard cap on Gemini requests per batch, retries included. |
+| `maxRetries` | 2 | For rate limits, timeouts, and transient 5xx/network errors. |
+| `maxInvalidResponseRetries` | 0 | Malformed/invalid output is not retried by default (max 2). |
+| `initialBackoffMs` / `maxBackoffMs` | 2000 / 60000 | Exponential; rate limits honor Gemini's `retryDelay` up to the cap. |
+| `minRequestIntervalMs` | 0 | Optional spacing between calls. |
+
+Per-task failure isolation is preserved. Failures use safe codes only
+(`RATE_LIMITED`, `QUOTA_EXHAUSTED`, `TIMEOUT`, `PROVIDER_ERROR`, `INVALID_RESPONSE`,
+`AUTHENTICATION_ERROR`, `CONFIGURATION_ERROR`, `BUDGET_EXHAUSTED`,
+`BATCH_ABORTED`); raw SDK messages, prompts, and keys are discarded. A
+credential or configuration error stops the remaining tasks (`BATCH_ABORTED`)
+instead of repeating the same failing call. Confirmed quota exhaustion is
+`QUOTA_EXHAUSTED` and is never automatically retried, even if a retry hint is
+also present. Confirmation requires structured Google RPC details: a
+`QuotaFailure` violation with a zero allowance or a per-day quota identifier,
+or a Google `ErrorInfo` reason of `QUOTA_EXHAUSTED` / `DAILY_LIMIT_EXCEEDED`.
+A generic 429, `RESOURCE_EXHAUSTED`, ambiguous `QUOTA_EXCEEDED`, or free-text
+quota message alone remains `RATE_LIMITED` with bounded retries.
+Only typed `RetryInfo.retryDelay` details supply backoff hints.
+
+Provider failures include optional safe `diagnostics` with `httpStatus`
+(or `null` for network errors), an allowlisted `category`, and `retryable`
+(whether the failure is eligible for automatic retry, subject to batch limits).
+Timeouts remain `TIMEOUT`, including HTTP 408/504 and abort/timeout exceptions,
+not HTTP 429. No raw messages, RPC metadata, prompts, keys, or credentials are
+exported. Every failure stays `UNRESOLVED` and `retryEligible: true`, meaning it
+can be manually rescheduled once its underlying problem has been addressed;
+this is distinct from automatic retryability.
+The existing offline `researchMetadata()` is unchanged.
+
+### Local demonstration (opt-in)
+
+```sh
+npm run research:demo                                  # dry run: no Gemini call, no network
+npm run research:demo:live                             # one live call, default field "label"
+npm run research:demo:live -- --field isrc --max-calls 2
+```
+
+The demo uses a fictional Orchard recording, researches one eligible gap, caps
+calls at `--max-calls` (default 1, hard maximum 3), prints the proposal,
+grounding, verification reports, and usage, and confirms the record and its
+`DRAFT` approval status are unchanged. It never imports browser automation and
+never contacts Mediabase. It lives outside `tests/`, so Playwright never runs
+it. Because the recording is fictional, the expected honest answer is
+`INSUFFICIENT_EVIDENCE`.
+
+### Costs and usage
+
+- Each attempt is one billed `generateContent` request; usage reports prompt,
+  output, thinking, tool-prompt, and total tokens plus executed search queries.
+- On Gemini 3-series models, Google Search grounding is billed per executed
+  search query once the free monthly allowance is used. Check the current
+  Gemini API pricing page before running batches.
+- Free-tier keys may have no Search grounding quota. Gemini then returns 429
+  `RESOURCE_EXHAUSTED` immediately. It is reported as non-retried
+  `QUOTA_EXHAUSTED` only when structured details confirm exhaustion; otherwise
+  it remains `RATE_LIMITED` with bounded retries. Set `MEDIABASE_GEMINI_GOOGLE_SEARCH=false` to test
+  the ungrounded path; without grounding, no claim can be verified.
+- Keep `maxProviderCalls` small; the worst case per batch is
+  `maxProviderCalls` requests.
+
+### Verification limitations
+
+- **Approved sources default to empty** (fail closed): with no configured hosts
+  every citation stays a `PROVIDER_CLAIM`. Brad must choose the hosts.
+- **Grounding redirect URIs are not followed.** On the Gemini Developer API
+  grounding chunks are `vertexaisearch.cloud.google.com` redirect links whose
+  title is usually the source domain; the verifier matches on that domain and
+  fetches the model-cited direct URL itself.
+- **Heuristic semantics.** Matching is textual: quote present, value in quote,
+  identity terms within about 2,000 characters. It does not understand page
+  layout, so a page listing several releases could still mislead it; Brad's
+  review remains mandatory. Pages that need JavaScript to render will fail as
+  `QUOTE_NOT_FOUND`.
+- **DNS rebinding** between the address check and the fetch is mitigated only by
+  the host allowlist; there is no pinned-IP connection.
+- Verification is a snapshot of one retrieval; it does not prove the page will
+  stay the same and is invalidated whenever identifying metadata changes.
 
 ## Running checks
 
