@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { extractAudioMetadataBatch } from "../src/audio/audioMetadata";
 import {
   applyAudioMatch,
+  assessAudioDecision,
   confirmAudioSelection,
   matchAudioToRecording,
   matchAudioToRecordings
@@ -34,6 +35,8 @@ const reviewData = {
 function recording(overrides: Partial<DemoRecording> = {}): DemoRecording {
   return {
     recordingId: "ORCHARD-RADIO",
+    // Hand-built record outside the importer, so it uses the explicit legacy marker.
+    recordSource: "MANUAL",
     artist: "Mara Quill",
     title: "Glass Coast",
     version: "Radio Edit",
@@ -339,4 +342,94 @@ test("prepares a matched recording without uploading, submitting, or altering au
   await expect(page.locator("#mediabase-form")).toHaveAttribute("data-submit-count", "0");
   expect(requests).toEqual([]);
   expect(createHash("sha256").update(readFileSync(radio)).digest("hex")).toBe(before);
+});
+
+test("does not let a stale automatic match hide new ambiguity", async ({ page }, testInfo) => {
+  const radio = wav(testInfo, "glass-coast.wav", radioTags);
+  const original = matchAudioToRecording(recording(), await extractAudioMetadataBatch([radio]));
+  const approved = reviewAndApproveRecord(applyAudioMatch(recording(), original), reviewData, { audioMatchResult: original });
+  expect(approved.audioMatch).toMatchObject({ status: "AUTO_MATCHED", humanConfirmed: false });
+  expect(assessAudioDecision(approved, original).problems).toEqual([]);
+
+  const copy = mp3(testInfo, "glass-coast.mp3", radioTags);
+  const current = matchAudioToRecording(recording(), await extractAudioMetadataBatch([radio, copy]));
+  expect(current.status).toBe("AMBIGUOUS");
+  const assessment = assessAudioDecision(approved, current);
+  expect(assessment).toMatchObject({ status: "AMBIGUOUS", source: "automatic", filePath: null });
+  expect(assessment.problems.map((problem) => problem.code)).toEqual(["unresolved", "stale-automatic-match"]);
+  expect(() => validateRecordForPreparation(approved)).not.toThrow();
+  expect(() => validateRecordForPreparation(approved, { audioMatchResult: current })).toThrow(
+    "Audio match requires an explicit human selection before approval."
+  );
+  await page.setContent(readFileSync("fixtures/mock-mediabase.html", "utf8"));
+  await expect(prepareMediabaseForm(page, approved, { audioMatchResult: current })).rejects.toThrow(
+    "Audio match requires an explicit human selection before approval."
+  );
+  expect(await page.locator("#audio-file").evaluate((input: HTMLInputElement) => input.files?.length ?? 0)).toBe(0);
+
+  // Corrected state: re-apply current evidence, then a human selects.
+  const reapplied = applyAudioMatch(approved, current);
+  expect(reapplied).toMatchObject({ audioFilePath: null, audioMatch: { status: "AMBIGUOUS" } });
+  const selected = confirmAudioSelection(reapplied, current, radio);
+  expect(assessAudioDecision(selected, current).problems).toEqual([]);
+  expect(() => validateRecordForPreparation(selected, { audioMatchResult: current })).not.toThrow();
+});
+
+test("requires review when new evidence contradicts a stored automatic match", async ({}, testInfo) => {
+  const radio = wav(testInfo, "glass-coast.wav", radioTags);
+  const original = matchAudioToRecording(recording(), await extractAudioMetadataBatch([radio]));
+  const approved = reviewAndApproveRecord(applyAudioMatch(recording(), original), reviewData);
+
+  writeFixture(radio, buildWav({ id3: { ...radioTags, version: "Club Remix" } }));
+  const current = matchAudioToRecording(recording(), await extractAudioMetadataBatch([radio]));
+  expect(current.status).toBe("NEEDS_REVIEW");
+  expect(current.candidates[0].conflicts.join(" ")).toContain("Club Remix");
+  expect(assessAudioDecision(approved, current).problems.map((problem) => problem.code)).toEqual([
+    "unresolved",
+    "stale-automatic-match"
+  ]);
+  expect(() => validateRecordForPreparation(approved, { audioMatchResult: current })).toThrow(
+    "Audio match requires an explicit human selection before approval."
+  );
+
+  // A record that never had the current automatic match applied is also stale.
+  const unapplied = recording();
+  const match = matchAudioToRecording(unapplied, await extractAudioMetadataBatch([wav(testInfo, "radio.wav", radioTags)]));
+  expect(assessAudioDecision(unapplied, match).problems.map((problem) => problem.code)).toEqual(["stale-automatic-match"]);
+  expect(assessAudioDecision(applyAudioMatch(unapplied, match), match).problems).toEqual([]);
+});
+
+test("preserves human audio selections but flags new candidates and conflicts", async ({}, testInfo) => {
+  const radio = wav(testInfo, "glass-coast.wav", radioTags);
+  const original = matchAudioToRecording(recording(), await extractAudioMetadataBatch([radio]));
+  const selected = confirmAudioSelection(applyAudioMatch(recording(), original), original, radio);
+  const approved = reviewAndApproveRecord(selected, reviewData, { audioMatchResult: original });
+
+  const copy = mp3(testInfo, "glass-coast.mp3", radioTags);
+  const withCopy = matchAudioToRecording(recording(), await extractAudioMetadataBatch([radio, copy]));
+  expect(applyAudioMatch(approved, withCopy)).toBe(approved);
+  const assessment = assessAudioDecision(approved, withCopy);
+  expect(assessment).toMatchObject({ status: "CONFIRMED", source: "human", filePath: radio });
+  expect(assessment.problems).toEqual([
+    expect.objectContaining({ code: "selection-new-candidates", filePaths: [copy] })
+  ]);
+  expect(() => validateRecordForPreparation(approved, { audioMatchResult: withCopy })).toThrow(
+    "New candidate audio files were found after the human audio selection; the selection must be confirmed again."
+  );
+  const reconfirmed = confirmAudioSelection(approved, withCopy, radio);
+  expect(() => validateRecordForPreparation(reconfirmed, { audioMatchResult: withCopy })).not.toThrow();
+
+  writeFixture(radio, buildWav({ id3: { ...radioTags, isrc: "USAAA2600099" } }));
+  const contradicted = matchAudioToRecording(recording(), await extractAudioMetadataBatch([radio]));
+  expect(assessAudioDecision(approved, contradicted).problems).toEqual([
+    expect.objectContaining({
+      code: "selection-new-conflicts",
+      conflicts: [`Embedded ISRC USAAA2600099 contradicts Orchard ISRC ${RADIO_ISRC}.`]
+    })
+  ]);
+  expect(() => validateRecordForPreparation(approved, { audioMatchResult: contradicted })).toThrow(
+    "The selected audio file now has conflicting evidence that was not acknowledged; the selection must be confirmed again."
+  );
+  const acknowledged = confirmAudioSelection(approved, contradicted, radio, { acknowledgeConflicts: true });
+  expect(() => validateRecordForPreparation(acknowledged, { audioMatchResult: contradicted })).not.toThrow();
 });

@@ -1,8 +1,15 @@
 import { createHash } from "node:crypto";
-import type { DemoRecording } from "../browser/mediabaseForm";
+import type { DemoRecording } from "./recordValidation";
 import {
   createArtistAttributionDecision
 } from "./artistAttribution";
+
+const ORCHARD_RECORDING_ID = /^ORCHARD-[0-9A-F]{16}$/;
+
+/** True for IDs in the format produced by importOrchardCsv. */
+export function isOrchardRecordingId(recordingId: string): boolean {
+  return ORCHARD_RECORDING_ID.test(recordingId);
+}
 
 export type OrchardIssueSeverity = "warning" | "error";
 
@@ -318,6 +325,7 @@ export function importOrchardCsv(
     const productType = valueFor(row, "PRODUCT TYPE", "PRODUCT_TYPE", "RELEASE TYPE");
     const record: DemoRecording = {
       recordingId: stableId(sourceName, row, duplicateOccurrence),
+      recordSource: "ORCHARD",
       submitterName: null,
       company: null,
       phone: null,

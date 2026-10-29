@@ -89,8 +89,29 @@ gate checks `artistAttribution.confirmed`, which only
 `confirmArtistAttribution` sets. Once confirmed, the selection is preserved on
 re-approval; changing `artist` requires a new explicit confirmation, and
 `validateRecordForPreparation` rejects a record whose `artist` differs from the
-confirmed Exact Artist. Records without an `artistAttribution` decision (for
-example the already approved `fixtures/example-record.json`) are unaffected.
+confirmed Exact Artist.
+
+`confirmArtistAttribution` also records the `TRACK ARTIST` / `PRODUCT ARTIST`
+values it confirmed (`confirmedSource`). The confirmation stays valid across
+unrelated edits, but if either Orchard artist value later changes, the record is
+blocked until the Exact Artist is confirmed again. A decision marked
+`confirmed` without going through `confirmArtistAttribution` (no
+`confirmedSource`, an empty Exact Artist, or a `status` that does not match the
+artist values) is rejected as inconsistent.
+
+Provenance is recorded in `recordSource` and does not depend on the mutable
+`recordingId`. The importer stamps `recordSource: "ORCHARD"`, and every
+recording requires a confirmed decision by default: deleting or omitting
+`artistAttribution`, changing the recording ID, or dropping `recordSource`
+blocks approval, and a nonempty `artist` alone never counts as confirmation.
+**Legacy exception:** only a record explicitly marked `recordSource: "MANUAL"`
+whose ID is not in the importer's `ORCHARD-<16 hex>` format
+(`isLegacyManualRecord`), such as the already approved
+`fixtures/example-record.json` (`TEST-001`), may omit `artistAttribution`.
+`reviewAndApproveRecord` ignores `recordSource` in review data, so a review
+cannot grant the exception. Like `approvalStatus`, `recordSource` is plain
+prototype data; deliberately forging it is covered by the deferred
+authenticated-approval work.
 
 ### ISRC
 
@@ -164,9 +185,128 @@ Approval is blocked while `audioMatch.status` is `AMBIGUOUS` or
 reviewed match. Matching never changes `approvalStatus`, Orchard ISRCs, or
 artist attribution.
 
+### Reconciling stored decisions with current evidence
+
+A stored `audioMatch` may be older than the audio folder. `assessAudioDecision(
+record, currentResult)` returns the effective decision that the gap analyzer
+and form preparation both use:
+
+- **Automatic matches** (`AUTO_MATCHED`, or no stored decision) follow the
+  current result. If the current status, selected file, or candidate set
+  differs from the stored decision, the match is reported as
+  `stale-automatic-match`; a newly `AMBIGUOUS` or `NEEDS_REVIEW` result also
+  requires a human selection. Re-run `applyAudioMatch` with the current result
+  to refresh it.
+- **Human selections** (`humanConfirmed: true`) are never overwritten. New
+  candidate files, newly unacknowledged conflicts (ISRC, artist, title, or
+  version) on the selected file, or the selected file becoming unreadable block
+  approval until `confirmAudioSelection` is called again.
+
+Pass the current result to the gates:
+
+```ts
+const current = matchAudioToRecording(record, await extractAudioMetadataBatch(paths));
+validateRecordForPreparation(record, { audioMatchResult: current });
+await prepareMediabaseForm(page, record, { audioMatchResult: current });
+reviewAndApproveRecord(record, reviewData, { audioMatchResult: current });
+```
+
+Without `audioMatchResult` the gates check only the stored decision, as before.
+
 `audioFilePath` is only a local path. Nothing is uploaded automatically: the
 local mock form attaches the file to its file input but is never submitted, and
 there is no live Mediabase automation.
+
+## Metadata gap analysis
+
+`analyzeMetadataGaps(record, context)` in `src/metadata/metadataGapAnalyzer.ts`
+is a read-only check run before any research agent. It is synchronous and pure:
+it never mutates inputs, reads files, calls the network, or changes
+`approvalStatus`. Audio evidence is supplied by the caller:
+
+```ts
+const extractions = await extractAudioMetadataBatch(audioPaths);
+const matches = matchAudioToRecordings(records, extractions);
+const reports = analyzeMetadataGapsBatch(records, {
+  audioExtractions: extractions, // used to verify the selected audioFilePath
+  audioMatchResults: matches,    // matched to records by recordingId
+  expectedArtistRoles: []        // e.g. ["primary"] only when Brad's workflow requires it
+});
+const sheetRows = [[...METADATA_GAP_SHEET_COLUMNS], ...toMetadataGapSheetRows(reports)];
+```
+
+Each report contains `recordingId`, `approvalStatus`, `readiness`, a severity
+`summary`, and sorted `gaps`. Batch reports are sorted by `recordingId`, so the
+output does not depend on record or context order.
+
+| `readiness` | Meaning |
+| --- | --- |
+| `BLOCKED` | At least one blocking gap other than pending approval |
+| `AWAITING_APPROVAL` | No other blocking gaps; a human must still approve the record |
+| `READY` | Approved and passes `validateRecordForPreparation`; warnings may remain |
+
+`READY` means the record passes the current prototype workflow checks. It is
+**not** cryptographically verified human approval: `approvalStatus` and other
+record fields are plain mutable data, so a caller can still set `"APPROVED"`
+directly. Authenticated approval is deferred to the human-review interface.
+
+The analyzer re-runs `validateRecordForPreparation` (with the current audio
+match result) as a safety net, so it may be stricter than the preparation gate
+but never looser. Shared validation lives in the runtime-neutral
+`src/metadata/recordValidation.ts`; the analyzer does not load Playwright.
+`src/browser/mediabaseForm.ts` re-exports these functions for existing callers.
+Each gap has:
+
+| Property | Values |
+| --- | --- |
+| `gapId` | Stable `<recordingId>:<code>:<fields>` |
+| `code` | Reuses Orchard codes (`missing-isrc`, `invalid-isrc`, `artist-conflict`, `missing-required-field`) plus analyzer codes such as `artist-unconfirmed`, `audio-ambiguous`, `audio-isrc-conflict`, `declaration-unanswered` |
+| `severity` | `blocking`, `warning`, `informational` |
+| `category` | `missing`, `invalid`, `conflicting`, `needs-human-review` |
+| `area` | `submission`, `identifiers`, `artist-attribution`, `audio`, `release`, `declarations`, `approval` |
+| `resolvedBy` | Who may apply the fix: `deterministic-rule` (mechanical) or `human`; never a research agent |
+| `researchEligible` | The gap is open and a research agent may investigate it and propose evidence; grants no authority to apply anything |
+| `agentMayResolve` | Always `false` |
+| `requiresHumanConfirmation` | `true` when `resolvedBy` is `human` or the gap is research-eligible |
+| `suggestedValue` | Deterministic replacement (e.g. `2026-11-15` → `11/15/2026`, normalized ISRC); never applied automatically |
+| `evidence` | `{ source, field, value, fileId? }` from `record`, `orchard`, `artist-attribution`, `audio-metadata`, or `audio-match` |
+| `recommendedAction` | Next step for the reviewer |
+
+Reports are safe to share with Google Sheets or a research agent. Submitter
+emails are replaced with `[redacted email]`, and local audio files appear only
+by file name plus an opaque `fileId` (`audioFileId(path)`, e.g.
+`AUDIO-5E4CDCBBD922`); directory paths are removed from all evidence and
+descriptions. Records are not changed, so full `audioFilePath` values remain
+available internally for matching and Playwright file attachment.
+
+Research eligibility is separate from authority to apply a change
+(`RESEARCH_AGENT_POLICY`). `researchEligible` answers "may an agent
+investigate?"; `resolvedBy`, `agentMayResolve: false`, and
+`requiresHumanConfirmation` answer "who decides?". For example, an
+unacknowledged conflicting embedded ISRC is `researchEligible: true`,
+`resolvedBy: "human"`, and blocking; once a reviewer acknowledges it, it
+becomes informational and no longer research-eligible. A research agent **may**
+investigate gaps
+(including conflicting ISRCs), search approved sources, explain discrepancies,
+and suggest corrections with evidence. It **must not** choose an authoritative
+value, overwrite metadata, resolve conflicts without human confirmation, or
+approve recordings.
+
+Research eligibility:
+
+- **Potentially researchable:** missing label, official/album release dates,
+  album title, album UPC, missing or malformed ISRCs, and conflicting embedded
+  ISRCs. Research results are proposals only; a human confirms every value.
+- **Human-only:** Exact Artist confirmation and Brad's primary/secondary/
+  tertiary hierarchy, Featured Artist (Vydia), declarations, submitter details,
+  audio selection (ambiguous, conflicting, or missing files), and approval.
+- **Deterministic:** ISRC normalization, `mm/dd/yyyy` reformatting of ISO or
+  unpadded dates, whitespace cleanup, and UPC check-digit validation.
+
+No research agent may approve records or override a human decision. Optional
+empty fields (company, phone, version, website, comments, Hide Until) are not
+reported. An empty Featured Artist is informational only; it is never assumed
+to be required.
 
 ## Running checks
 
