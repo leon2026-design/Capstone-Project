@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { analyzeMetadataGaps, type MetadataGapReport } from "../src/metadata/metadataGapAnalyzer";
 import {
   buildMetadataResearchTasks,
@@ -272,7 +272,7 @@ test("researches actual embedded ISRC conflicts without resolving them automatic
   const record = draft();
   record.isrc = "USAAA2600010";
   record.isrcValidation = { status: "valid", originalValue: record.isrc, reviewed: true };
-  record.audioFilePath = "C:\\fictional\\glass.wav";
+  record.audioFilePath = resolve("C:\\fictional\\glass.wav");
   const report = analyzeMetadataGaps(record, {
     audioExtractions: [{
       status: "OK", filePath: record.audioFilePath, fileName: "glass.wav",

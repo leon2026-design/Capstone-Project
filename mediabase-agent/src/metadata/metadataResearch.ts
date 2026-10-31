@@ -395,7 +395,8 @@ export function validateMetadataResearchResponse(
   }
   const unresolvedReasons: string[] = [];
   const contradictory = conflictingEvidence.length > 0 ||
-    evidence.some((item) => item.supportedValue !== response.suggestedValue);
+    (response.suggestedValue !== null &&
+      evidence.some((item) => item.supportedValue !== response.suggestedValue));
   const supported = evidence.some((item) =>
     item.verification === "INDEPENDENTLY_VERIFIED" && item.supportedValue === response.suggestedValue);
   let outcome: ResearchOutcome = response.outcome;

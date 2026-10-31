@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { ApiError, type GenerateContentParameters, type GenerateContentResponse } from "@google/genai";
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { analyzeMetadataGaps } from "../src/metadata/metadataGapAnalyzer";
 import {
   buildMetadataResearchTasks,
@@ -641,7 +641,7 @@ test.describe("Research orchestration", () => {
     const source = record();
     source.isrc = "QZFIC2600001";
     source.isrcValidation = { status: "valid", originalValue: source.isrc, reviewed: true };
-    source.audioFilePath = "C:\\fictional\\glass.wav";
+    source.audioFilePath = resolve("C:\\fictional\\glass.wav");
     const report = analyzeMetadataGaps(source, {
       audioExtractions: [{
         status: "OK", filePath: source.audioFilePath, fileName: "glass.wav",
