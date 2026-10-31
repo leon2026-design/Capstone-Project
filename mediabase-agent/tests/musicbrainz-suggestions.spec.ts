@@ -142,7 +142,8 @@ test("formats a complete date but never invents missing date parts", () => {
   for (const [date, expected] of [
     ["2026-11-15", "11/15/2026"],
     ["2026-11", "2026-11"],
-    ["2026", "2026"]
+    ["2026", "2026"],
+    ["2026-02-31", "2026-02-31"]
   ]) {
     const input = fixture("albumReleaseDate");
     input.releaseLookup.releases[0].date = date;
@@ -152,16 +153,30 @@ test("formats a complete date but never invents missing date parts", () => {
     expect(result.ok).toBe(true);
     if (!result.ok) throw new Error(result.errors.join("; "));
 
-        if (date === "2026-11-15") {
-      expect(result.proposal.evidence[0].quote).toBe(date);
-      expect(result.proposal.evidence[0].supportedValue).toBe(expected);
-    } else {
-      expect(result.proposal.evidence).toEqual([]);
-      expect(result.proposal.explanation).toContain(date);
-    }
+    expect(result.proposal.evidence).toMatchObject([{
+      sourceId: "MusicBrainz",
+      url: `https://musicbrainz.org/release/${MB_RELEASE_ID}`,
+      quote: date,
+      supportedValue: expected,
+      verification: "PROVIDER_CLAIM",
+      verificationId: null
+    }]);
     expect(result.proposal.suggestedValue).toBeNull();
     expect(result.proposal.outcome).toBe("INSUFFICIENT_EVIDENCE");
   }
+});
+
+test("keeps a missing release date out of proposal evidence", () => {
+  const input = fixture("albumReleaseDate");
+  input.releaseLookup.releases[0].date = null;
+
+  const result = build(input);
+
+  expect(result.ok).toBe(true);
+  if (!result.ok) throw new Error(result.errors.join("; "));
+  expect(result.proposal.evidence).toEqual([]);
+  expect(result.proposal.suggestedValue).toBeNull();
+  expect(result.proposal.outcome).toBe("INSUFFICIENT_EVIDENCE");
 });
 
 test("rejects unrelated records, ISRCs, and release selections", () => {

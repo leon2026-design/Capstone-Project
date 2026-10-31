@@ -127,7 +127,7 @@ export function buildMusicBrainzProposal(
     gapId: task.gapId,
     field: task.field,
     suggestedValue: candidateValue,
-        evidence: candidateValue !== null && rawValue?.trim()
+    evidence: rawValue?.trim()
       ? [{
           sourceId: "MusicBrainz",
           url: expectedSourceUrl,
@@ -137,7 +137,7 @@ export function buildMusicBrainzProposal(
           supportedValue: candidateValue ?? rawValue
         }]
       : [],
-        explanation:
+    explanation:
       "The explicitly selected MusicBrainz release supplies catalog data. " +
       (
         candidateValue === null
