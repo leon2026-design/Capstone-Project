@@ -15,15 +15,28 @@ import {
   type HumanReviewState
 } from "../src/workflow/humanReview";
 import {
+  applyCombinedReviewDecisionsWithRefusalLog,
   applyReviewDecisionsWithRefusalLog,
+  combinedReviewSessionDigest,
+  COMBINED_REVIEW_SESSION_SCHEMA_VERSION,
   createReviewSessionStore,
   recordRefusedDecision,
   reviewSessionDigest,
   reviewStorageKey,
   REVIEW_SESSION_FORMAT,
+  REVIEW_SESSION_SCHEMA_VERSION,
+  verifyHumanGapReviewState,
   type ReviewSessionStore
 } from "../src/workflow/reviewSessionStore";
-import { MB_RELEASE_ID, decide, setup } from "./support/reviewFixture";
+import {
+  applyHumanGapDecision,
+  applyResearchReviewDecision,
+  publicHumanGapAuditTrail,
+  startHumanGapReview,
+  type HumanGapReviewState
+} from "../src/workflow/humanGapReview";
+import type { DemoRecording } from "../src/metadata/recordValidation";
+import { MB_RELEASE_ID, decide, gapDecide, setup } from "./support/reviewFixture";
 
 const SAVED_AT = new Date("2026-11-04T16:00:00.000Z");
 
@@ -637,5 +650,392 @@ test("persists refused decisions across a restart as an append-only, redacted lo
     // Without a key a consistent, re-checksummed edit of free text is not detectable (documented).
     await tamper(dir, state.recordingId, original, (doc) => { doc.refusedDecisions[1].note = "Different."; });
     expect((await unsigned().load(state.recordingId)).ok).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// MB-09: combined MB-07 + MB-09 sessions (schema version 2)
+// ---------------------------------------------------------------------------
+
+/** Orchard artist already on the record, so confirming it keeps the research identity unchanged. */
+const attributed = { prepare: (record: DemoRecording) => { record.artist = "Fictional Artist"; } };
+
+function ok<R extends { ok: boolean }>(result: R): Extract<R, { ok: true }> {
+  if (!result.ok) {
+    const failure = result as { code?: string; message?: string; rejection?: { message: string } };
+    throw new Error(`${failure.code ?? ""} ${failure.message ?? failure.rejection?.message ?? ""}`);
+  }
+  return result as Extract<R, { ok: true }>;
+}
+
+/** MB-07 accepts the label, MB-09 confirms the artist, MB-07 rejects the UPC, MB-09 answers a declaration. */
+async function combined(options: Parameters<typeof setup>[0] = attributed) {
+  const base = await setup(options);
+  let state: HumanGapReviewState = startHumanGapReview(base.state);
+  state = ok(applyResearchReviewDecision(state, decide(state.research, "label", "APPROVE_SUGGESTED_VALUE",
+    { note: "Matches the label catalog." }))).state;
+  state = ok(applyHumanGapDecision(state, gapDecide(state, "artist-unconfirmed",
+    { action: "CONFIRM_ARTIST", exactArtist: "Fictional Artist", primaryArtist: "Fictional Artist" }))).state;
+  state = ok(applyResearchReviewDecision(state, decide(state.research, "albumUPC", "REJECT_SUGGESTION",
+    { note: "Research UPC not confirmed by distributor." }))).state;
+  state = ok(applyHumanGapDecision(state, gapDecide(state, "declaration-unanswered",
+    { action: "SET_FIELD", field: "canadianContentDeclaration", value: "yes" },
+    { field: "canadianContentDeclaration", note: "Confirmed with the label." }))).state;
+  return { ...base, combined: state };
+}
+
+async function tamperV2(
+  dir: string,
+  recordingId: string,
+  original: string,
+  mutate: (document: any) => void,
+  redigest = true
+): Promise<void> {
+  const document = JSON.parse(original);
+  mutate(document);
+  if (redigest) document.contentDigest = combinedReviewSessionDigest(document.state, document.refusedDecisions);
+  await fs.writeFile(await storedFile(dir, recordingId), JSON.stringify(document));
+}
+
+for (const backendKind of ["json-file", "memory"] as const) {
+  test(`MB-09: a combined research and manual review survives save, restart, and reload (${backendKind})`, async () => {
+    await withTempDir(async (dir) => {
+      const memory = createInMemoryReviewStorage();
+      const open = (): ReviewSessionStore => backendKind === "memory"
+        ? createReviewSessionStore(memory, { now: () => SAVED_AT })
+        : fileStore(dir);
+      const { workflow, combined: state } = await combined();
+      expect(state.reviewEvents.map((event) => event.kind)).toEqual(["RESEARCH", "MANUAL", "RESEARCH", "MANUAL"]);
+
+      const saved = await open().saveCombined(state, { expectedRevision: 0, sessionId: "review-desk-9" });
+      expect(saved).toMatchObject({
+        ok: true, unchanged: false,
+        session: { schemaVersion: COMBINED_REVIEW_SESSION_SCHEMA_VERSION, revision: 1, savedBy: "review-desk-9", upgradedFrom: null }
+      });
+
+      // Restart: a fresh store instance reloads and verifies the full combined history.
+      const loaded = ok(await open().loadCombined(state.recordingId));
+      const restored = loaded.session.state;
+      expect(restored).toEqual(state);
+      expect(Object.isFrozen(restored.manualAuditTrail[0])).toBe(true);
+      expect(restored.research.originalRecording).toEqual(workflow.recording);
+      expect(restored.research.recording).toMatchObject({
+        artist: "Fictional Artist", label: "Fictional Label", canadianContentDeclaration: "yes", approvalStatus: "DRAFT"
+      });
+      expect(restored.research.recording.artistAttribution?.confirmed).toBe(true);
+      expect(restored.reviewEvents).toEqual(state.reviewEvents);
+      expect(restored.manualAuditTrail.map((entry) => entry.eventSequence)).toEqual([2, 4]);
+      expect(restored.research.auditTrail.find((entry) => entry.action === "REJECT_SUGGESTION"))
+        .toMatchObject({ field: "albumUPC" });
+      expect(await open().load(state.recordingId)).toMatchObject({ ok: false, code: "INCOMPATIBLE_VERSION" });
+      expect(await open().list()).toEqual([expect.objectContaining({
+        ok: true, schemaVersion: 2, revision: 1, auditEntries: 2, manualAuditEntries: 2, approvalStatus: "DRAFT"
+      })]);
+
+      // Continue after the restart; the history only grows.
+      const next = ok(applyHumanGapDecision(restored, gapDecide(restored, "missing-required-field",
+        { action: "SET_FIELD", field: "email", value: "submitter@example.test" }, { field: "email" }))).state;
+      expect(await open().saveCombined(next, { expectedRevision: 1 })).toMatchObject({ ok: true, session: { revision: 2 } });
+      expect(await open().saveCombined(next, { expectedRevision: 2 })).toMatchObject({ ok: true, unchanged: true });
+      const reloaded = ok(await open().loadCombined(state.recordingId));
+      expect(reloaded.session.state).toEqual(next);
+      expect(JSON.stringify(publicHumanGapAuditTrail(reloaded.session.state))).not.toContain("submitter@example.test");
+    });
+  });
+}
+
+test("MB-09: replaying the combined history reproduces the exact state", async () => {
+  const { combined: state } = await combined();
+  const replayed = verifyHumanGapReviewState(JSON.parse(JSON.stringify(state)));
+  if (!replayed.ok) throw new Error(replayed.message);
+  expect(replayed.value).toEqual(state);
+  expect(JSON.stringify(replayed.value)).toBe(JSON.stringify(state));
+});
+
+test("MB-09: altered, forged, reordered, or deleted manual history fails verification", async () => {
+  await withTempDir(async (dir) => {
+    const { combined: state } = await combined();
+    expect((await fileStore(dir).saveCombined(state, { expectedRevision: 0 })).ok).toBe(true);
+    const original = await fs.readFile(await storedFile(dir, state.recordingId), "utf8");
+    const swap = (list: any[], a: number, b: number) => { [list[a], list[b]] = [list[b], list[a]]; };
+
+    const cases: Array<[string, (document: any) => void]> = [
+      ["unreviewed metadata change", (doc) => { doc.state.research.recording.christmasHanukkahDeclaration = "no"; }],
+      ["unauthorized approval", (doc) => { doc.state.research.recording.approvalStatus = "APPROVED"; }],
+      ["altered manual value", (doc) => { doc.state.manualAuditTrail[1].replay.value = "no"; }],
+      ["altered recording to match a forged value", (doc) => {
+        doc.state.manualAuditTrail[1].replay.value = "no";
+        doc.state.research.recording.canadianContentDeclaration = "no";
+      }],
+      ["altered artist roles", (doc) => { doc.state.manualAuditTrail[0].replay.secondaryArtist = "Forged Guest"; }],
+      ["deleted manual entry", (doc) => {
+        doc.state.manualAuditTrail.pop();
+        doc.state.reviewEvents.pop();
+        doc.manualAuditEntries -= 1;
+        doc.reviewEvents -= 1;
+      }],
+      ["deleted event only", (doc) => { doc.state.reviewEvents.pop(); doc.reviewEvents -= 1; }],
+      ["reordered events", (doc) => {
+        swap(doc.state.reviewEvents, 0, 1);
+        doc.state.reviewEvents.forEach((event: any, index: number) => { event.sequence = index + 1; });
+      }],
+      ["reordered events without renumbering the audit trail", (doc) => {
+        swap(doc.state.reviewEvents, 1, 2);
+        doc.state.reviewEvents.forEach((event: any, index: number) => { event.sequence = index + 1; });
+      }],
+      ["duplicate review id", (doc) => {
+        const reused = doc.state.research.auditTrail[0].reviewId;
+        doc.state.manualAuditTrail[1].reviewId = reused;
+        doc.state.reviewEvents[3].reviewId = reused;
+      }],
+      ["forged manual confirmation", (doc) => {
+        const forged = JSON.parse(JSON.stringify(doc.state.manualAuditTrail[1]));
+        Object.assign(forged, { sequence: 3, eventSequence: 5, reviewId: "forged-1" });
+        doc.state.manualAuditTrail.push(forged);
+        doc.state.reviewEvents.push({ sequence: 5, kind: "MANUAL", reviewId: "forged-1", auditSequence: 3 });
+        doc.manualAuditEntries += 1;
+        doc.reviewEvents += 1;
+      }],
+      ["stale basis", (doc) => { doc.state.manualAuditTrail[1].gapDigest = "GAP-000000000000000000000000"; }],
+      ["modified evidence", (doc) => {
+        doc.state.manualAuditTrail[0].evidence.push({ source: "record", field: "artist", value: "Forged" });
+      }],
+      ["modified research evidence", (doc) => {
+        doc.state.research.auditTrail[0].evidence[0].url = "https://elsewhere.example.test/";
+      }],
+      ["unknown event kind", (doc) => { doc.state.reviewEvents[1].kind = "AUTOMATIC"; }]
+    ];
+    for (const [name, mutate] of cases) {
+      await tamperV2(dir, state.recordingId, original, mutate);
+      expect(await fileStore(dir).loadCombined(state.recordingId), name)
+        .toMatchObject({ ok: false, code: "INTEGRITY_CHECK_FAILED" });
+    }
+    await tamperV2(dir, state.recordingId, original, (doc) => { doc.state.manualAuditTrail[0].note = "x"; }, false);
+    expect(await fileStore(dir).loadCombined(state.recordingId)).toMatchObject({ ok: false, code: "CORRUPTED_DATA" });
+
+    // A tampered in-memory state is refused before anything is written.
+    await fs.writeFile(await storedFile(dir, state.recordingId), original);
+    const forged = JSON.parse(JSON.stringify(state));
+    forged.research.recording.generativeAiAudioDeclaration = "no";
+    expect(await fileStore(dir).saveCombined(forged, { expectedRevision: 1 })).toMatchObject({ ok: false, code: "INVALID_STATE" });
+    expect(await fs.readFile(await storedFile(dir, state.recordingId), "utf8")).toBe(original);
+  });
+});
+
+test("MB-09: version-1 sessions stay readable and are upgraded only explicitly", async () => {
+  await withTempDir(async (dir) => {
+    const { reviewed: v1State } = await reviewed(attributed);
+    const refused = recordRefusedDecision([], { reviewId: "bad" }, { reviewId: "bad", code: "INVALID_DECISION", message: "Malformed." },
+      SAVED_AT);
+    expect((await fileStore(dir).save(v1State, { expectedRevision: 0, refusedDecisions: refused })).ok).toBe(true);
+    const v1Text = await fs.readFile(await storedFile(dir, v1State.recordingId), "utf8");
+    expect(JSON.parse(v1Text).schemaVersion).toBe(REVIEW_SESSION_SCHEMA_VERSION);
+
+    // MB-08 reads are unchanged; combined access requires an explicit upgrade.
+    expect((await fileStore(dir).load(v1State.recordingId)).ok).toBe(true);
+    expect(await fileStore(dir).loadCombined(v1State.recordingId)).toMatchObject({ ok: false, code: "UPGRADE_REQUIRED" });
+    expect(await fileStore(dir).saveCombined(startHumanGapReview(v1State), { expectedRevision: 1 }))
+      .toMatchObject({ ok: false, code: "UPGRADE_REQUIRED", currentRevision: 1 });
+    expect(await fileStore(dir).upgrade(v1State.recordingId, { expectedRevision: 0 }))
+      .toMatchObject({ ok: false, code: "INVALID_REQUEST" });
+    expect(await fileStore(dir).upgrade(v1State.recordingId, { expectedRevision: 2 }))
+      .toMatchObject({ ok: false, code: "REVISION_CONFLICT", currentRevision: 1 });
+    expect(await fileStore(dir).upgrade("no-such-recording", { expectedRevision: 1 }))
+      .toMatchObject({ ok: false, code: "NOT_FOUND" });
+    expect(await fs.readFile(await storedFile(dir, v1State.recordingId), "utf8")).toBe(v1Text);
+
+    const upgraded = ok(await fileStore(dir).upgrade(v1State.recordingId, { expectedRevision: 1, sessionId: "upgrade-desk" }));
+    expect(upgraded).toMatchObject({ unchanged: false, session: { schemaVersion: 2, revision: 2, savedBy: "upgrade-desk" } });
+    expect(upgraded.session.upgradedFrom).toEqual({
+      schemaVersion: 1, revision: 1, contentDigest: reviewSessionDigest(v1State, refused)
+    });
+    // Nothing was reinterpreted: the MB-07 state, history, and refusals are carried over verbatim.
+    expect(upgraded.session.state.research).toEqual(v1State);
+    expect(upgraded.session.refusedDecisions).toEqual(refused);
+    expect(upgraded.session.state.manualAuditTrail).toEqual([]);
+    expect(upgraded.session.state.reviewEvents.map((event) => [event.kind, event.reviewId]))
+      .toEqual(v1State.auditTrail.map((entry) => ["RESEARCH", entry.reviewId]));
+
+    // The upgraded document is version 2: MB-08 v1 writes may not overwrite it.
+    const v2Text = await fs.readFile(await storedFile(dir, v1State.recordingId), "utf8");
+    expect(await fileStore(dir).load(v1State.recordingId)).toMatchObject({ ok: false, code: "INCOMPATIBLE_VERSION" });
+    expect(await fileStore(dir).save(v1State, { expectedRevision: 2 })).toMatchObject({ ok: false, code: "INCOMPATIBLE_VERSION" });
+    expect(await fs.readFile(await storedFile(dir, v1State.recordingId), "utf8")).toBe(v2Text);
+    expect(await fileStore(dir).upgrade(v1State.recordingId, { expectedRevision: 2 })).toMatchObject({ ok: true, unchanged: true });
+
+    // MB-09 continues on the upgraded session; provenance is carried forward.
+    const loaded = ok(await fileStore(dir).loadCombined(v1State.recordingId));
+    const next = ok(applyHumanGapDecision(loaded.session.state, gapDecide(loaded.session.state, "artist-unconfirmed",
+      { action: "CONFIRM_ARTIST", exactArtist: "Fictional Artist" }))).state;
+    const resaved = ok(await fileStore(dir).saveCombined(next, { expectedRevision: 2 }));
+    expect(resaved.session).toMatchObject({ revision: 3, upgradedFrom: upgraded.session.upgradedFrom });
+    expect(ok(await fileStore(dir).loadCombined(v1State.recordingId)).session.state).toEqual(next);
+
+    // Upgrade provenance and schema numbers are validated too.
+    const current = await fs.readFile(await storedFile(dir, v1State.recordingId), "utf8");
+    await tamperV2(dir, v1State.recordingId, current, (doc) => { doc.upgradedFrom.revision = 9; });
+    expect(await fileStore(dir).loadCombined(v1State.recordingId)).toMatchObject({ ok: false, code: "CORRUPTED_DATA" });
+    await tamperV2(dir, v1State.recordingId, current, (doc) => { doc.schemaVersion = 3; });
+    expect(await fileStore(dir).loadCombined(v1State.recordingId)).toMatchObject({ ok: false, code: "INCOMPATIBLE_VERSION" });
+    expect(await fileStore(dir).load(v1State.recordingId)).toMatchObject({ ok: false, code: "INCOMPATIBLE_VERSION" });
+  });
+});
+
+test("MB-09: an unmodified version-1 document from MB-08 upgrades in a memory store too", async () => {
+  const memory = createInMemoryReviewStorage();
+  const store = createReviewSessionStore(memory, { now: () => SAVED_AT });
+  const { reviewed: v1State } = await reviewed();
+  expect((await store.save(v1State, { expectedRevision: 0 })).ok).toBe(true);
+  const upgraded = ok(await store.upgrade(v1State.recordingId, { expectedRevision: 1 }));
+  expect(upgraded.session.state.research).toEqual(v1State);
+  expect((await store.list())[0]).toMatchObject({ ok: true, schemaVersion: 2, manualAuditEntries: 0, auditEntries: 4 });
+});
+
+test("MB-09: concurrent combined sessions produce revision conflicts, not silent overwrites", async () => {
+  await withTempDir(async (dir) => {
+    const { combined: state } = await combined();
+    expect((await fileStore(dir).saveCombined(state, { expectedRevision: 0 })).ok).toBe(true);
+    const deskA = ok(await fileStore(dir).loadCombined(state.recordingId)).session;
+    const deskB = ok(await fileStore(dir).loadCombined(state.recordingId)).session;
+
+    const a = ok(applyHumanGapDecision(deskA.state, gapDecide(deskA.state, "missing-required-field",
+      { action: "SET_FIELD", field: "submitterName", value: "Fictional Submitter" }, { field: "submitterName" }))).state;
+    const b = ok(applyHumanGapDecision(deskB.state, gapDecide(deskB.state, "declaration-unanswered",
+      { action: "SET_FIELD", field: "independentLabelDeclaration", value: "no" }, { field: "independentLabelDeclaration" }))).state;
+    expect(await fileStore(dir).saveCombined(a, { expectedRevision: deskA.revision })).toMatchObject({ ok: true, session: { revision: 2 } });
+    expect(await fileStore(dir).saveCombined(b, { expectedRevision: deskB.revision }))
+      .toMatchObject({ ok: false, code: "REVISION_CONFLICT", currentRevision: 2 });
+    // Even with the right revision, desk B's diverged history is not an append to desk A's.
+    expect(await fileStore(dir).saveCombined(b, { expectedRevision: 2 })).toMatchObject({ ok: false, code: "HISTORY_REWRITE" });
+    // An older state cannot drop newer decisions.
+    expect(await fileStore(dir).saveCombined(state, { expectedRevision: 2 })).toMatchObject({ ok: false, code: "HISTORY_REWRITE" });
+    expect(ok(await fileStore(dir).loadCombined(state.recordingId)).session.state).toEqual(a);
+
+    // Racing saves from separate stores never both succeed.
+    const latest = ok(await fileStore(dir).loadCombined(state.recordingId)).session;
+    const c = ok(applyHumanGapDecision(latest.state, gapDecide(latest.state, "missing-required-field",
+      { action: "SET_FIELD", field: "email", value: "submitter@example.test" }, { field: "email" }))).state;
+    const results = await Promise.all([
+      fileStore(dir).saveCombined(c, { expectedRevision: 2 }),
+      fileStore(dir).saveCombined(c, { expectedRevision: 2 })
+    ]);
+    expect(results.filter((result) => result.ok && !result.unchanged)).toHaveLength(1);
+    const other = results.find((result) => !result.ok || result.unchanged);
+    if (other && !other.ok) expect(["REVISION_CONFLICT", "LOCKED"]).toContain(other.code);
+  });
+});
+
+test("MB-09: a signed store detects rewritten manual history and headers", async () => {
+  await withTempDir(async (dir) => {
+    const key = "fictional-local-review-key-0009";
+    const signed = () => createReviewSessionStore(createJsonFileReviewStorage(dir), { integrityKey: key });
+    const { combined: state } = await combined();
+    expect((await signed().saveCombined(state, { expectedRevision: 0 })).ok).toBe(true);
+    const original = await fs.readFile(await storedFile(dir, state.recordingId), "utf8");
+    expect(JSON.parse(original).signature).toMatch(/^HMAC-SHA256-[0-9a-f]{64}$/);
+    expect((await signed().loadCombined(state.recordingId)).ok).toBe(true);
+
+    const rewrites: Array<[string, (document: any) => void]> = [
+      ["manual note", (doc) => { doc.state.manualAuditTrail[1].note = "Different note."; }],
+      ["manual timestamp", (doc) => { doc.state.manualAuditTrail[0].reviewedAt = "2020-01-01T00:00:00.000Z"; }],
+      ["manual reviewer name", (doc) => { doc.state.manualAuditTrail[0].reviewer.displayName = "Someone"; }],
+      ["manual reviewer id", (doc) => { doc.state.manualAuditTrail[0].reviewer.reviewerId = "someone-else"; }],
+      ["fully renumbered reorder of independent decisions", (doc) => {
+        [doc.state.reviewEvents[1], doc.state.reviewEvents[2]] = [doc.state.reviewEvents[2], doc.state.reviewEvents[1]];
+        doc.state.reviewEvents.forEach((event: any, index: number) => { event.sequence = index + 1; });
+        doc.state.manualAuditTrail[0].eventSequence = 3;
+      }],
+      ["header count", (doc) => { doc.manualAuditEntries = 2; doc.revision = 4; }],
+      ["upgrade provenance", (doc) => { doc.upgradedFrom = null; doc.savedBy = "someone"; }],
+      ["signature removed", (doc) => { doc.signature = null; }]
+    ];
+    for (const [name, mutate] of rewrites) {
+      await tamperV2(dir, state.recordingId, original, mutate);
+      expect(await signed().loadCombined(state.recordingId), name).toMatchObject({ ok: false, code: "INTEGRITY_CHECK_FAILED" });
+    }
+    await fs.writeFile(await storedFile(dir, state.recordingId), original);
+    const wrongKey = createReviewSessionStore(createJsonFileReviewStorage(dir), { integrityKey: "another-fictional-key-0010" });
+    expect(await wrongKey.loadCombined(state.recordingId)).toMatchObject({ ok: false, code: "INTEGRITY_CHECK_FAILED" });
+    // Without a key a consistent, re-checksummed edit of a free-text note, or a fully renumbered reorder of
+    // independent decisions, is not detectable (documented); a signing key covers both.
+    await tamperV2(dir, state.recordingId, original, (doc) => { doc.state.manualAuditTrail[1].note = "Different note."; });
+    expect((await fileStore(dir).loadCombined(state.recordingId)).ok).toBe(true);
+  });
+});
+
+test("MB-09: refused manual and research decisions persist as one append-only, redacted log", async () => {
+  await withTempDir(async (dir) => {
+    const key = "fictional-local-review-key-0011";
+    const recordedAt = new Date("2026-11-04T15:45:00.000Z");
+    const open = () => createReviewSessionStore(createJsonFileReviewStorage(dir), { now: () => SAVED_AT, integrityKey: key });
+    const { combined: state } = await combined();
+
+    const batch = applyCombinedReviewDecisionsWithRefusalLog({ state, refusedDecisions: [] }, [
+      { kind: "MANUAL", decision: gapDecide(state, "missing-required-field",
+        { action: "SET_FIELD", field: "email", value: "not an email a@example.test" },
+        { field: "email", note: "From C:\\Users\\someone\\contacts.txt" }) },
+      { kind: "RESEARCH", decision: decide(state.research, "label", "APPROVE_SUGGESTED_VALUE",
+        { reviewId: state.research.auditTrail[0].reviewId }) },
+      { kind: "MANUAL", decision: gapDecide(state, "declaration-unanswered",
+        { action: "ACKNOWLEDGE" }, { field: "independentLabelDeclaration" }) },
+      { kind: "MANUAL", decision: gapDecide(state, "missing-required-field",
+        { action: "SET_FIELD", field: "submitterName", value: "Fictional Submitter" }, { field: "submitterName" }) }
+    ], { now: () => recordedAt });
+    expect(batch.rejected.map((item) => `${item.kind}:${item.rejection.code}`))
+      .toEqual(["MANUAL:INVALID_VALUE", "RESEARCH:DUPLICATE_REVIEW", "MANUAL:NOTE_REQUIRED"]);
+    expect(batch.applied).toHaveLength(1);
+    expect(batch.state.research.recording.email).toBe(state.research.recording.email);
+
+    const saved = ok(await open().saveCombined(batch.state, { expectedRevision: 0, refusedDecisions: batch.refusedDecisions }));
+    expect(saved.session.refusedDecisions).toHaveLength(3);
+    const raw = await fs.readFile(await storedFile(dir, state.recordingId), "utf8");
+    expect(raw).not.toContain("a@example.test");
+    expect(raw).not.toContain("contacts.txt");
+
+    const loaded = ok(await open().loadCombined(state.recordingId)).session;
+    expect(loaded.refusedDecisions).toEqual(batch.refusedDecisions);
+    expect(loaded.refusedDecisions[0]).toMatchObject({
+      kind: "MANUAL", sequence: 1, field: "email", action: "SET_FIELD", code: "INVALID_VALUE",
+      reviewer: { reviewerId: "dana" }, note: "From [redacted local path]", recordedAt: recordedAt.toISOString()
+    });
+    expect(loaded.refusedDecisions[1]).toMatchObject({ sequence: 2, code: "DUPLICATE_REVIEW", field: "label" });
+    expect(loaded.refusedDecisions[1]).not.toHaveProperty("kind");
+    expect(loaded.state).toEqual(batch.state);
+
+    // Append-only and validated like the audit trail.
+    expect(await open().saveCombined(batch.state, { expectedRevision: 1, refusedDecisions: batch.refusedDecisions.slice(0, 2) }))
+      .toMatchObject({ ok: false, code: "HISTORY_REWRITE" });
+    expect(await open().saveCombined(batch.state, {
+      expectedRevision: 1, refusedDecisions: [{ ...batch.refusedDecisions[0], note: "mail me@example.test" }] as never
+    })).toMatchObject({ ok: false, code: "INVALID_STATE" });
+    const original = await fs.readFile(await storedFile(dir, state.recordingId), "utf8");
+    await tamperV2(dir, state.recordingId, original, (doc) => { doc.refusedDecisions[0].code = "MADE_UP"; });
+    expect(await open().loadCombined(state.recordingId)).toMatchObject({ ok: false, code: "INTEGRITY_CHECK_FAILED" });
+    await tamperV2(dir, state.recordingId, original, (doc) => { doc.refusedDecisions.pop(); doc.refusedDecisionCount -= 1; });
+    expect(await open().loadCombined(state.recordingId)).toMatchObject({ ok: false, code: "INTEGRITY_CHECK_FAILED" });
+  });
+});
+
+test("MB-09: approval stays a separate explicit operation across persistence", async () => {
+  await withTempDir(async (dir) => {
+    const { combined: state } = await combined();
+    expect(state.research.recording.approvalStatus).toBe("DRAFT");
+    expect(state.research.recordingApprovalRequired).toBe(true);
+    expect(state.research.gapReport.gaps.some((gap) => gap.code === "approval-pending")).toBe(true);
+    ok(await fileStore(dir).saveCombined(state, { expectedRevision: 0 }));
+    const restored = ok(await fileStore(dir).loadCombined(state.recordingId)).session.state;
+    expect(restored.research.recording.approvalStatus).toBe("DRAFT");
+    expect(restored.manualAuditTrail.every((entry) => entry.resultingApprovalStatus === "DRAFT")).toBe(true);
+
+    // A previously approved recording changed by review is saved as needing review again, never re-approved.
+    const { combined: approved } = await combined({
+      ...attributed, current: (record) => { record.approvalStatus = "APPROVED"; }
+    });
+    expect(approved.research.recording.approvalStatus).toBe("NEEDS_REVIEW");
+    expect(approved.manualAuditTrail.every((entry) => entry.resultingApprovalStatus === "NEEDS_REVIEW")).toBe(true);
+    const memory = createReviewSessionStore(createInMemoryReviewStorage(), { now: () => SAVED_AT });
+    ok(await memory.saveCombined(approved, { expectedRevision: 0 }));
+    expect(ok(await memory.loadCombined(approved.recordingId)).session.state.research.recording.approvalStatus)
+      .toBe("NEEDS_REVIEW");
   });
 });

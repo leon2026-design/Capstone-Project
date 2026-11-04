@@ -8,7 +8,8 @@
     "research:demo": "tsx scripts/liveResearchDemo.ts",
     "research:demo:live": "tsx scripts/liveResearchDemo.ts --live",
     "review:demo": "tsx scripts/humanReviewDemo.ts",
-    "review:persistence:demo": "tsx scripts/reviewPersistenceDemo.ts"
+    "review:persistence:demo": "tsx scripts/reviewPersistenceDemo.ts",
+    "gap:demo": "tsx scripts/humanGapReviewDemo.ts"
   },
   "keywords": [],
   "author": "",
