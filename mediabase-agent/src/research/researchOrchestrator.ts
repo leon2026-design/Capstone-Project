@@ -80,6 +80,18 @@ export function validateResearchLimits(limits: Partial<ResearchLimits> = {}): Re
   return merged;
 }
 
+export function validateResearchConfiguration(options: ResearchRunOptions): ResearchLimits {
+  const limits = validateResearchLimits(options.limits);
+  const { mode, provider } = options;
+  if (mode !== "dry-run" && !provider) {
+    throw new ResearchLimitsError(`Research mode "${mode}" requires a provider.`);
+  }
+  if (mode === "live" && provider && !isGroundedProvider(provider)) {
+    throw new ResearchLimitsError("Live research requires a grounded provider such as the Gemini provider.");
+  }
+  return limits;
+}
+
 /** Deterministic exponential backoff; rate limits honor the provider's retry delay up to the cap. */
 export function backoffDelayMs(limits: ResearchLimits, retryIndex: number, retryAfterMs: number | null): number {
   const exponential = limits.initialBackoffMs * 2 ** Math.max(0, retryIndex);
@@ -235,12 +247,8 @@ export async function runMetadataResearch(
   tasks: readonly MetadataResearchTask[],
   options: ResearchRunOptions
 ): Promise<ResearchRunResult> {
-  const limits = validateResearchLimits(options.limits);
+  const limits = validateResearchConfiguration(options);
   const { mode, provider, verifier } = options;
-  if (mode !== "dry-run" && !provider) throw new ResearchLimitsError(`Research mode "${mode}" requires a provider.`);
-  if (mode === "live" && provider && !isGroundedProvider(provider)) {
-    throw new ResearchLimitsError("Live research requires a grounded provider such as the Gemini provider.");
-  }
   const snapshots = structuredClone(tasks);
   if (new Set(snapshots.map((task) => task.taskId)).size !== snapshots.length) {
     throw new Error("Duplicate research task identifier.");
