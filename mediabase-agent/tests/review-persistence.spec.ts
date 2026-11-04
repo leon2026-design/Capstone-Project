@@ -744,6 +744,22 @@ for (const backendKind of ["json-file", "memory"] as const) {
   });
 }
 
+for (const [raw, redacted] of [["a@b", "[redacted email]"], ["/a", "[redacted local path]"]]) {
+  test(`MB-09: notes redacted to exactly 2000 characters survive persistence (${raw})`, async () => {
+    const base = await setup();
+    const state = startHumanGapReview(base.state);
+    const prefix = `${"x".repeat(1999 - redacted.length)} `;
+    const next = ok(applyHumanGapDecision(state, gapDecide(state, "missing-required-field",
+      { action: "SET_FIELD", field: "email", value: "submitter@example.test" },
+      { field: "email", note: `${prefix}${raw}` }))).state;
+    expect(next.manualAuditTrail[0].note).toBe(`${prefix}${redacted}`);
+    expect(next.manualAuditTrail[0].note).toHaveLength(2000);
+    const store = createReviewSessionStore(createInMemoryReviewStorage(), { now: () => SAVED_AT });
+    expect(await store.saveCombined(next, { expectedRevision: 0 })).toMatchObject({ ok: true });
+    expect(ok(await store.loadCombined(next.recordingId)).session.state).toEqual(next);
+  });
+}
+
 test("MB-09: replaying the combined history reproduces the exact state", async () => {
   const { combined: state } = await combined();
   const replayed = verifyHumanGapReviewState(JSON.parse(JSON.stringify(state)));

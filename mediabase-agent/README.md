@@ -975,9 +975,11 @@ network service.
 ```ts
 let state = startHumanGapReview(startHumanReview(workflow, audio)); // MB-07 -> MB-09
 const queue = humanOnlyGapQueue(state);
+const item = queue.find((item) => item.allowedActions.includes("CONFIRM_ARTIST"));
+if (!item) throw new Error("No artist gap is available for confirmation.");
 const result = applyHumanGapDecision(state, {
-  reviewId: "r-42", recordingId: state.recordingId, gapId: queue[0].gapId,
-  basis: humanGapBasisFor(state, queue[0].gapId),
+  reviewId: "r-42", recordingId: state.recordingId, gapId: item.gap.gapId,
+  basis: humanGapBasisFor(state, item.gap.gapId),
   reviewer: { reviewerId: "dana" }, reviewedAt: new Date().toISOString(),
   action: { action: "CONFIRM_ARTIST", exactArtist: "Fictional Artist", primaryArtist: "Fictional Artist" }
 });

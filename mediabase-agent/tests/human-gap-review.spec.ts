@@ -413,6 +413,20 @@ test.describe("MB-09 stale, duplicate, and rejected decisions", () => {
 });
 
 test.describe("MB-09 immutability and audit", () => {
+  for (const [raw, redacted] of [["a@b", "[redacted email]"], ["/a", "[redacted local path]"]]) {
+    test(`rejects notes that exceed the limit after redacting ${raw}`, async () => {
+      const { gap } = await gapState();
+      const before = JSON.stringify(gap);
+      const note = `${"x".repeat(2000 - redacted.length)} ${raw}`;
+      expect(note.length).toBeLessThan(2000);
+      const result = applyHumanGapDecision(gap, gapDecide(gap, "missing-required-field",
+        { action: "SET_FIELD", field: "email", value: "submitter@example.test" }, { field: "email", note }));
+      expect(rejectionCode(result)).toBe("INVALID_DECISION");
+      expect(result.state).toBe(gap);
+      expect(JSON.stringify(gap)).toBe(before);
+    });
+  }
+
   test("accepted actions return new frozen state and leave the input and original snapshot untouched", async () => {
     const { gap, workflow } = await gapState();
     const before = JSON.stringify(gap);

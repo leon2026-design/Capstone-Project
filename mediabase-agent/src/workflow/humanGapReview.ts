@@ -578,6 +578,9 @@ export function applyHumanGapDecision(
   }
 
   const note = decision.note?.trim() ? redactResearchText(decision.note.trim()) : null;
+  if (note && note.length > MAX_NOTE_LENGTH) {
+    return reject("INVALID_DECISION", "Reviewer note must be text of at most 2000 characters after redaction.");
+  }
   let recording: DemoRecording = structuredClone(before) as DemoRecording;
   let replay: HumanGapAction;
   let outcome: HumanGapOutcome;
