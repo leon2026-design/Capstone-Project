@@ -434,12 +434,12 @@ validated evidence with verification status, `unresolvedReasons`, and:
 - `agentMayResolve: false`
 - `conflictRequiresHumanResolution: true` for conflicting outcomes
 
-`MetadataReviewAction` defines the future review interface's intents:
+`MetadataReviewAction` defines the review intents:
 `APPROVE_SUGGESTED_VALUE`, `EDIT_SUGGESTED_VALUE` (requires `editedValue`),
 `REJECT_SUGGESTION`, and `DEFER_DECISION`, linked to the proposal/recording/gap/
-field. These are contracts only: there is no action executor, approval change,
-or record mutation. Approving a suggestion must not implicitly approve a
-record or acknowledge an ISRC conflict.
+field. This module never executes them; MB-07 (below) validates and applies
+them with an audit trail. Approving a suggestion never implicitly approves a
+record or acknowledges an ISRC conflict.
 
 The future UI should display completed evidence-backed proposals, alternatives,
 and verification/uncertainty labels so Brad reviews exceptions rather than
@@ -656,7 +656,7 @@ decisions.
   and approval remain unchanged.
 - The workflow does not access live Mediabase.
 
-This implements workflow preparation, not MB-07's approval interface.
+This implements workflow preparation; MB-07 (below) consumes its pending decisions.
 MusicBrainz source verification and live end-to-end research remain separate work.
 The returned result includes local operational data and should not be published
 or sent wholesale to a research provider.
@@ -676,4 +676,98 @@ npx tsx scripts/recordingWorkflowDemo.ts
 ```sh
 npm run typecheck
 npx playwright test --reporter=line
+```
+
+## MB-07: Human Review and Approval Workflow
+
+`src/workflow/humanReview.ts` lets a human reviewer act on MB-06
+`metadataDecisions`. It is pure and offline: inputs are never mutated, every
+returned state is a new deeply frozen snapshot, and nothing contacts a
+provider or Mediabase or submits anything.
+
+```ts
+const workflow = await runRecordingWorkflow(record, audio, options); // MB-06
+let state = startHumanReview(workflow, audio);
+const basis = reviewBasisFor(state, decisionId); // capture when showing the decision
+const result = applyHumanReviewDecision(state, {
+  reviewId, decisionId, source: "RESEARCH", action, // action: MetadataReviewAction
+  reviewer: { reviewerId: "brad" }, reviewedAt: "2026-11-04T15:30:00.000Z", basis
+});
+// or: processPendingReviews(state, decisions) -> { state, applied, rejected }
+```
+
+`source` is required because MusicBrainz and research proposals for the same
+task share a `proposalId`.
+
+### Review actions
+
+| Action | Effect |
+| --- | --- |
+| `APPROVE_SUGGESTED_VALUE` | Applies the proposal's independently verified `suggestedValue`. Not allowed for conflicting decisions or proposals without a verified suggestion. |
+| `EDIT_SUGGESTED_VALUE` | Applies the reviewer's `editedValue`. Requires a note when evidence conflicts or no verified suggestion exists. |
+| `REJECT_SUGGESTION` | Marks that finding rejected; the recording is unchanged. |
+| `DEFER_DECISION` | Leaves the decision open (`DEFERRED`); it can be decided later. |
+
+A decision's status is `VALUE_ACCEPTED` once a value is applied,
+`ALL_SUGGESTIONS_REJECTED` when every finding is rejected, otherwise
+`DEFERRED` or `PENDING_REVIEW`. `researchReview.status` becomes `COMPLETE`
+when no decision is pending or deferred.
+
+### Validation and rejection
+
+Each decision is fully validated before anything changes; a rejected decision
+returns the unchanged state and `{ reviewId, code, message }`:
+
+- `INVALID_DECISION`: missing reviewer identity, non-ISO-8601-UTC timestamp,
+  unknown action/source, `editedValue` on a non-edit action, or oversized note.
+- `INVALID_VALUE`: values must satisfy the existing rules: `mm/dd/yyyy` dates
+  (`isValidDate`), normalized 12-character ISRCs, UPCs with a valid check digit
+  (`isValidUpc`), and text without surrounding whitespace, control characters,
+  emails, or local paths.
+- `UNKNOWN_DECISION` / `MISMATCHED_DECISION`: the proposal, source, recording,
+  gap, and field must all belong to the targeted pending decision.
+- `STALE_DECISION`: the recording's identity fingerprint, the field's current
+  value, or the findings shown (`findingsDigest`) changed after the basis was
+  captured; the proposal was researched for a different identity; or the gap
+  it addressed is no longer open.
+- `DUPLICATE_REVIEW` / `ALREADY_DECIDED`: a `reviewId` can be recorded once,
+  and accepted values or rejected suggestions cannot be decided again.
+- `CONFLICT_REQUIRES_EXPLICIT_RESOLUTION` / `NOTE_REQUIRED` /
+  `NO_VERIFIED_SUGGESTION`: conflicts are never resolved by approval.
+
+### Data integrity
+
+- Only the reviewed field changes (plus `isrcValidation`, marked reviewed, for
+  ISRCs); any other difference aborts the decision.
+- `originalRecording` keeps the MB-06 snapshot; MB-06 decisions, evidence,
+  verification labels, and source URLs are kept unchanged.
+- After each applied value the audio match and gap report are recalculated
+  with the same audio evidence.
+- Research review never sets `approvalStatus` to `APPROVED`. If an approved
+  recording's value changes it returns to `NEEDS_REVIEW`. Final approval
+  remains the separate `reviewAndApproveRecord` step.
+- MB-06 `gapDecisions` (human-only gaps) are not handled here.
+
+### Audit trail
+
+Each recorded action appends an immutable `ReviewAuditEntry`: sequence,
+`reviewId`, reviewer, timestamp, action and outcome, recording/decision/
+proposal/task/gap identifiers, source, field, assessment and candidate values,
+suggested and edited values, value origin, previous and resulting values,
+previous and resulting approval status, identity fingerprint, every evidence
+item of the decision (with source URL, verification status, and role), and
+the reviewer note (emails and local paths redacted). Rejected decisions are
+returned to the caller and not added to the trail.
+
+Persisting state and the audit trail is the caller's responsibility.
+
+### Offline demonstration
+
+Uses fictional data, mock providers, and a fictional verifier. It approves,
+edits, resolves the date conflict with a note, defers a decision, and shows
+rejected conflict, invalid-UPC, and replayed decisions. The recording stays
+DRAFT.
+
+```sh
+npm run review:demo
 ```

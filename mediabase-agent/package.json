@@ -6,7 +6,8 @@
     "typecheck": "tsc -p tsconfig.json",
     "test": "playwright test",
     "research:demo": "tsx scripts/liveResearchDemo.ts",
-    "research:demo:live": "tsx scripts/liveResearchDemo.ts --live"
+    "research:demo:live": "tsx scripts/liveResearchDemo.ts --live",
+    "review:demo": "tsx scripts/humanReviewDemo.ts"
   },
   "keywords": [],
   "author": "",
