@@ -75,8 +75,6 @@ export type ReviewFileSystem = Pick<
 
 export type JsonFileReviewStorageOptions = {
   fileSystem?: ReviewFileSystem;
-  /** A lock file older than this is treated as abandoned by a crashed process. */
-  staleLockMs?: number;
   /** Documents larger than this are refused when read. */
   maxDocumentBytes?: number;
 };
@@ -98,7 +96,6 @@ export function createJsonFileReviewStorage(
 ): ReviewStorageBackend {
   const fs = options.fileSystem ?? nodeFs;
   const root = resolve(directory);
-  const staleLockMs = options.staleLockMs ?? 30_000;
   const maxBytes = options.maxDocumentBytes ?? 20 * 1024 * 1024;
   const documentPath = (key: string) => join(root, `${key}.json`);
   const lockPath = (key: string) => join(root, `${key}.lock`);
@@ -113,23 +110,17 @@ export function createJsonFileReviewStorage(
   }
 
   async function acquire(key: string): Promise<void> {
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const handle = await fs.open(lockPath(key), "wx", 0o600);
       try {
-        const handle = await fs.open(lockPath(key), "wx", 0o600);
-        try {
-          await handle.writeFile(JSON.stringify({ pid: process.pid, acquiredAt: new Date().toISOString() }));
-        } finally {
-          await handle.close();
-        }
-        return;
-      } catch (error) {
-        if (errorCode(error) !== "EEXIST") throw error;
-        const age = await fs.stat(lockPath(key)).then((info) => Date.now() - info.mtimeMs, () => 0);
-        if (attempt > 0 || age < staleLockMs) throw new ReviewStorageLockedError();
-        await removeQuietly(lockPath(key));
+        await handle.writeFile(JSON.stringify({ pid: process.pid, acquiredAt: new Date().toISOString() }));
+      } finally {
+        await handle.close();
       }
+    } catch (error) {
+      if (errorCode(error) === "EEXIST") throw new ReviewStorageLockedError();
+      throw error;
     }
-    throw new ReviewStorageLockedError();
   }
 
   return {

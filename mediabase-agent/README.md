@@ -855,9 +855,10 @@ omitted, the stored log is kept unchanged.
   prefix of the new ones, and the original snapshot, pending decisions, and
   audio evidence cannot change. Audit entries and refusals can only be
   appended. A save that only adds refusals is still a new revision.
-- `LOCKED`: saves for one recording are serialized with a lock file. A lock
-  older than `staleLockMs` (default 30 s) is treated as left behind by a
-  crashed process and removed.
+- `LOCKED`: saves for one recording are serialized with a lock file. Lock files
+  are never removed based on age, because a process may still be active while
+  paused. If a process has stopped and left a lock behind, remove that
+  recording's `.lock` file before retrying the save.
 
 ### Integrity checks
 

@@ -36,9 +36,9 @@ async function withTempDir<T>(run: (dir: string) => Promise<T>): Promise<T> {
   }
 }
 
-function fileStore(dir: string, fileSystem?: ReviewFileSystem, staleLockMs?: number): ReviewSessionStore {
+function fileStore(dir: string, fileSystem?: ReviewFileSystem): ReviewSessionStore {
   return createReviewSessionStore(
-    createJsonFileReviewStorage(dir, { ...(fileSystem ? { fileSystem } : {}), ...(staleLockMs !== undefined ? { staleLockMs } : {}) }),
+    createJsonFileReviewStorage(dir, { ...(fileSystem ? { fileSystem } : {}) }),
     { now: () => SAVED_AT }
   );
 }
@@ -438,14 +438,17 @@ test("a signed store detects rewritten audit notes, reviewers, and timestamps", 
   });
 });
 
-test("a held lock blocks saving; an abandoned lock is recovered", async () => {
+test("an existing lock blocks saving until it is safely removed", async () => {
   await withTempDir(async (dir) => {
     const { state } = await reviewed();
     const lock = join(dir, `${reviewStorageKey(state.recordingId)}.lock`);
     await fs.writeFile(lock, "{}");
     expect(await fileStore(dir).save(state, { expectedRevision: 0 })).toMatchObject({ ok: false, code: "LOCKED" });
-    expect(await fileStore(dir, undefined, 0).save(state, { expectedRevision: 0 }))
-      .toMatchObject({ ok: true, session: { revision: 1 } });
+    expect(await fs.readFile(lock, "utf8")).toBe("{}");
+    await fs.unlink(lock);
+    expect(await fileStore(dir).save(state, { expectedRevision: 0 })).toMatchObject({
+      ok: true, session: { revision: 1 }
+    });
     expect((await fs.readdir(dir)).some((name) => name.endsWith(".lock"))).toBe(false);
   });
 });
