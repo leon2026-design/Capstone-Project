@@ -88,7 +88,11 @@ export type MetadataResearchProposal = Omit<MetadataResearchResponse, "evidence"
   conflictRequiresHumanResolution: boolean;
 };
 
-/** Future UI intent only; no action in this module applies values or approves records. */
+/**
+ * A human reviewer's intent for one proposal. This module never applies it;
+ * MB-07 (`src/workflow/humanReview.ts`) validates and applies it with an audit
+ * trail, and never approves the recording.
+ */
 export type MetadataReviewAction = {
   proposalId: string;
   recordingId: string;
@@ -197,6 +201,24 @@ export function researchIdentityFingerprint(
   return `IDENTITY-${createHash("sha256").update(JSON.stringify(identity)).digest("hex").slice(0, 16).toUpperCase()}`;
 }
 
+function researchContext(record: DemoRecording): MetadataResearchTask["existingMetadata"] {
+  const existingMetadata: MetadataResearchTask["existingMetadata"] = {};
+  for (const field of PUBLIC_CONTEXT_FIELDS) {
+    const value = record[field]?.trim();
+    if (value) existingMetadata[field] = sanitize(value);
+  }
+  for (const field of ["trackArtist", "productArtist"] as const) {
+    const value = record.artistAttribution?.[field]?.trim();
+    if (value) existingMetadata[field] = sanitize(value);
+  }
+  return existingMetadata;
+}
+
+/** The identity fingerprint research tasks for this recording would carry right now. */
+export function recordingIdentityFingerprint(record: DemoRecording): string {
+  return researchIdentityFingerprint(record.recordingId, researchContext(record));
+}
+
 export function buildMetadataResearchTasks(
   record: DemoRecording,
   report: MetadataGapReport
@@ -207,15 +229,7 @@ export function buildMetadataResearchTasks(
   if (!safeIdentifier(report.recordingId)) {
     throw new Error("Research recording identifier is empty, oversized, or contains sensitive data.");
   }
-  const existingMetadata: MetadataResearchTask["existingMetadata"] = {};
-  for (const field of PUBLIC_CONTEXT_FIELDS) {
-    const value = record[field]?.trim();
-    if (value) existingMetadata[field] = sanitize(value);
-  }
-  for (const field of ["trackArtist", "productArtist"] as const) {
-    const value = record.artistAttribution?.[field]?.trim();
-    if (value) existingMetadata[field] = sanitize(value);
-  }
+  const existingMetadata = researchContext(record);
   const identityFingerprint = researchIdentityFingerprint(record.recordingId, existingMetadata);
   const tasks: MetadataResearchTask[] = [];
   const seen = new Set<string>();
