@@ -65,7 +65,6 @@ const MASTER_CONTACT_HEADERS = [
     const possibleMatches = [];
   
     for (const person of contacts) {
-      // Use MA-02 to compare this master contact with the incoming report row.
       const result = contactMatchClassify(person, candidate);
   
       if (result.status === "EXACT_MATCH") {
