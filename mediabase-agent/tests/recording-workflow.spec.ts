@@ -303,3 +303,16 @@ test("dry-run plans tasks without invoking either provider", async () => {
   expect(result.findings).toEqual([]);
   expect(result.recording).toEqual(record);
 });
+
+test("rejects an ungrounded live provider before invoking either provider", async () => {
+  const { record, audio } = fixture();
+  const mock = providers();
+
+  await expect(runRecordingWorkflow(record, audio, {
+    research: { mode: "live", provider: mock.research },
+    musicBrainz: { provider: mock.musicBrainz, selection }
+  })).rejects.toThrow(/grounded provider/);
+
+  expect(mock.musicBrainzCalls).toEqual([]);
+  expect(mock.researchCalls).toEqual([]);
+});

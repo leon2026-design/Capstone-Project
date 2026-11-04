@@ -15,7 +15,7 @@ import {
 import type { DemoRecording } from "../metadata/recordValidation";
 import {
   runMetadataResearch,
-  validateResearchLimits,
+  validateResearchConfiguration,
   type ResearchRunOptions,
   type ResearchRunResult
 } from "../research/researchOrchestrator";
@@ -74,12 +74,12 @@ export async function runRecordingWorkflow(
   const audio = structuredClone([...audioExtractions]);
 
   // Validate configuration before any provider request.
-  const limits = validateResearchLimits(options.research.limits);
+  const limits = validateResearchConfiguration(options.research);
   const researchOptions = {
     ...options.research,
     limits
   };
-    const musicBrainzOptions: MusicBrainzWorkflowOptions = options.musicBrainz
+  const musicBrainzOptions: MusicBrainzWorkflowOptions = options.musicBrainz
     ? {
         ...options.musicBrainz,
         selection: { ...options.musicBrainz.selection }
@@ -95,10 +95,6 @@ export async function runRecordingWorkflow(
     )
   ) {
     throw new Error("MusicBrainz maxCalls must be an integer from 0 to 2.");
-  }
-
-  if (researchOptions.mode !== "dry-run" && !researchOptions.provider) {
-    throw new Error("A research provider is required outside dry-run mode.");
   }
 
   const audioMatch = matchAudioToRecording(snapshot, audio);
