@@ -946,3 +946,203 @@ the folder for inspection.
 ```sh
 npm run review:persistence:demo
 ```
+
+
+## MB-09: Persistent Human-Only Metadata Gap Resolution
+
+MB-09 lets a human resolve the metadata gaps MB-06 marks as human-only. It
+extends MB-06 through MB-08 rather than replacing them:
+- MB-06 (`recordingWorkflow.ts`) still finds the gaps.
+- MB-07 (`humanReview.ts`, unchanged) still reviews research suggestions.
+- MB-08 (`reviewSessionStore.ts`) now also stores the combined history.
+
+MB-09 never approves, submits, uploads audio, or contacts Mediabase or any
+network service.
+
+- `src/workflow/humanGapReview.ts`:
+  - `startHumanGapReview(mb07State)` wraps an MB-07 state.
+  - `humanOnlyGapQueue(state)` lists the open human-only gaps with their
+    allowed actions and audio candidates.
+  - `humanGapBasisFor(state, gapId)` returns what the reviewer saw.
+  - `applyHumanGapDecision(state, decision)` applies one decision.
+  - `applyResearchReviewDecision` and `applyCombinedReviewDecisions`
+    interleave MB-07 and MB-09 decisions.
+- `src/workflow/reviewSessionStore.ts`:
+  - `loadCombined`, `saveCombined`, and `upgrade` handle schema version 2.
+  - `applyCombinedReviewDecisionsWithRefusalLog` records refusals of both
+    kinds.
+
+```ts
+let state = startHumanGapReview(startHumanReview(workflow, audio)); // MB-07 -> MB-09
+const queue = humanOnlyGapQueue(state);
+const item = queue.find((item) => item.allowedActions.includes("CONFIRM_ARTIST"));
+if (!item) throw new Error("No artist gap is available for confirmation.");
+const result = applyHumanGapDecision(state, {
+  reviewId: "r-42", recordingId: state.recordingId, gapId: item.gap.gapId,
+  basis: humanGapBasisFor(state, item.gap.gapId),
+  reviewer: { reviewerId: "dana" }, reviewedAt: new Date().toISOString(),
+  action: { action: "CONFIRM_ARTIST", exactArtist: "Fictional Artist", primaryArtist: "Fictional Artist" }
+});
+if (result.ok) state = result.state; // otherwise result.rejection.code explains why; state is unchanged
+await store.saveCombined(state, { expectedRevision, refusedDecisions });
+```
+
+### Which gaps MB-09 resolves
+
+A gap is handled by MB-09 only when all three conditions hold:
+- `gap.resolvedBy === "human"`
+- the gap is not research-eligible (`!gap.researchEligible`)
+- the gap is not in the `approval` area
+
+Research-eligible gaps stay with MB-07. `approval-pending` and other approval
+gates are never resolved here; they belong to the separate final approval
+step.
+
+### Actions
+
+| Action | Allowed when | Rules |
+| --- | --- | --- |
+| `SET_FIELD` | The gap names one of: `submitterName`, `email`, `title`, `featuredArtist`, `officialReleaseDate`, `albumReleaseDate`, or a yes/no declaration | Only a field of the active gap can be set. Values use the existing project rules: MM/DD/YYYY dates, a valid email, `yes`/`no` declarations, limits on length and control characters, and no emails or local paths in other text fields. Setting a field to its current value is refused. |
+| `CONFIRM_ARTIST` | Artist-attribution gaps | Calls `confirmArtistAttribution()`. The reviewer must select the Exact Artist explicitly; primary, secondary, and tertiary artists are optional explicit assignments. An Orchard `CONFLICT`, or an Exact Artist that Orchard did not offer, requires a note. Without Orchard attribution the decision is refused with `PROVENANCE_REQUIRED`; nothing is invented. |
+| `CONFIRM_AUDIO` | Audio gaps | Calls `confirmAudioSelection()` with an evaluated candidate's opaque `audioFileId`, or with `null` to confirm that no audio is attached. A candidate with conflicting metadata requires `acknowledgeConflicts: true` and a note. The file is never read, copied, or uploaded. |
+| `ACKNOWLEDGE` | Warning and informational gaps | Requires a note. The finding stays in the gap report, marked as acknowledged. Blocking gaps cannot be acknowledged. |
+| `DEFER` | Any human-only gap | Records the deferral only. The recording and approval status do not change. |
+
+Unanswered declarations are never filled in automatically. Research
+confidence is not treated as approval, and Gemini or MusicBrainz suggestions
+are never accepted by MB-09.
+
+Each decision carries a `basis`: the recording identity fingerprint and a
+digest of the gap and its current values. A decision is refused, leaving the
+state unchanged, if any of these apply:
+
+| Code | Reason |
+| --- | --- |
+| `STALE_DECISION` | The basis no longer matches. |
+| `DUPLICATE_REVIEW` | The review ID was already used by an MB-07 or MB-09 decision. |
+| `MISMATCHED_DECISION` | The decision belongs to another recording. |
+| `ACTION_NOT_ALLOWED` | The action or field is not allowed for this gap. |
+| `ALREADY_DECIDED` | The gap is already acknowledged or deferred. |
+| `INVALID_VALUE` | The value fails validation. |
+| `NOTE_REQUIRED` or `ACKNOWLEDGEMENT_REQUIRED` | A required note or acknowledgment is missing. |
+| `INVALID_DECISION` | The decision is malformed. |
+
+Accepted decisions return a new frozen state and an audit entry.
+
+### Research and manual review together
+
+`HumanGapReviewState` contains:
+- the MB-07 state, whose `recording` reflects both kinds of change
+- the manual audit trail
+- `reviewEvents`, one event per accepted decision in the order it was
+  applied (`RESEARCH` or `MANUAL`, with the review ID and audit sequence)
+
+Each manual audit entry also stores its `eventSequence`.
+
+MB-07 decisions still go through `applyHumanReviewDecision` unchanged, and
+research proposals are still checked against the recording identity and
+evidence they were generated from. A manual change that alters the recording
+identity makes older research decisions `STALE_DECISION`. For example,
+confirming an Exact Artist that differs from the stored artist does this.
+
+If a manual change touches an `APPROVED` recording, the recording returns to
+`NEEDS_REVIEW` and must be approved again. MB-09 never sets `APPROVED`;
+final approval (`reviewAndApproveRecord`) is still a separate, explicit
+operation.
+
+### Persistence and replay (schema version 2)
+
+Combined sessions are saved as schema version 2 by `saveCombined` and read by
+`loadCombined`. They use the same backend, storage keys, locks, atomic
+replacement, `expectedRevision`, `REVISION_CONFLICT`, `HISTORY_REWRITE`,
+`LOCKED`, SHA-256 checksum, and optional HMAC-SHA256 signature as MB-08. The
+signature also covers the manual audit and event counts and `upgradedFrom`.
+
+On every save and load the store rebuilds the session from the original MB-06
+snapshot and pending research decisions. It then replays every event in its
+recorded order: research events through MB-07 and manual events through
+`applyHumanGapDecision`, so the same rules apply as when the decision was
+made. The result must equal the stored state exactly.
+
+A manual audit entry keeps the exact validated action (`replay`) so that
+legitimate changes can be rebuilt. This internal field may hold a contact
+value. `publicHumanGapAuditTrail()` and `humanGapReviewSummary()` omit it,
+and their previous and resulting values redact emails and local paths.
+
+Replay rejects all of the following with `INTEGRITY_CHECK_FAILED`:
+- unreviewed metadata changes
+- forged confirmations
+- edited, deleted, or reordered history
+- duplicate review IDs
+- stale bases
+- changed evidence
+- approval status changed outside final approval
+
+When saving, the stored research history, manual audit trail, events, and
+refusals must each be a prefix of the new ones; otherwise the save fails
+with `HISTORY_REWRITE`.
+
+Refused manual decisions are appended to the same append-only refusal log
+(`kind: "MANUAL"`, with the MB-09 rejection code). Their text is redacted and
+length-limited, and the state is unchanged.
+
+### Version-1 compatibility
+
+`REVIEW_SESSION_SCHEMA_VERSION` is still `1`, and MB-08 sessions keep working
+exactly as before:
+- `load` and `save` read and write version 1 using the MB-08 replay rules.
+- `load` reports `INCOMPATIBLE_VERSION` for a version-2 document, and `save`
+  will not overwrite one.
+- `loadCombined` and `saveCombined` report `UPGRADE_REQUIRED` for a version-1
+  document.
+
+To upgrade, call `upgrade(recordingId, { expectedRevision })` explicitly:
+1. It verifies the version-1 document under its own rules.
+2. It wraps it unchanged, keeping the original snapshot, research history,
+   and refusals, with the existing audit entries as the first events.
+3. It writes version 2 at the next revision.
+4. It records `upgradedFrom` (the old schema version, revision, and content
+   digest).
+
+Nothing is reinterpreted or discarded, and an already upgraded document is
+reported as `unchanged`.
+
+### Limitations
+
+- Without `integrityKey`, edits that stay internally consistent cannot be
+  detected once the checksum is recomputed:
+  - edited free text (notes, reviewer identity, timestamps)
+  - reordering independent decisions and renumbering every sequence to match
+
+  With the key, any edit fails to load.
+- The internal replay data contains the exact values entered (including
+  contact details). Files are not encrypted at rest, as in MB-08.
+- There is no user interface; decisions are built by the caller (see
+  `scripts/humanGapReviewDemo.ts`).
+- Final approval and Mediabase submission are out of scope.
+
+### Offline demonstration
+
+The demo uses a fictional Orchard record, fictional reviewers, and simulated
+audio metadata (three candidate files, one with conflicting metadata) in a
+temporary folder. It:
+1. Runs MB-06.
+2. Creates an MB-07 session and accepts the verified label.
+3. Saves it with MB-08 (version 1), then upgrades it explicitly.
+4. Loads the saved session.
+5. Confirms the Exact Artist (MB-09).
+6. Rejects the research UPC (MB-07).
+7. Answers a declaration (MB-09).
+8. Selects the ISRC-matched audio file, after a refused unacknowledged
+   selection of the conflicting file is logged.
+9. Saves the combined history.
+10. Simulates a restart, reloads and verifies the history, and shows that a
+    stale session save gets `REVISION_CONFLICT`.
+11. Prints the outstanding gaps and review status.
+
+The recording stays DRAFT; nothing is uploaded or submitted.
+
+```sh
+npm run gap:demo
+npx playwright test tests/human-gap-review.spec.ts tests/review-persistence.spec.ts --reporter=line
+```

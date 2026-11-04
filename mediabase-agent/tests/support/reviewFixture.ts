@@ -17,6 +17,13 @@ import {
   type HumanReviewState
 } from "../../src/workflow/humanReview";
 import type { WorkflowMusicBrainzProvider } from "../../src/workflow/musicBrainzWorkflow";
+import {
+  humanGapBasisFor,
+  humanOnlyGapQueue,
+  type HumanGapAction,
+  type HumanGapDecision,
+  type HumanGapReviewState
+} from "../../src/workflow/humanGapReview";
 import { runRecordingWorkflow, type RecordingWorkflowResult } from "../../src/workflow/recordingWorkflow";
 
 /** Shared fictional MB-06 -> MB-07 fixture: mock providers and a fictional verifier, fully offline. */
@@ -73,6 +80,32 @@ export function fixture(withIsrc = true, sourceName = "fictional-review.csv") {
     }
   }];
   return { record, audio };
+}
+
+/** A simulated audio file; by default its embedded artist conflicts with the record. */
+export function conflictingAudio(fileName = "fictional-song-alt.wav", artist = "Someone Else Entirely"): AudioExtractionResult {
+  const filePath = resolve("fictional-audio", fileName);
+  return {
+    status: "OK",
+    filePath,
+    fileName,
+    metadata: {
+      filePath,
+      fileName,
+      format: "WAV",
+      extensionMatchesFormat: true,
+      durationSeconds: 181,
+      sampleRate: 44100,
+      channels: 2,
+      bitDepth: 16,
+      artist: artist,
+      title: "Fictional Song",
+      album: "Fictional Album",
+      version: null,
+      isrc: null,
+      rawIsrcs: []
+    }
+  };
 }
 
 export const musicBrainz: WorkflowMusicBrainzProvider = {
@@ -164,9 +197,16 @@ export async function setup(
     withIsrc?: boolean;
     sourceName?: string;
     current?: (record: DemoRecording) => void;
+    /** Mutates the imported record before MB-06 runs. */
+    prepare?: (record: DemoRecording) => void;
+    /** Additional simulated audio extractions offered as candidates. */
+    extraAudio?: AudioExtractionResult[];
   } = {}
 ): Promise<Setup> {
-  const { record, audio } = fixture(options.withIsrc ?? true, options.sourceName);
+  const base = fixture(options.withIsrc ?? true, options.sourceName);
+  const record = base.record;
+  const audio = [...base.audio, ...(options.extraAudio ?? [])];
+  options.prepare?.(record);
   const workflow = await runRecordingWorkflow(record, audio, {
     research: { mode: "mock", provider: research, ...(options.verify === false ? {} : { verifier }) },
     musicBrainz: {
@@ -184,6 +224,28 @@ export async function setup(
 }
 
 let reviewCounter = 0;
+
+/** Builds an MB-09 decision for the human-only gap whose code (and optionally field) matches. */
+export function gapDecide(
+  state: HumanGapReviewState,
+  code: string,
+  action: HumanGapAction,
+  extra: { field?: string; note?: string; reviewId?: string; reviewerId?: string } = {}
+): HumanGapDecision {
+  const item = humanOnlyGapQueue(state).find((entry) =>
+    entry.gap.code === code && (extra.field === undefined || entry.gap.fields.includes(extra.field)));
+  if (!item) throw new Error(`No human-only ${code} gap${extra.field ? ` for ${extra.field}` : ""}.`);
+  return {
+    reviewId: extra.reviewId ?? `gap-review-${++reviewCounter}`,
+    recordingId: state.recordingId,
+    gapId: item.gap.gapId,
+    action,
+    reviewer: { reviewerId: extra.reviewerId ?? "dana", displayName: "Dana (fictional reviewer)" },
+    reviewedAt: REVIEWED_AT,
+    basis: humanGapBasisFor(state, item.gap.gapId),
+    ...(extra.note !== undefined ? { note: extra.note } : {})
+  };
+}
 
 export function decide(
   state: HumanReviewState,
