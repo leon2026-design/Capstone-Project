@@ -90,7 +90,7 @@ const MASTER_CONTACT_HEADERS = [
           possibleMatches.push(person);
         }
       } else {
-        throw new Error("Unexpected MA-02 match status: " + result.status);
+        throw new Error("Unexpected match status: " + result.status);
       }
     }
   
