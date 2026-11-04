@@ -516,6 +516,7 @@ test("requires explicit reviewer identity and well-formed decisions", async () =
     { ...base, reviewer: { reviewerId: "  " } },
     { ...base, reviewedAt: "yesterday" },
     { ...base, reviewedAt: "2026-11-04 15:30:00" },
+    { ...base, reviewedAt: "2026-02-31T15:30:00Z" },
     { ...base, reviewId: "" },
     { ...base, source: "GEMINI" },
     { ...base, basis: undefined },

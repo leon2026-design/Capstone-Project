@@ -171,7 +171,7 @@ const SOURCES = ["MUSICBRAINZ", "RESEARCH"] as const;
 const MAX_ID_LENGTH = 200;
 const MAX_NOTE_LENGTH = 2000;
 const MAX_VALUE_LENGTH = 500;
-const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
+const ISO_UTC = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,3})?Z$/;
 const CONTROL = /[\u0000-\u001f\u007f]/;
 
 function deepFreeze<T>(value: T): T {
@@ -337,8 +337,7 @@ function shapeError(input: unknown): string | null {
   if (reviewer.displayName !== undefined && reviewer.displayName !== null && !identifier(reviewer.displayName)) {
     return "Reviewer display name is invalid.";
   }
-  if (typeof input.reviewedAt !== "string" || !ISO_UTC.test(input.reviewedAt) ||
-    Number.isNaN(Date.parse(input.reviewedAt))) {
+  if (typeof input.reviewedAt !== "string" || !validReviewTimestamp(input.reviewedAt)) {
     return "Review timestamp must be an ISO 8601 UTC timestamp.";
   }
   const basis = input.basis;
@@ -360,6 +359,18 @@ function shapeError(input: unknown): string | null {
     return "Only EDIT_SUGGESTED_VALUE carries an edited value, and it requires one.";
   }
   return null;
+}
+
+function validReviewTimestamp(value: string): boolean {
+  const match = ISO_UTC.exec(value);
+  if (!match || Number.isNaN(Date.parse(value))) return false;
+
+  const [year, month, day, hour, minute, second] = match.slice(1, 7).map(Number);
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+  return month >= 1 && month <= 12 && day >= 1 && day <= daysInMonth[month - 1] &&
+    hour <= 23 && minute <= 59 && second <= 59;
 }
 
 /** Fails if anything other than the allowed keys differs between two snapshots. */
