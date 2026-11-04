@@ -7,7 +7,8 @@
     "test": "playwright test",
     "research:demo": "tsx scripts/liveResearchDemo.ts",
     "research:demo:live": "tsx scripts/liveResearchDemo.ts --live",
-    "review:demo": "tsx scripts/humanReviewDemo.ts"
+    "review:demo": "tsx scripts/humanReviewDemo.ts",
+    "review:persistence:demo": "tsx scripts/reviewPersistenceDemo.ts"
   },
   "keywords": [],
   "author": "",
