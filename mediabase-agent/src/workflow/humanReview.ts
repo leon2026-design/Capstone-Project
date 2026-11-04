@@ -27,6 +27,11 @@ import type { RecordingWorkflowResult } from "./recordingWorkflow";
  * Mediabase. Final approval remains `reviewAndApproveRecord`.
  */
 
+/** The parts of an MB-06 result review starts from; a full `RecordingWorkflowResult` satisfies it. */
+export type HumanReviewSource = Pick<RecordingWorkflowResult, "recording" | "metadataDecisions"> & {
+  researchTasks: readonly Pick<RecordingWorkflowResult["researchTasks"][number], "taskId" | "identityFingerprint">[];
+};
+
 export type ReviewerIdentity = {
   reviewerId: string;
   displayName?: string | null;
@@ -267,7 +272,7 @@ function analyze(recording: DemoRecording, audioExtractions: AudioExtractionResu
  * recording; proposals researched for a different identity are then stale.
  */
 export function startHumanReview(
-  workflow: Readonly<RecordingWorkflowResult>,
+  workflow: Readonly<HumanReviewSource>,
   audioExtractions: readonly AudioExtractionResult[],
   options: { currentRecording?: Readonly<DemoRecording> } = {}
 ): HumanReviewState {

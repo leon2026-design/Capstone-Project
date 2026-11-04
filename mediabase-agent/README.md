@@ -759,7 +759,8 @@ item of the decision (with source URL, verification status, and role), and
 the reviewer note (emails and local paths redacted). Rejected decisions are
 returned to the caller and not added to the trail.
 
-Persisting state and the audit trail is the caller's responsibility.
+MB-08 (below) persists the state and audit trail, plus a separate log of
+refused decisions.
 
 ### Offline demonstration
 
@@ -770,4 +771,177 @@ DRAFT.
 
 ```sh
 npm run review:demo
+```
+
+## MB-08: Persistent Review Storage and Audit History
+
+MB-08 saves MB-07 review sessions locally and restores them between
+sessions. It reuses the MB-07 types and rules unchanged, works offline,
+and never approves, submits, or contacts Mediabase or any network service.
+
+- `src/storage/reviewStorageBackend.ts`: the replaceable
+  `ReviewStorageBackend` interface (`read`, atomic `replace`, `withLock`,
+  `keys`), with a local JSON-file backend and an in-memory backend.
+- `src/workflow/reviewSessionStore.ts`: `createReviewSessionStore(backend)`
+  adds revisions, conflict detection, integrity checks, and append-only audit
+  history on top of any backend.
+
+```ts
+const store = createReviewSessionStore(createJsonFileReviewStorage(".review-sessions"), {
+  integrityKey: process.env.REVIEW_STORE_KEY // optional, at least 16 bytes; see below
+});
+
+let state = startHumanReview(workflow, audio);            // MB-07
+// Applies decisions through MB-07 unchanged and logs every refused decision.
+let progress = applyReviewDecisionsWithRefusalLog({ state, refusedDecisions: [] }, decisions);
+const saved = await store.save(progress.state, {
+  expectedRevision: 0, sessionId: "desk-1", refusedDecisions: progress.refusedDecisions
+});
+
+// Later, after restarting:
+const loaded = await store.load(recordingId);
+if (loaded.ok) {
+  progress = applyReviewDecisionsWithRefusalLog(loaded.session, [decision]);
+  await store.save(progress.state, {
+    expectedRevision: loaded.session.revision, refusedDecisions: progress.refusedDecisions
+  });
+}
+```
+
+`/.review-sessions/` is git-ignored; saved sessions contain the full
+recording snapshot, including contact details, so keep them out of version
+control.
+
+### What is saved
+
+Each recording is one document holding the whole `HumanReviewState`:
+- the original MB-06 snapshot and the current snapshot with accepted values
+- every pending decision with its evidence, verification labels, and source
+  URLs, plus each finding's status (pending, approved, edited, rejected,
+  deferred)
+- the recalculated gap report and audio match
+- the complete audit trail, including human `REJECT_SUGGESTION` decisions
+  (outcome `SUGGESTION_REJECTED`)
+- an append-only refusal log of decisions MB-07 refused (duplicate,
+  stale, mismatched, conflicting, invalid value, and so on). Each entry keeps
+  its sequence, `recordedAt`, review/decision/proposal IDs, source, action,
+  field, reviewer, `reviewedAt`, submitted value, note, and the MB-07
+  rejection code and message. A refused decision never changes the state.
+  Free text is redacted (emails, local paths, control characters) and
+  length-limited before it is stored.
+
+A header records the recording ID, revision, `savedAt`, optional `sessionId`,
+audit entry and refusal counts, a SHA-256 content checksum (covering the
+state and refusal log), and an optional signature.
+
+`applyReviewDecisionsWithRefusalLog(progress, decisions)` applies decisions
+through `applyHumanReviewDecision` and appends each refusal to the log;
+`recordRefusedDecision(log, decision, rejection)` records one refusal
+directly. Pass the complete log as `refusedDecisions` when saving; if it is
+omitted, the stored log is kept unchanged.
+
+### Revisions and conflicts
+
+- The `recordingId` is already stable (`ORCHARD-?` IDs are derived from the
+  import). The storage key is a SHA-256 hash of it, so raw identifiers never
+  become file names and keys are always path-safe.
+- The first save uses `expectedRevision: 0`. Each later save must pass the
+  revision it loaded; a successful save increments it. Saving an identical
+  state returns `unchanged: true` without writing.
+- `REVISION_CONFLICT`: another session saved first. Load the latest revision
+  and re-apply new decisions through MB-07. Decisions about the same value
+  then fail as `STALE_DECISION`, so nothing is silently overwritten.
+- `HISTORY_REWRITE`: the saved audit trail and refusal log must each be a
+  prefix of the new ones, and the original snapshot, pending decisions, and
+  audio evidence cannot change. Audit entries and refusals can only be
+  appended. A save that only adds refusals is still a new revision.
+- `LOCKED`: saves for one recording are serialized with a lock file. A lock
+  older than `staleLockMs` (default 30 s) is treated as left behind by a
+  crashed process and removed.
+
+### Integrity checks
+
+A state is verified on every save and every load. The store rebuilds it from
+its original snapshot and pending decisions, replays each audit entry through
+`applyHumanReviewDecision`, and requires an exact match. A state MB-07 would
+not produce is refused:
+- a value without a human decision
+- a changed unrelated field
+- `APPROVED` set outside the final approval step
+- a deleted or altered entry
+- edited evidence or URLs
+- an approval of conflicting evidence
+
+Refusal log entries cannot be replayed (they changed nothing), so they are
+checked for sequence, known codes and actions, timestamps, length, and
+redaction instead.
+
+| Code | Meaning |
+| --- | --- |
+| `NOT_FOUND` | No saved session for this recording. |
+| `CORRUPTED_DATA` | Invalid JSON, malformed header, or checksum mismatch. |
+| `INCOMPATIBLE_VERSION` | Not a review session document, or an unsupported `schemaVersion`. |
+| `INTEGRITY_CHECK_FAILED` | Wrong recording, failed replay, malformed refusal log, or missing/invalid signature. |
+| `INVALID_STATE` | `save` was given a state MB-07 did not produce, or a malformed refusal log; nothing is written. |
+| `INVALID_REQUEST` | Bad `expectedRevision` or `sessionId`. |
+| `REVISION_CONFLICT`, `HISTORY_REWRITE`, `LOCKED` | See above. |
+| `STORAGE_ERROR` | The backend failed; only the OS error code is reported. |
+
+Unreadable documents are never overwritten; a save on top of one fails until
+the file is fixed.
+
+Notes, reviewer identity, and timestamps (in audit entries and refusals) are
+free text, so replay cannot tell whether they were edited. With `integrityKey`, each document is signed with
+HMAC-SHA256, and an edit to any part of it fails to load. Without the key,
+only accidental corruption (checksum) and inconsistent states (replay) are
+detected. Keep the key outside the repository.
+
+### Safe writes and privacy
+
+- Each save writes a temporary file, flushes it to disk, and renames it over
+  the previous file. If a save fails or is interrupted, the earlier revision
+  stays intact; leftover temporary files are ignored and cleaned up on the
+  next save.
+- Folders are created with mode `0700` and files with `0600` where the OS
+  supports it.
+- Reviewer notes are already redacted by MB-07; refusal log text is redacted
+  by MB-08 before it is stored.
+- `list()` returns only the recording ID, revision, save time, counts, and
+  status. Error messages contain no file paths or recording contents.
+
+### Limitations
+
+- Files are not encrypted at rest. Contact details and local audio paths are
+  stored because resuming requires the exact snapshot.
+- Locking is file-based and meant for one machine or one shared folder; it is
+  not a distributed lock.
+- Refused decisions are only persisted when the caller records them
+  (`applyReviewDecisionsWithRefusalLog` or `recordRefusedDecision`) and
+  passes the log to `save`; calling `applyHumanReviewDecision` directly
+  still returns refusals without logging them.
+- Final approval (`reviewAndApproveRecord`) is not stored here.
+- A future change to MB-07 rules may make older sessions fail replay. They
+  then report `INTEGRITY_CHECK_FAILED` instead of being reinterpreted.
+- Only local JSON and in-memory backends exist. Another backend only needs to
+  implement `ReviewStorageBackend`.
+
+### Offline demonstration
+
+Uses fictional data in a temporary folder. The demo:
+1. Starts a session.
+2. Applies approve, edit, reject, and defer decisions, and logs MB-07's
+   refusal of an approval of conflicting evidence.
+3. Saves the session with its refusal log.
+4. Discards the in-memory session to simulate closing the app.
+5. Restores the session and its refusals, and shows that a replayed decision
+   is still refused (and logged).
+6. Resolves the deferred decision and saves revision 2.
+7. Shows that an outdated session cannot overwrite revision 2.
+8. Confirms the first four audit entries and the first refusal are unchanged.
+
+The recording stays DRAFT and nothing is submitted. Pass `-- --keep` to keep
+the folder for inspection.
+
+```sh
+npm run review:persistence:demo
 ```
