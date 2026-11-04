@@ -631,3 +631,49 @@ npx playwright test --reporter=line
 Audio tests generate minimal fictional WAV/MP3 files at runtime
 (`tests/support/audioFixtures.ts`) in Playwright's output directory; no real
 recordings are committed.
+
+
+## MB-06: Recording Workflow Integration
+
+`src/workflow/recordingWorkflow.ts` connects the existing audio matcher,
+gap analyzer, research task builder, MusicBrainz adapter, and research
+orchestrator for one recording.
+
+The result includes the unchanged recording snapshot, current audio match,
+gap report, research tasks/results, provider findings, and pending review
+decisions.
+
+### Behavior
+
+- MusicBrainz recording and release selections must be explicit.
+- MusicBrainz allows at most two lookup calls per workflow run.
+- Research uses one orchestrator batch, preserving its budgets and failure handling.
+- Unverified MusicBrainz findings do not resolve gaps; those tasks remain eligible for research.
+- Conflicting candidate values are flagged while retaining both providers' evidence.
+- Partial dates remain evidence rather than complete date candidates.
+- Dry-run mode does not invoke either provider.
+- No suggestions or audio matches are applied. Attribution, audio selections,
+  and approval remain unchanged.
+- The workflow does not access live Mediabase.
+
+This implements workflow preparation, not MB-07's approval interface.
+MusicBrainz source verification and live end-to-end research remain separate work.
+The returned result includes local operational data and should not be published
+or sent wholesale to a research provider.
+
+### Offline demonstration
+
+Uses a fictional Orchard import, simulated audio metadata, and mock providers.
+It demonstrates a deliberate date conflict and checks that inputs remain
+unchanged and the recording stays DRAFT.
+
+```sh
+npx tsx scripts/recordingWorkflowDemo.ts
+```
+
+### Checks
+
+```sh
+npm run typecheck
+npx playwright test --reporter=line
+```
