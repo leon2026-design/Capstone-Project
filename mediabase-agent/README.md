@@ -129,7 +129,8 @@ is detected from file content (RIFF/WAVE or ID3/MPEG Layer III frames), not the
 extension; `extensionMatchesFormat` reports any mismatch.
 
 Extracted fields: `filePath`, `fileName`, `format`, `durationSeconds`,
-`sampleRate`, `bitDepth`, `channels`, `artist`, `title`, `album`, `isrc`
+`sampleRate`, `bitDepth`, `channels`, `artist`, `albumArtist`, `title`, `album`,
+`genre`, `year`, `date`, `comments`, `isrc`
 (normalized, only when every embedded value agrees on one valid ISRC),
 `rawIsrcs` (exact embedded values), and `version` (only from an explicit ID3
 `TIT3` subtitle tag; never inferred from the title). Unavailable values are
