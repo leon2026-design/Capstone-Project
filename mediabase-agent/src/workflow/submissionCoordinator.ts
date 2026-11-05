@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import type { Page } from "@playwright/test";
-import { applyAudioMatch, matchAudioToRecording } from "../audio/audioMatcher";
+import { applyAudioMatch, matchAudioToRecording, matchAudioToRecordings, type AudioMatchResult } from "../audio/audioMatcher";
 import { extractAudioMetadata, type AudioExtractionResult } from "../audio/audioMetadata";
 import { prepareMediabaseForm } from "../browser/mediabaseForm";
 import { redactResearchText } from "../metadata/metadataResearch";
@@ -286,6 +286,7 @@ export function createSubmissionCoordinator(options: SubmissionCoordinatorOption
   if (!Number.isInteger(policy.maxAttempts) || policy.maxAttempts < 1 || policy.maxAttempts > 10) {
     throw new Error("maxAttempts must be an integer from 1 to 10.");
   }
+  if (!policy.requireAudio) throw new Error("The Mediabase submission coordinator requires audio uploads.");
   const destination = options.destination;
   assertLocalDestination(destination.formUrl);
   if (!SAFE_ID.test(destination.id)) throw new Error("Destination id must be a short safe identifier.");
@@ -433,7 +434,8 @@ export function createSubmissionCoordinator(options: SubmissionCoordinatorOption
   async function importLocked(
     record: DemoRecording,
     audio: readonly AudioExtractionResult[],
-    sourceName: string | null
+    sourceName: string | null,
+    batchMatch?: AudioMatchResult
   ): Promise<ImportOutcome> {
     const local: CoordinatorTimings = {};
     const outcome = await locked<ImportOutcome>(record.recordingId, async (ctx) => {
@@ -459,7 +461,7 @@ export function createSubmissionCoordinator(options: SubmissionCoordinatorOption
 
       let prepared = structuredClone(record);
       const corrections: Array<Omit<AutomaticCorrection, "sequence">> = [];
-      const match = matchAudioToRecording(prepared, [...audio]);
+      const match = batchMatch ?? matchAudioToRecording(prepared, [...audio]);
       if (policy.autoApplyConflictFreeAudioMatch && match.status === "MATCHED" && !prepared.audioFilePath && !prepared.audioMatch) {
         const candidate = match.candidates.find((item) => item.filePath === match.selectedFilePath);
         if (candidate?.autoEligible && candidate.conflicts.length === 0) {
@@ -474,6 +476,13 @@ export function createSubmissionCoordinator(options: SubmissionCoordinatorOption
           });
           count("automaticCorrections");
         }
+      } else if (
+        !prepared.audioFilePath &&
+        !prepared.audioMatch &&
+        match.status === "AMBIGUOUS" &&
+        match.reasons.some((reason) => reason.includes("same file automatically matched more than one Orchard recording"))
+      ) {
+        prepared = applyAudioMatch(prepared, match);
       }
       const workflow = await time("research", local, () => runRecordingWorkflow(prepared, [...audio], options.workflow));
       const usage = usageCounters(workflow.researchResults.usage);
@@ -769,10 +778,11 @@ export function createSubmissionCoordinator(options: SubmissionCoordinatorOption
       const local: CoordinatorTimings = {};
       const imported = importOrchardCsv(csv, sourceName);
       const audio = await time("audioExtraction", local, () => Promise.all(audioPaths.map((path) => extractAudioMetadata(path))));
+      const matches = matchAudioToRecordings(imported.records, audio);
       const outcomes: ImportOutcome[] = [];
-      for (const record of imported.records) {
+      for (const [index, record] of imported.records.entries()) {
         try {
-          outcomes.push(await importLocked(record, audio, sourceName));
+          outcomes.push(await importLocked(record, audio, sourceName, matches[index]));
         } catch (failure) {
           outcomes.push(error(record.recordingId, "IMPORT_FAILED", failure instanceof Error ? failure.message : String(failure)));
         }

@@ -117,6 +117,35 @@ async function readySong(e: Env, c: SubmissionCoordinator, row: OrchardRow = SON
 const sha256 = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
 
 test.describe("MB-10 end-to-end submission", () => {
+  test("batch imports do not auto-assign one matching audio file to multiple recordings", async ({ browser }, testInfo) => {
+    const e = await env(testInfo, browser);
+    const c = e.coordinator();
+    const wav = writeWav(e.dir, "fictional-song.wav", { artist: "Fictional Artist", title: "Fictional Song", album: "Fictional Album" });
+    const outcomes = await c.importRecordings({
+      csv: orchardCsv([
+        { track: "Fictional Song", artist: "Fictional Artist", product: "Fictional Album A" },
+        { track: "Fictional Song", artist: "Fictional Artist", product: "Fictional Album B" }
+      ]),
+      sourceName: "fictional-orchard.csv",
+      audioPaths: [wav]
+    });
+
+    expect(outcomes).toHaveLength(2);
+    expect(outcomes.every((item) => item.ok && item.corrections.length === 0)).toBe(true);
+    const { reviewStore } = e.stores.open();
+    for (const item of outcomes) {
+      if (!item.ok) continue;
+      const loaded = await reviewStore.loadCombined(item.recordingId);
+      expect(loaded.ok && loaded.session.state.research.audioMatch.status).toBe("AMBIGUOUS");
+      expect(loaded.ok && loaded.session.state.research.recording.audioMatch?.status).toBe("AMBIGUOUS");
+    }
+  });
+
+  test("the Mediabase coordinator rejects a policy that disables audio uploads", async ({ browser }, testInfo) => {
+    const e = await env(testInfo, browser);
+    expect(() => e.coordinator({ policy: { requireAudio: false } })).toThrow("requires audio uploads");
+  });
+
   for (const kind of ["memory", "json"] as const) {
     test(`a valid recording is imported, reviewed, approved, filled, verified, uploaded, and confirmed (${kind})`, async ({ browser }, testInfo) => {
       const e = await env(testInfo, browser, kind);
