@@ -90,7 +90,9 @@
   <h1>Mediabase Mock Form</h1>
   <p>Local test using fabricated song information.</p>
 
-  <form id="mediabase-form" data-submit-count="0">
+  <form id="mediabase-form" data-submit-count="0" action="/mock-mediabase/submit" method="post" enctype="multipart/form-data">
+    <input id="submission-id" name="submissionId" type="hidden" value="">
+
     <fieldset>
       <legend>Submitter information</legend>
 
@@ -202,20 +204,57 @@
     </button>
   </form>
 
+  <output id="submission-result" data-status="idle" aria-live="polite"></output>
+
   <script>
     const form = document.getElementById("mediabase-form");
     const submitButton = document.getElementById("submit");
+    const result = document.getElementById("submission-result");
+    // Uploads happen only when this page is served by the local mock (MB-10).
+    // Loaded with page.setContent or from any other origin, submit only counts.
+    const servedByLocalMock =
+      location.protocol === "http:" &&
+      ["127.0.0.1", "localhost", "[::1]"].includes(location.hostname);
 
     submitButton.addEventListener("click", () => {
       submitButton.dataset.clickCount =
         String(Number(submitButton.dataset.clickCount) + 1);
     });
 
-    form.addEventListener("submit", (event) => {
+    form.addEventListener("submit", async (event) => {
       event.preventDefault();
 
       form.dataset.submitCount =
         String(Number(form.dataset.submitCount) + 1);
+
+      if (!servedByLocalMock) return;
+      const action = new URL(form.getAttribute("action"), location.href);
+      if (action.origin !== location.origin) {
+        result.dataset.status = "blocked";
+        return;
+      }
+      if (form.dataset.submitCount !== "1") {
+        result.dataset.status = "repeat-ignored";
+        return;
+      }
+
+      result.dataset.status = "pending";
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), Number(form.dataset.timeoutMs || "15000"));
+      try {
+        const response = await fetch(action, {
+          method: "POST",
+          body: new FormData(form),
+          signal: controller.signal
+        });
+        result.textContent = await response.text();
+        result.dataset.httpStatus = String(response.status);
+        result.dataset.status = "responded";
+      } catch (error) {
+        result.dataset.status = error && error.name === "AbortError" ? "timeout" : "network-error";
+      } finally {
+        clearTimeout(timer);
+      }
     });
   </script>
 </body>
