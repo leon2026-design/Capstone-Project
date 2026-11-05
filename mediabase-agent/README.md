@@ -1366,3 +1366,84 @@ temporary folder:
 After a simulated restart it runs the queue. It verifies the SHA-256 of each
 received file against its source, runs the queue again to show that nothing is
 sent twice, and prints the ledger, timings, and counters.
+
+## MB-11: Verified Audio Preparation
+
+MB-11 prepares a separate, verified MP3 copy from already-reviewed metadata.
+It preserves the MB-06 through MB-09 decision rules and MB-08 review-event
+history; preparation manifests are stored separately and do not rewrite review
+history or grant final approval.
+
+```text
+reviewed recording + selected source audio
+  -> validate approved metadata and source tags
+  -> write a separate ID3-tagged MP3 copy
+  -> independently read tags back
+  -> compare the complete MPEG frame payload and decode both files
+  -> append a checksummed preparation manifest
+  -> MB-10 verifies the manifest and requires separate final approval
+  -> local mock submission only
+```
+
+`src/submission/audioPreparation.ts` exposes `prepareAudioArtifact` for one
+record and `prepareAudioArtifactsBatch` for a batch. Batch preparation
+continues after per-record failures and blocks destination filename
+collisions. Output files are created without overwriting existing files.
+`src/submission/audioPreparationStore.ts` appends versioned, per-recording
+manifests through the existing review storage backend, with SHA-256 integrity
+checks and optional HMAC-SHA256 signatures. Set an integrity key in the
+application configuration to authenticate persisted manifests.
+
+Tag selection uses an explicit, versioned `AudioTagProfile`. Values come only
+from the reviewed recording, validated fields, Orchard provenance, or a
+reviewer-approved explicit source. Existing tags that conflict with reviewed
+identity data are not silently replaced; non-ISRC conflicts require an
+identified reviewer, note, and field-level acknowledgment. The source audio
+file is never changed. Existing ID3 metadata, including unrelated user frames
+and artwork, is preserved and checked by tests.
+
+The prepared MP3 is independently read back, its MPEG Layer III frame stream
+must exactly match the source, and both streams must decode with the same
+sample rate, channel count, and decoded sample count. MB-10 can be configured
+with `audioPreparationStore`; when present, it refuses approval/submission
+unless a current prepared artifact and manifest verify. Final approval is
+still a separate explicit human decision.
+
+Destination naming is injectable and versioned via
+`UploadNamingProfile`/`createConfigurableNamingProfile`. No production
+Mediabase naming convention is assumed. The included `BASIC_FILENAME_PROFILE`
+is a technical example only.
+
+### MB-11 limitations and sponsor decisions
+
+- MP3 tagging is supported. WAV tagging fails closed with
+  `UNSUPPORTED_TAG_WRITE`; audio is not converted or re-encoded.
+- The MP3 decoder verifies decodability and preserved frame payload; it is not
+  a substitute for listening tests, loudness checks, or a full media-quality
+  certification workflow.
+- “Rye M”, genre vocabulary, clean/explicit status, destination naming, exact
+  required tags, multi-artist tag conventions, and WAV requirements need
+  sponsor confirmation. The unresolved questions are tracked in
+  [MB11_SPONSOR_DECISIONS.md](./MB11_SPONSOR_DECISIONS.md).
+- Preparation manifests include the local artifact path so that MB-10 can
+  resume. Restrict access to the local storage directory and avoid publishing
+  manifests or logs; persisted files are integrity-protected but not encrypted
+  at rest.
+- The demo's upload is to the loopback mock only. A mock receipt is not a
+  Mediabase confirmation, and no live Mediabase connection or submission is
+  implemented.
+
+### MB-11 commands
+
+```sh
+npm run mb11:demo
+npm run mb11:demo -- --keep
+npx playwright test tests/audio-preparation.spec.ts --reporter=line
+npm run typecheck
+```
+
+The offline demo uses fictional records and generated MP3 fixtures. It shows a
+successful preparation and local mock upload, a missing-tag correction sourced
+from reviewed values, and an unresolved required genre that remains blocked.
+It prints measured timings and configured usage counters; cost is not
+estimated. No real Mediabase, paid API, or sponsor account is contacted.

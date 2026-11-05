@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import { basename } from "node:path";
-import { matchAudioToRecording, type AudioMatchResult } from "../audio/audioMatcher";
+import { applyAudioMatch, matchAudioToRecording, type AudioMatchResult } from "../audio/audioMatcher";
 import { extractAudioMetadata, type AudioExtractionResult, type AudioMetadata } from "../audio/audioMetadata";
 import { analyzeMetadataGaps } from "../metadata/metadataGapAnalyzer";
 import { redactResearchText } from "../metadata/metadataResearch";
@@ -13,6 +13,9 @@ import {
 } from "../metadata/recordValidation";
 import { DECLARATION_FIELDS, humanOnlyGapQueue, type HumanGapReviewState } from "../workflow/humanGapReview";
 import { verifyAudioTags, type AudioTagVerification } from "./audioTagVerification";
+import { DEFAULT_MP3_TAG_PROFILE, type AudioTagProfile, type ExplicitTagValues } from "./audioTagProfile";
+import { extractMpegAudioPayload } from "./audioPreparation";
+import type { PreparedAudioManifest } from "./audioPreparationStore";
 import { SAFE_FILENAME_PROFILE, type UploadNamingProfile } from "./namingProfile";
 import { canonicalJson, sha256Hex, type AutomaticCorrection, type FinalApprovalRecord, type SubmissionException } from "./submissionLedger";
 
@@ -36,6 +39,8 @@ export type SubmissionPolicy = {
   allowUploadRename: boolean;
   /** Permits applying a conflict-free automatic audio match (MATCHED by ISRC or exact metadata) at import. */
   autoApplyConflictFreeAudioMatch: boolean;
+  /** When true, approval and submission require a verified MB-11 prepared artifact. */
+  requirePreparedAudio: boolean;
   /** Attempts per submit call, counting the first; only explicitly retryable failures are retried. */
   maxAttempts: number;
   retryDelaysMs: readonly number[];
@@ -49,6 +54,7 @@ export const DEFAULT_SUBMISSION_POLICY: SubmissionPolicy = Object.freeze({
   requireAudio: true,
   allowUploadRename: false,
   autoApplyConflictFreeAudioMatch: true,
+  requirePreparedAudio: false,
   maxAttempts: 3,
   retryDelaysMs: [250, 1000],
   responseTimeoutMs: 15000
@@ -96,9 +102,13 @@ function message(error: unknown): string {
 }
 
 /** Fingerprint of the reviewed recording (approval status excluded) and the audio bytes. */
-export function contentFingerprint(recording: Readonly<DemoRecording>, audioSha256: string | null): string {
+export function contentFingerprint(
+  recording: Readonly<DemoRecording>,
+  audioSha256: string | null,
+  context?: Record<string, unknown>
+): string {
   const { approvalStatus: _ignored, ...content } = recording as DemoRecording;
-  return `CONTENT-${sha256Hex(canonicalJson({ content, audioSha256 })).slice(0, 32).toUpperCase()}`;
+  return `CONTENT-${sha256Hex(canonicalJson({ content, audioSha256, ...(context ? { context } : {}) })).slice(0, 32).toUpperCase()}`;
 }
 
 /** Stable per recording, destination, and approved content: the same content always gets the same id. */
@@ -139,12 +149,17 @@ export type ReadinessInput = {
   destinationId: string;
   policy: SubmissionPolicy;
   namingProfile?: UploadNamingProfile;
+  preparedAudio?: PreparedAudioManifest | null;
+  audioTagProfile?: AudioTagProfile;
+  explicitTagValues?: ExplicitTagValues;
+  preparationStoreError?: SubmissionException | null;
 };
 
 export async function assessSubmissionReadiness(input: ReadinessInput): Promise<ReadinessReport> {
   const { state, policy } = input;
   const profile = input.namingProfile ?? SAFE_FILENAME_PROFILE;
-  const recording = state.research.recording;
+  const originalRecording = state.research.recording;
+  let recording = originalRecording;
   const exceptions: SubmissionException[] = [];
   const warnings: SubmissionException[] = [];
   const corrections: ReadinessReport["corrections"] = [];
@@ -161,10 +176,30 @@ export async function assessSubmissionReadiness(input: ReadinessInput): Promise<
       `Human-only gap ${item.gap.code} is ${item.status.toLowerCase()} (${item.gap.fields.join(", ")}).`);
   }
 
-  // The selected audio file as it exists now.
-  const path = recording.audioFilePath ?? null;
+  const preparedManifest = input.preparedAudio ?? null;
+  if (policy.requirePreparedAudio && !preparedManifest) {
+    add(exceptions, "AUDIO_PREPARATION_REQUIRED", "SPONSOR_DECISION", "audioFilePath", "A verified prepared audio artifact is required before approval or submission.");
+  }
+  if (preparedManifest && (
+    preparedManifest.recordingId !== state.recordingId ||
+    !preparedManifest.artifactPath ||
+    !preparedManifest.preparedSha256 ||
+    preparedManifest.preparationStatus !== "PREPARED" && preparedManifest.preparationStatus !== "REUSED"
+  )) {
+    add(exceptions, "PREPARED_ARTIFACT_UNVERIFIED", "INTEGRITY", "audioFilePath", "Prepared artifact manifest is incomplete or belongs to another recording.");
+  }
+  if (input.preparationStoreError) {
+    add(exceptions, input.preparationStoreError.code, input.preparationStoreError.kind,
+      input.preparationStoreError.field, input.preparationStoreError.message);
+  }
+  const preparedMode = preparedManifest !== null;
+  const path = preparedManifest?.artifactPath ?? recording.audioFilePath ?? null;
   const digest = path ? await fileDigest(path) : null;
   let metadata: AudioMetadata | null = null;
+  let audio: { extractions: AudioExtractionResult[]; match: AudioMatchResult } = {
+    extractions: [],
+    match: matchAudioToRecording(recording, [])
+  };
   if (!path) {
     if (policy.requireAudio) add(exceptions, "AUDIO_NOT_SELECTED", "SPONSOR_DECISION", "audioFilePath", "No audio file is selected for upload.");
   } else if (!digest) {
@@ -172,13 +207,62 @@ export async function assessSubmissionReadiness(input: ReadinessInput): Promise<
   } else {
     const extraction = await extractAudioMetadata(path);
     if (extraction.status === "ERROR") add(exceptions, "AUDIO_FILE_UNREADABLE", "RECOVERABLE", "audioFilePath", `Selected audio file: ${extraction.error}.`);
-    else metadata = extraction.metadata;
+    else {
+      metadata = extraction.metadata;
+      if (preparedMode) {
+        if (preparedManifest.preparationStatus !== "PREPARED" && preparedManifest.preparationStatus !== "REUSED" ||
+          preparedManifest.tagVerificationStatus !== "MATCH" || !preparedManifest.audioIntegrityVerified ||
+          preparedManifest.preparedSha256 !== digest.sha256 || preparedManifest.preparedFormat !== metadata.format) {
+          add(exceptions, "PREPARED_ARTIFACT_UNVERIFIED", "INTEGRITY", "audioFilePath", "Prepared artifact manifest does not verify this file.");
+        }
+        const sourcePath = originalRecording.audioFilePath ?? null;
+        const sourceDigest = sourcePath ? await fileDigest(sourcePath) : null;
+        if (!sourceDigest || sourceDigest.sha256 !== preparedManifest.sourceSha256) {
+          add(exceptions, "PREPARED_SOURCE_STALE", "INTEGRITY", "audioFilePath", "The original reviewed audio changed after preparation.");
+        } else {
+          try {
+            const sourceBytes = await fs.readFile(sourcePath!);
+            const preparedBytes = await fs.readFile(path);
+            if (!extractMpegAudioPayload(sourceBytes).equals(extractMpegAudioPayload(preparedBytes))) {
+              add(exceptions, "PREPARED_AUDIO_INTEGRITY_FAILED", "INTEGRITY", "audioFilePath", "Prepared audio frame payload differs from the selected source.");
+            }
+          } catch {
+            add(exceptions, "PREPARED_AUDIO_INTEGRITY_FAILED", "INTEGRITY", "audioFilePath", "Prepared audio payload could not be independently verified.");
+          }
+        }
+        const matchingRecord: DemoRecording = { ...originalRecording, audioFilePath: null, audioMatch: undefined };
+        audio = {
+          extractions: [extraction],
+          match: matchAudioToRecording(matchingRecord, [extraction])
+        };
+        if (audio.match.status !== "MATCHED" || audio.match.selectedFilePath !== path) {
+          add(exceptions, "PREPARED_AUDIO_IDENTITY_MISMATCH", "INTEGRITY", "audioFilePath", "Prepared audio tags do not identify the reviewed recording.");
+        } else {
+          recording = applyAudioMatch(matchingRecord, audio.match);
+        }
+      } else {
+        audio = await currentAudio(state);
+      }
+    }
   }
-  const audio = await currentAudio(state);
+  if (!path || !digest || !metadata) audio = await currentAudio(state);
+  const activeTagProfile = input.audioTagProfile ?? (preparedMode ? DEFAULT_MP3_TAG_PROFILE : undefined);
+  const activeTagProfileIdentity = preparedMode && preparedManifest
+    ? { id: activeTagProfile?.id ?? preparedManifest.tagProfileId, version: activeTagProfile?.version ?? preparedManifest.tagProfileVersion }
+    : null;
+  const namingProfileIdentity = preparedMode
+    ? { id: profile.id, version: profile.version ?? "1" }
+    : null;
   const basis: ApprovalBasis = {
     recordingId: state.recordingId,
     reviewRevision: input.reviewRevision,
-    contentFingerprint: contentFingerprint(recording, digest?.sha256 ?? null)
+    contentFingerprint: contentFingerprint(recording, digest?.sha256 ?? null, preparedMode ? {
+      preparedArtifactSha256: digest?.sha256 ?? null,
+      preparationId: preparedManifest?.preparationId ?? null,
+      tagProfile: activeTagProfileIdentity,
+      namingProfile: namingProfileIdentity,
+      uploadFileName: preparedManifest?.uploadFileName ?? null
+    } : undefined)
   };
 
   // Final approval: explicit, by a person, and bound to exactly this content.
@@ -248,7 +332,23 @@ export async function assessSubmissionReadiness(input: ReadinessInput): Promise<
   let tagVerification: AudioTagVerification | null = null;
   let upload: PreparedUpload | null = null;
   if (metadata && digest && path) {
-    tagVerification = verifyAudioTags(target, metadata, audio.match);
+    tagVerification = verifyAudioTags(
+      target,
+      metadata,
+      audio.match,
+      activeTagProfile,
+      input.explicitTagValues
+    );
+    if (preparedMode) {
+      for (const preparationIssue of preparedManifest?.issues ?? []) {
+        add(warnings, "PREPARATION_NOTE", preparationIssue.category === "SPONSOR_DECISION" ? "SPONSOR_DECISION" : "RECOVERABLE",
+          preparationIssue.field, preparationIssue.code);
+      }
+      for (const mapping of activeTagProfile?.unresolvedSponsorMappings ?? []) {
+        add(warnings, "UNRESOLVED_SPONSOR_MAPPING", "SPONSOR_DECISION", mapping,
+          `Sponsor mapping "${mapping}" is not configured and remains unresolved.`);
+      }
+    }
     for (const item of tagVerification.fields) {
       if (item.severity === "blocking") {
         add(exceptions, "AUDIO_TAG_CONFLICT", "SPONSOR_DECISION", item.field, `Embedded ${item.field} tag disagrees with the approved recording.`);

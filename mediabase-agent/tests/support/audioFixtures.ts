@@ -3,8 +3,12 @@ import { dirname } from "node:path";
 
 export type FixtureTags = {
   artist?: string;
+  albumArtist?: string;
   title?: string;
   album?: string;
+  genre?: string;
+  year?: string;
+  comments?: string;
   isrc?: string | string[];
   version?: string;
 };
@@ -30,10 +34,21 @@ function syncSafe(size: number): Buffer {
 export function buildId3Tag(tags: FixtureTags): Buffer {
   const frames: Buffer[] = [];
   if (tags.artist) frames.push(id3TextFrame("TPE1", tags.artist));
+  if (tags.albumArtist) frames.push(id3TextFrame("TPE2", tags.albumArtist));
   if (tags.title) frames.push(id3TextFrame("TIT2", tags.title));
   if (tags.album) frames.push(id3TextFrame("TALB", tags.album));
+  if (tags.genre) frames.push(id3TextFrame("TCON", tags.genre));
+  if (tags.year) frames.push(id3TextFrame("TYER", tags.year));
   if (tags.version) frames.push(id3TextFrame("TIT3", tags.version));
   for (const isrc of [tags.isrc ?? []].flat()) frames.push(id3TextFrame("TSRC", isrc));
+  if (tags.comments) {
+    const text = Buffer.from(tags.comments, "latin1");
+    const body = Buffer.concat([Buffer.from([0x00]), Buffer.from("eng", "latin1"), Buffer.from([0x00]), text]);
+    const header = Buffer.alloc(10);
+    header.write("COMM", 0, "latin1");
+    header.writeUInt32BE(body.length, 4);
+    frames.push(Buffer.concat([header, body]));
+  }
   const body = Buffer.concat(frames);
   return Buffer.concat([Buffer.from("ID3\x03\x00\x00", "latin1"), syncSafe(body.length), body]);
 }
