@@ -1146,3 +1146,223 @@ The recording stays DRAFT; nothing is uploaded or submitted.
 npm run gap:demo
 npx playwright test tests/human-gap-review.spec.ts tests/review-persistence.spec.ts --reporter=line
 ```
+
+## MB-10: End-to-End Workflow and Mock Submission
+
+MB-10 links the existing stages into one resumable, fully offline pipeline. It
+does not reimplement research or review. It calls MB-06 through MB-09 and adds
+four things: final readiness validation, an independent form preflight, a real
+multipart upload to a local mock, and a persistent submission ledger.
+
+```
+Orchard CSV + audio files
+  -> import + audio extraction/matching          (existing importers)
+  -> MB-06 research and gap analysis              (recordingWorkflow.ts)
+  -> MB-07 research review + MB-09 human-only gaps, saved by MB-08 (schema v2)
+  -> explicit final approval by a person          (stored in the submission ledger)
+  -> readiness validation, before any browser opens  (submissionReadiness.ts)
+  -> Playwright form filling                      (prepareMediabaseForm)
+  -> independent DOM preflight                    (formPreflight.ts)
+  -> multipart upload to the loopback mock        (mockMediabaseServer.ts)
+  -> receipt verification and confirmation        (submissionCoordinator.ts)
+```
+
+| File | Role |
+| --- | --- |
+| `src/workflow/submissionCoordinator.ts` | Orchestrator: `importRecordings`, `approvalBasis`, `approve`, `evaluate`, `submit`, `processQueue`, `reconcile`, `status`, `metrics` |
+| `src/submission/submissionReadiness.ts` | Submission policy, content fingerprint, stable submission ID, readiness exceptions |
+| `src/submission/audioTagVerification.ts` | Reads embedded tags in the selected file and compares them with the approved record |
+| `src/submission/namingProfile.ts` | Injectable upload filename policy |
+| `src/submission/formPreflight.ts` | Reads the rendered form independently and compares it field by field |
+| `src/submission/mockMediabaseServer.ts` | Loopback-only multipart receiver with scripted outcomes |
+| `src/submission/submissionLedger.ts` | Append-only, per-recording attempt history (digest and optional HMAC) |
+| `src/submission/submissionSafety.ts` | Destination and network guards |
+
+### States
+
+Each recording moves through `IMPORTED`, `VALIDATING`, `NEEDS_ATTENTION`,
+`READY`, `FILLING_FORM`, `PREFLIGHT_FAILED`, `SUBMITTING`, `SUBMITTED`,
+`FAILED`, and `OUTCOME_UNKNOWN`. Every change is appended to the ledger's
+`statusHistory`, with a timestamp and reason. Earlier entries are never
+rewritten.
+
+### Final approval is separate and explicit
+
+- The coordinator never writes to the review session. In the review,
+  `approvalStatus` stays `DRAFT`.
+- Final approval is a separate decision. It names the approver and the time,
+  and it is stored in the ledger.
+- `approvalBasis()` binds an approval to three things: the review revision, a
+  content fingerprint of the reviewed recording, and the SHA-256 of the
+  selected audio bytes.
+  - If any of these changes later, the approval becomes `APPROVAL_STALE` and a
+    person must approve again.
+- Approval is refused (`APPROVAL_REFUSED`) while any readiness exception
+  remains. A duplicate approval ID is refused as well.
+
+### Readiness validation (before the browser)
+
+`assessSubmissionReadiness` reports structured exceptions. Nothing is invented
+to clear them. It checks:
+- unresolved MB-09 human-only gaps, and blocking MB-06 gaps
+- the required submitter, artist, title and release-date fields
+- that the exact artist attribution is confirmed and the ISRC is validated
+- that all four declarations are answered
+- that an audio file is selected and exists
+- the MB-07 preparation rules
+- the embedded audio tags. Missing, mismatched, and unsupported tags are
+  reported separately. A conflict a person has acknowledged through MB-09 is
+  kept as a warning; an unacknowledged conflict blocks.
+- the upload filename, against the naming profile
+
+Each exception is classified as `SPONSOR_DECISION` (a person must decide),
+`RECOVERABLE`, or `INTEGRITY`.
+
+Only two corrections are automatic, and each is recorded in the ledger with the
+rule that allowed it:
+- `applyAudioMatch:conflict-free-isrc`: at import, an audio file whose
+  embedded ISRC matches is selected, but only if no other tag conflicts.
+- A filename rename, only when the injected naming profile permits it.
+
+The default profile (`SAFE_FILENAME_PROFILE`) only rejects unsafe names. It
+makes no assumption about a destination naming convention. Inject one with
+`createTemplateNamingProfile(id, "{isrc}{ext}")` or a custom
+`UploadNamingProfile`.
+
+### Independent preflight
+
+After `prepareMediabaseForm` fills the page, `runFormPreflight` reads the
+rendered DOM directly:
+- every text value
+- the checked radio in each group
+- the attached file's name, and the number of attached files
+
+It compares these with values derived from the approved record, not with what
+was passed to the form filler. A difference produces typed failure codes,
+including:
+- `FIELD_VALUE_MISMATCH`, `FIELD_MISSING`, `UNEXPECTED_FIELD_VALUE`
+- `RADIO_SELECTION_MISMATCH`
+- `FILE_NAME_MISMATCH`, `FILE_SIZE_MISMATCH`, `FILE_DIGEST_MISMATCH`,
+  `FILE_COUNT_MISMATCH`, `FILE_INPUT_MULTIPLE`
+- `SUBMISSION_ID_MISMATCH`, `ALREADY_SUBMITTED`
+
+Any failure blocks submission and sets `PREFLIGHT_FAILED`.
+
+An optional `explainer` may describe a failure. Its output is advisory only and
+cannot unblock the recording.
+
+### Mock upload, outcomes, retries and reconciliation
+
+- **The upload.** The mock page posts real `multipart/form-data`, including the
+  audio bytes, to `startMockMediabaseServer()` on `127.0.0.1`.
+- **The receipt.** The coordinator then looks up the receipt and verifies it:
+  - the fields digest
+  - the filename and file size
+  - the SHA-256 of the received bytes
+  - that exactly one file was received
+- **The confirmation.** It is persisted only when the receipt verifies.
+- **Scripted mock outcomes:** `success`, `validation-error` (422),
+  `unavailable` (503), `delay`, `reset-before-receipt`, and
+  `ambiguous-after-receipt`.
+
+Retry rules:
+- **Retried automatically.** Only an explicit "stored nothing, retryable"
+  response (503 or 429) is retried, up to `maxAttempts` (default 3) with
+  bounded delays. When retries run out, the status is `FAILED` with
+  `TRANSPORT_RETRY_EXHAUSTED`.
+- **Rejected by the destination.** A validation rejection is `FAILED` with a
+  `DESTINATION_REJECTED` sponsor-decision exception. It is not retried, and the
+  queue continues with the next recording.
+- **Possibly received.** Any outcome that might have reached the server (a
+  timeout, a lost connection, an unverifiable receipt, or a crash after the
+  attempt started) becomes `OUTCOME_UNKNOWN`. It is never resent
+  automatically. `reconcile()` looks up the receipt:
+  - Found and verified: `SUBMITTED`.
+  - Not found: `FAILED`. The person may then submit again explicitly.
+  - Found but different: stays `OUTCOME_UNKNOWN` with an integrity exception.
+- **Duplicates.** Each submission has a stable ID. It is derived from the
+  recording, the destination, and the content fingerprint. Concurrent submits
+  of the same recording are refused (`SUBMISSION_IN_PROGRESS`), and a
+  `SUBMITTED` recording is never sent again (`alreadySubmitted: true`).
+
+Finding for live testing: when a reused keep-alive connection resets before any
+response bytes arrive, browsers may silently resend a POST. The mock
+deduplicates on the submission ID and reports `duplicate: true`, which the
+coordinator records as `DESTINATION_ALREADY_HAD_SUBMISSION`. Whether real
+Mediabase deduplicates is unknown.
+
+### Persistence and compatibility
+
+- Review sessions use the MB-08/MB-09 store unchanged. Schema versions 1 and 2,
+  replay, digests, and signatures are untouched.
+- Submission state lives in a separate ledger, one key per recording and
+  destination. It has the same guarantees as review storage:
+  - revisions
+  - append-only attempts and status history
+  - a SHA-256 digest, plus an HMAC when a key is supplied
+  - locking and atomic writes
+- On restart, the coordinator resumes from the ledger. An attempt interrupted
+  mid-flight becomes `OUTCOME_UNKNOWN`. Reviews are never applied twice and
+  completed recordings are never resubmitted.
+- Corrupted or tampered review or ledger files are refused as `INTEGRITY`
+  exceptions.
+- The ledger stores error codes, digests, and IDs. It does not store email
+  addresses, notes, local paths, or raw server messages.
+
+### Safety
+
+- `assertLocalDestination` throws `LiveDestinationForbiddenError`
+  (`LIVE_DESTINATION_FORBIDDEN`) for any non-loopback URL. Any
+  `mediabase.com` host is always refused.
+- `installLoopbackNetworkGuard(page)` aborts every non-loopback request the
+  page makes. The mock page's own submit code also refuses non-loopback
+  targets.
+- Nothing in MB-10 contacts real Mediabase, uses an account, or calls a paid
+  API.
+
+### Metrics
+
+`metrics()` returns:
+- counters (imports, approvals, attempts, retries, and outcomes)
+- per-stage timings (validation, form fill, preflight, network, receipt
+  verification)
+- research usage reported by the providers
+
+`cost` is always `null`, because no API prices are configured and none are
+estimated.
+
+### Limitations, and what supervised live testing still needs
+
+- **Mock success is not live success.** `SUBMITTED` here means only that the
+  local mock received and verified the upload. A live submission needs a
+  confirmation from real Mediabase, which is out of scope.
+- **Real form not verified.** The real form's field names, file limits,
+  confirmation format, and receipt lookup are unverified. A live destination
+  needs its own `SubmissionDestination`, especially `lookupReceipt`, for
+  reconciliation.
+- **Live behavior unknown.** Real Mediabase's deduplication and retry behavior
+  (see the finding above) must be checked under supervision.
+- **Locks.**
+  - JSON-file locks never expire (MB-08 behavior); remove a stale lock by hand.
+  - The in-flight guard is per process. Across processes, the ledger lock
+    serializes access.
+- **Not encrypted.** Files are not encrypted at rest.
+
+### Commands
+
+```sh
+npm run mb10:demo            # add -- --keep to inspect the saved JSON files
+npx playwright test tests/mb10-submission.spec.ts --reporter=line
+```
+
+The demo uses three fictional recordings and real WAV files written to a
+temporary folder:
+- One recording submits on the first attempt.
+- One recovers automatically: the audio match is applied at import, and a 503
+  is retried.
+- One is flagged because a person deferred a declaration, so approval is
+  refused.
+
+After a simulated restart it runs the queue. It verifies the SHA-256 of each
+received file against its source, runs the queue again to show that nothing is
+sent twice, and prints the ledger, timings, and counters.

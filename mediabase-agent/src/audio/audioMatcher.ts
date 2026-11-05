@@ -262,6 +262,12 @@ function buildResult(
   } else {
     result.reasons.push("No local audio file matched this recording.");
   }
+  if (record.audioMatch?.status === "AMBIGUOUS" && !record.audioMatch.humanConfirmed && result.status === "MATCHED") {
+    result.status = "AMBIGUOUS";
+    result.selectedFilePath = null;
+    result.basis = null;
+    result.reasons.push("A human must resolve the previous audio ambiguity before this file can be selected.");
+  }
   return result;
 }
 
