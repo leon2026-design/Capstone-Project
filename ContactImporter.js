@@ -60,24 +60,47 @@ const MASTER_CONTACT_HEADERS = [
     };
   }
   
-  // Same name alone or a shared station inbox alone does not establish identity.
   function findContactMatch(contacts, candidate) {
-    const name = "Name / DJ Alias", org = "Station / Venue / Organization";
-    const same = (a,b) => !!normalizeContactText(a) && normalizeContactText(a) === normalizeContactText(b);
-    const overlap = (a,b) => trimCellText(a).split("\n").some(x =>
-      trimCellText(b).split("\n").some(y => same(x,y)));
-    const possible = [], strong = [];
-    contacts.forEach(person => {
-      const sameName = same(person[name],candidate[name]);
-      const sameEmail = overlap(person.Email,candidate.Email);
-      const sameSocial = overlap(person["Social Accounts"],candidate["Social Accounts"]);
-      const sameOrg = overlap(person[org], candidate[org]);
-      const orgOnly = !candidate[name] && !person[name] && sameOrg;
-      if (sameName || sameEmail || sameSocial || orgOnly) possible.push(person);
-      if (sameName && (sameEmail || sameSocial || sameOrg)) strong.push(person);
-    });
-    if (strong.length === 1 && possible.length === 1) return {person: strong[0]};
-    return possible.length ? {review: possible} : {};
+    const exactMatches = [];
+    const possibleMatches = [];
+  
+    for (const person of contacts) {
+      const result = contactMatchClassify(person, candidate);
+  
+      if (result.status === "EXACT_MATCH") {
+        exactMatches.push(person);
+      } else if (result.status === "POSSIBLE_MATCH") {
+        possibleMatches.push(person);
+      } else if (result.status === "NO_MATCH") {
+        // Keep the old review rule for a name alone or two unnamed station records.
+        const sameName = contactMatchHasSharedValue(
+          person["Name / DJ Alias"],
+          candidate["Name / DJ Alias"]
+        );
+  
+        const sameUnnamedStation =
+          !person["Name / DJ Alias"] &&
+          !candidate["Name / DJ Alias"] &&
+          contactMatchHasSharedValue(
+            person["Station / Venue / Organization"],
+            candidate["Station / Venue / Organization"]
+          );
+  
+        if (sameName || sameUnnamedStation) {
+          possibleMatches.push(person);
+        }
+      } else {
+        throw new Error("Unexpected match status: " + result.status);
+      }
+    }
+  
+    // Only link automatically when exactly one person fits and nobody else might.
+    if (exactMatches.length === 1 && possibleMatches.length === 0) {
+      return { person: exactMatches[0] };
+    }
+  
+    const review = exactMatches.concat(possibleMatches);
+    return review.length > 0 ? { review } : {};
   }
   
   // Run this from Apps Script to import the configured campaign report tabs.
