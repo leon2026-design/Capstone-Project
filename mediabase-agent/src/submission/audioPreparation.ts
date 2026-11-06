@@ -1,16 +1,20 @@
 import { createHash, randomBytes } from "node:crypto";
 import { constants as fsConstants, promises as fs } from "node:fs";
-import { basename, extname, join, relative, resolve, sep } from "node:path";
+import { basename, join, relative, resolve, sep } from "node:path";
 import NodeID3 = require("node-id3");
 import { MPEGDecoder } from "mpg123-decoder";
 import { extractAudioMetadata, normalizeIsrcValue, type AudioFormat, type AudioMetadata } from "../audio/audioMetadata";
 import { getArtistAttributionProblem, isValidDate, type DemoRecording } from "../metadata/recordValidation";
 import {
   findNamingCollisions,
-  SAFE_FILENAME_PROFILE,
+  SPONSOR_TITLE_NAMING_PROFILE,
   type NamingInput,
   type UploadNamingProfile
 } from "./namingProfile";
+import {
+  resolveClientMetadata,
+  type ClientMetadataContract
+} from "./clientMetadataContract";
 import {
   DEFAULT_MP3_TAG_PROFILE,
   resolveAudioTagValues,
@@ -27,7 +31,7 @@ import {
   type PreparationStatus,
   type PreparedAudioManifest
 } from "./audioPreparationStore";
-import { sha256Hex } from "./submissionLedger";
+import { canonicalJson, sha256Hex } from "./submissionLedger";
 
 export type AudioPreparationTimings = Record<string, number>;
 
@@ -42,6 +46,7 @@ export type PrepareAudioArtifactInput = {
   sourceAudioPath: string;
   tagProfile?: AudioTagProfile;
   namingProfile?: UploadNamingProfile;
+  clientContract?: ClientMetadataContract;
   outputDirectory: string;
   explicitValues?: ExplicitTagValues;
   acknowledgedSourceConflicts?: AcknowledgedTagConflict;
@@ -69,6 +74,9 @@ export type AudioPreparationFailure = {
   recoveryAction: string | null;
   recoverySucceeded: boolean | null;
   humanInterventionRequired: boolean;
+  message?: string;
+  evidenceReferences?: string[];
+  recommendedAction?: string;
 };
 
 export type AudioPreparationResult =
@@ -233,7 +241,7 @@ function createManifest(
   options: Partial<PreparedAudioManifest> = {}
 ): PreparedAudioManifest {
   const tags = input.tagProfile ?? DEFAULT_MP3_TAG_PROFILE;
-  const naming = input.namingProfile ?? SAFE_FILENAME_PROFILE;
+  const naming = input.namingProfile ?? SPONSOR_TITLE_NAMING_PROFILE;
   return {
     recordingId,
     eventId: `PREP-EVENT-${randomBytes(12).toString("hex").toUpperCase()}`,
@@ -249,6 +257,7 @@ function createManifest(
     tagProfileVersion: tags.version,
     namingProfileId: naming.id,
     namingProfileVersion: naming.version ?? "1",
+    tagProfileDigest: sha256Hex(canonicalJson(tags)),
     uploadFileName: null,
     tagVerificationStatus: "NOT_RUN",
     audioIntegrityVerified: false,
@@ -350,7 +359,8 @@ async function prepareUnlocked(input: PrepareAudioArtifactInput, batchCollision 
   const now = input.now ?? (() => new Date());
   const createdAt = now().toISOString();
   const profile = input.tagProfile ?? DEFAULT_MP3_TAG_PROFILE;
-  const namingProfile = input.namingProfile ?? SAFE_FILENAME_PROFILE;
+  const namingProfile = input.namingProfile ?? SPONSOR_TITLE_NAMING_PROFILE;
+  const clientContract = input.clientContract;
   const sourcePath = resolve(input.sourceAudioPath);
   const recordingIdentity = hash(Buffer.from(recordingId));
   let preparationId = `PREP-${recordingIdentity.slice(0, 12).toUpperCase()}`;
@@ -359,6 +369,7 @@ async function prepareUnlocked(input: PrepareAudioArtifactInput, batchCollision 
   const failures: AudioPreparationFailure[] = [];
   const warnings: string[] = [];
   let tempPath: string | null = null;
+  let newlyPublishedPath: string | null = null;
 
   const fail = async (
     code: string,
@@ -439,6 +450,37 @@ async function prepareUnlocked(input: PrepareAudioArtifactInput, batchCollision 
       return await fail("INVALID_RELEASE_DATE", "METADATA_RESOLUTION", "officialReleaseDate", "SPONSOR_DECISION", "MISSING_SPONSOR_DATA");
     }
 
+    const clientMetadata = resolveClientMetadata(input.recording, extraction.metadata.format, profile, {
+      contract: clientContract,
+      explicitValues: input.explicitValues,
+      sourceMetadata: extraction.metadata,
+      recordedAt: createdAt
+    });
+    manifest = { ...manifest, clientMetadata };
+    if ((clientContract?.namingProfileId ?? "sponsor-title") !== namingProfile.id) {
+      return await fail("CONTRACT_NAMING_MISMATCH", "NAMING_PREFLIGHT", "uploadFileName", "SPONSOR_DECISION", "MISSING_SPONSOR_DATA");
+    }
+    if (clientMetadata.problems.length > 0) {
+      failures.push(...clientMetadata.problems.map((problem) => ({
+        ...issue(recordingId, problem.code, "METADATA_RESOLUTION", problem.field,
+          problem.code === "UNSUPPORTED_TAG_MAPPING" ? "UNSUPPORTED" : "SPONSOR_DECISION"),
+        message: problem.message,
+        evidenceReferences: problem.evidenceReferences,
+        recommendedAction: problem.recommendedAction
+      })));
+      manifest = {
+        ...manifest,
+        preparationStatus: "MISSING_SPONSOR_DATA",
+        issues: failures.map(issueForManifest),
+        createdAt: now().toISOString()
+      };
+      await persistManifest(input.manifestStore, manifest);
+      return { ok: false, recordingId, manifest, failures, timingsMs };
+    }
+    if (namingProfile.id === SPONSOR_TITLE_NAMING_PROFILE.id && !input.manifestStore) {
+      return await fail("UPLOAD_COLLISION_CHECK_REQUIRED", "NAMING_PREFLIGHT", "uploadFileName", "SPONSOR_DECISION", "MISSING_SPONSOR_DATA");
+    }
+
     const resolved = resolveAudioTagValues(input.recording, profile, input.explicitValues);
     if (resolved.missingRequired.length > 0) {
       return await fail("REQUIRED_TAG_VALUE_MISSING", "METADATA_RESOLUTION", resolved.missingRequired.join(","), "SPONSOR_DECISION", "MISSING_SPONSOR_DATA");
@@ -491,6 +533,9 @@ async function prepareUnlocked(input: PrepareAudioArtifactInput, batchCollision 
       sourceSha256,
       profile.id,
       profile.version,
+      sha256Hex(canonicalJson(profile)),
+      clientMetadata.contractDigest,
+      clientMetadata.metadataDigest,
       namingProfile.id,
       namingProfile.version ?? "1",
       resolve(input.outputDirectory),
@@ -509,10 +554,11 @@ async function prepareUnlocked(input: PrepareAudioArtifactInput, batchCollision 
     const expectedPreparedHash = hash(taggedBytes);
     const namingInput = { fileName: extraction.fileName, format: "MP3" as const, record: input.recording };
     const naming = namingProfile.check(namingInput);
-    const uploadFileName = naming.suggestedName ?? extraction.fileName;
-    if (!naming.ok && !naming.suggestedName) {
-      warnings.push("DESTINATION_NAMING_UNRESOLVED");
+    const uploadFileName = naming.suggestedName ?? (naming.ok ? extraction.fileName : null);
+    if (!uploadFileName || !namingProfile.check({ ...namingInput, fileName: uploadFileName }).ok) {
+      return await fail("FILENAME_POLICY_VIOLATION", "NAMING_PREFLIGHT", "uploadFileName", "SPONSOR_DECISION", "MISSING_SPONSOR_DATA");
     }
+    warnings.push(...clientMetadata.warnings.map((item) => `${item.code}:${item.field}`));
     const unsupportedOptional = unsupported.filter((field) => !profile.requiredFields.includes(field));
     if (unsupportedOptional.length > 0) warnings.push(`OPTIONAL_TAG_UNSUPPORTED:${unsupportedOptional.join(",")}`);
     if (resolved.unresolvedSponsorMappings.length > 0) {
@@ -610,6 +656,7 @@ async function prepareUnlocked(input: PrepareAudioArtifactInput, batchCollision 
     try {
       await publishWithoutOverwrite(tempPath, finalPath);
       tempPath = null;
+      newlyPublishedPath = finalPath;
     } catch (failure) {
       const code = typeof failure === "object" && failure !== null && "code" in failure
         ? String(failure.code)
@@ -656,26 +703,43 @@ async function prepareUnlocked(input: PrepareAudioArtifactInput, batchCollision 
       }))
     };
     await persistManifest(input.manifestStore, manifest);
+    newlyPublishedPath = null;
     return { ok: true, artifact, manifest, reused: false, warnings, timingsMs };
   } catch (failure) {
     if (tempPath) await fs.unlink(tempPath).catch(() => undefined);
+    if (newlyPublishedPath) {
+      try {
+        await fs.unlink(newlyPublishedPath);
+      } catch {
+        failures.push(issue(recordingId, "ARTIFACT_CLEANUP_FAILED", "PUBLISH", null, "INTEGRITY"));
+      }
+    }
     const systemCode = typeof failure === "object" && failure !== null && "code" in failure
       ? String(failure.code)
       : null;
     const manifestFailure = failure instanceof Error && failure.message.startsWith("PREPARATION_MANIFEST_");
+    const collision = failure instanceof Error && failure.message === "PREPARATION_MANIFEST_UPLOAD_FILENAME_COLLISION";
     const recoverable = manifestFailure || ["ENOSPC", "EACCES", "EPERM", "EIO", "EMFILE", "EBUSY"].includes(systemCode ?? "");
-    const code = manifestFailure
+    const code = collision ? "UPLOAD_FILENAME_COLLISION" : manifestFailure
       ? failure instanceof Error ? failure.message : "PREPARATION_MANIFEST_STORAGE_ERROR"
       : systemCode ? `FILESYSTEM_${systemCode}` : "PREPARATION_FAILED";
-    failures.push(issue(recordingId, code, "PREPARATION", null, recoverable ? "RECOVERABLE" : "INTEGRITY",
-      false, null, null, !recoverable));
+    failures.push(issue(recordingId, code, "PREPARATION", collision ? "uploadFileName" : null,
+      collision ? "SPONSOR_DECISION" : recoverable ? "RECOVERABLE" : "INTEGRITY",
+      false, null, null, collision || !recoverable));
     manifest = {
       ...manifest,
       preparationStatus: "FAILED",
+      artifactPath: null,
+      artifactFileName: null,
+      preparedSha256: null,
+      preparedFormat: null,
+      uploadFileName: null,
+      tagVerificationStatus: "NOT_RUN",
+      audioIntegrityVerified: false,
       issues: failures.map(issueForManifest),
       createdAt: now().toISOString()
     };
-    if (!manifestFailure) {
+    if (!manifestFailure || collision) {
       try {
         await persistManifest(input.manifestStore, manifest);
       } catch (manifestError) {
@@ -746,14 +810,15 @@ export async function prepareAudioArtifactsBatch(
   const duplicateIds = new Set<string>();
   const seenIds = new Set<string>();
 
-  inputs.forEach((input) => {
+  const extracted = await Promise.all(inputs.map((input) => extractAudioMetadata(input.sourceAudioPath)));
+  inputs.forEach((input, index) => {
     const recordingId = input.recording.recordingId;
     if (seenIds.has(recordingId)) duplicateIds.add(recordingId);
     seenIds.add(recordingId);
-    const extension = extname(input.sourceAudioPath).toLowerCase();
-    const format = extension === ".mp3" ? "MP3" : extension === ".wav" || extension === ".wave" ? "WAV" : null;
-    if (!format) return;
-    const profile = input.namingProfile ?? SAFE_FILENAME_PROFILE;
+    const extraction = extracted[index];
+    if (extraction.status !== "OK") return;
+    const format = extraction.metadata.format;
+    const profile = input.namingProfile ?? SPONSOR_TITLE_NAMING_PROFILE;
     const key = `${profile.id}\u0000${profile.version ?? "1"}`;
     const group = grouped.get(key) ?? { profile, items: [] };
     group.items.push({

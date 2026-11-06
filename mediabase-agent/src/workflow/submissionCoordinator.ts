@@ -16,6 +16,7 @@ import {
   type PreflightFailure
 } from "../submission/formPreflight";
 import type { UploadNamingProfile } from "../submission/namingProfile";
+import type { ClientMetadataContract } from "../submission/clientMetadataContract";
 import type { AudioTagProfile, ExplicitTagValues } from "../submission/audioTagProfile";
 import type { AudioPreparationStore, PreparedAudioManifest } from "../submission/audioPreparationStore";
 import { assertLocalDestination, installLoopbackNetworkGuard } from "../submission/submissionSafety";
@@ -184,6 +185,7 @@ export type SubmissionCoordinatorOptions = {
   audioPreparationStore?: AudioPreparationStore;
   audioTagProfile?: AudioTagProfile;
   explicitAudioTagValues?: ExplicitTagValues;
+  clientMetadataContract?: ClientMetadataContract;
   policy?: Partial<SubmissionPolicy>;
   explainer?: DiscrepancyExplainer;
   now?: () => Date;
@@ -388,8 +390,9 @@ export function createSubmissionCoordinator(options: SubmissionCoordinatorOption
   async function loadPreparation(recordingId: string): Promise<{
     manifest: PreparedAudioManifest | null;
     exception: SubmissionException | null;
+    errors: SubmissionException[];
   }> {
-    if (!options.audioPreparationStore) return { manifest: null, exception: null };
+    if (!options.audioPreparationStore) return { manifest: null, exception: null, errors: [] };
     const loaded = await options.audioPreparationStore.load(recordingId);
     if (!loaded.ok) {
       const kind: SubmissionException["kind"] =
@@ -401,13 +404,25 @@ export function createSubmissionCoordinator(options: SubmissionCoordinatorOption
           kind,
           field: null,
           message: redactResearchText(loaded.message)
-        }
+        },
+        errors: []
       };
     }
-    const manifest = [...loaded.manifests].reverse().find((item) =>
-      item.preparationStatus === "PREPARED" || item.preparationStatus === "REUSED"
-    ) ?? null;
-    return { manifest, exception: null };
+    const latest = loaded.manifests.at(-1) ?? null;
+    if (!latest || latest.preparationStatus === "PREPARED" || latest.preparationStatus === "REUSED") {
+      return { manifest: latest, exception: null, errors: [] };
+    }
+    const errors: SubmissionException[] = latest.issues.map((item) => ({
+      code: item.code,
+      kind: item.category === "INTEGRITY" ? "INTEGRITY" : item.category === "RECOVERABLE" ? "RECOVERABLE" : "SPONSOR_DECISION",
+      field: item.field,
+      message: redactResearchText(item.message ?? `Audio preparation stopped at ${item.stage}: ${item.code}.`)
+    }));
+    if (!errors.length) {
+      errors.push({ code: "AUDIO_PREPARATION_FAILED", kind: "INTEGRITY", field: null,
+        message: "The latest audio preparation did not produce a verified artifact." });
+    }
+    return { manifest: null, exception: null, errors };
   }
 
   /** Marks a submission left in SUBMITTING by an interrupted process as an unknown outcome. */
@@ -450,7 +465,9 @@ export function createSubmissionCoordinator(options: SubmissionCoordinatorOption
         preparedAudio: preparation.manifest,
         audioTagProfile: options.audioTagProfile,
         explicitTagValues: options.explicitAudioTagValues,
-        preparationStoreError: preparation.exception
+        clientContract: options.clientMetadataContract,
+        preparationStoreError: preparation.exception,
+        preparationErrors: preparation.errors
       });
       const known = ctx.entry!.corrections;
       const corrections = report.corrections
@@ -841,7 +858,9 @@ export function createSubmissionCoordinator(options: SubmissionCoordinatorOption
         preparedAudio: preparation.manifest,
         audioTagProfile: options.audioTagProfile,
         explicitTagValues: options.explicitAudioTagValues,
-        preparationStoreError: preparation.exception
+        clientContract: options.clientMetadataContract,
+        preparationStoreError: preparation.exception,
+        preparationErrors: preparation.errors
       });
       return report.basis ? { ok: true, basis: report.basis } : error(recordingId, "BASIS_UNAVAILABLE", "No approval basis is available.");
     },
@@ -880,7 +899,9 @@ export function createSubmissionCoordinator(options: SubmissionCoordinatorOption
           preparedAudio: preparation.manifest,
           audioTagProfile: options.audioTagProfile,
           explicitTagValues: options.explicitAudioTagValues,
-          preparationStoreError: preparation.exception
+          clientContract: options.clientMetadataContract,
+          preparationStoreError: preparation.exception,
+          preparationErrors: preparation.errors
         });
         if (report.exceptions.length > 0) {
           count("approvalsRefused");

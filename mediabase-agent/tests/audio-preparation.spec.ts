@@ -6,15 +6,18 @@ import { createArtistAttributionDecision, confirmArtistAttribution } from "../sr
 import type { DemoRecording } from "../src/metadata/recordValidation";
 import { BASIC_MP3_TAG_PROFILE, DEFAULT_MP3_TAG_PROFILE, type AudioTagProfile } from "../src/submission/audioTagProfile";
 import {
-  prepareAudioArtifact,
-  prepareAudioArtifactsBatch,
-  extractMpegAudioPayload
+  prepareAudioArtifact as prepareWithContract,
+  prepareAudioArtifactsBatch as prepareBatchWithContract,
+  extractMpegAudioPayload,
+  type PrepareAudioArtifactInput
 } from "../src/submission/audioPreparation";
 import { createAudioPreparationStore } from "../src/submission/audioPreparationStore";
 import {
   BASIC_FILENAME_PROFILE,
   createConfigurableNamingProfile,
   findNamingCollisions,
+  SAFE_FILENAME_PROFILE,
+  SPONSOR_TITLE_NAMING_PROFILE,
   type NamingInput
 } from "../src/submission/namingProfile";
 import { createInMemoryReviewStorage } from "../src/storage/reviewStorageBackend";
@@ -26,6 +29,20 @@ import { chromium } from "@playwright/test";
 import { fixture } from "./support/reviewFixture";
 import { buildMp3, buildWav, writeFixture } from "./support/audioFixtures";
 import { MB10_KEY, fullReview, orchardCsv, reviewDesk, workflowOptions } from "./support/mb10Fixture";
+import { TECHNICAL_TEST_CONTRACT } from "./support/clientContractFixture";
+
+function technicalInput(input: PrepareAudioArtifactInput): PrepareAudioArtifactInput {
+  const namingProfile = input.namingProfile ?? SAFE_FILENAME_PROFILE;
+  return {
+    ...input,
+    clientContract: input.clientContract ?? { ...TECHNICAL_TEST_CONTRACT, namingProfileId: namingProfile.id },
+    namingProfile
+  };
+}
+
+const prepareAudioArtifact = (input: PrepareAudioArtifactInput) => prepareWithContract(technicalInput(input));
+const prepareAudioArtifactsBatch = (inputs: readonly PrepareAudioArtifactInput[]) =>
+  prepareBatchWithContract(inputs.map(technicalInput));
 
 function digest(bytes: Buffer): string {
   return createHash("sha256").update(bytes).digest("hex");
@@ -318,6 +335,29 @@ test("batch preparation isolates failures and blocks destination filename collis
   expect(results[2].ok).toBe(true);
 });
 
+test("the shared store blocks separately prepared case-insensitive title collisions", async ({}, testInfo) => {
+  const store = createAudioPreparationStore(createInMemoryReviewStorage(), { integrityKey: "fictional-integrity-key" });
+  const outputDirectory = testInfo.outputPath("separate-preparations");
+  const source = writeFixture(testInfo.outputPath("collision-source.mp3"), buildMp3());
+  const first = await prepareAudioArtifact({
+    recording: approvedRecord(), sourceAudioPath: source, outputDirectory,
+    namingProfile: SPONSOR_TITLE_NAMING_PROFILE, manifestStore: store
+  });
+  expect(first.ok).toBe(true);
+  const secondRecord = { ...approvedRecord(), recordingId: "ORCHARD-ANOTHER-RECORD", title: "fictional song" };
+  const second = await prepareAudioArtifact({
+    recording: secondRecord, sourceAudioPath: source, outputDirectory,
+    namingProfile: SPONSOR_TITLE_NAMING_PROFILE, manifestStore: store
+  });
+  expect(second).toMatchObject({
+    ok: false,
+    failures: [expect.objectContaining({ code: "UPLOAD_FILENAME_COLLISION", humanInterventionRequired: true })]
+  });
+  const persisted = await store.load(secondRecord.recordingId);
+  expect(persisted.ok && persisted.manifests.at(-1)?.issues[0].code).toBe("UPLOAD_FILENAME_COLLISION");
+  expect((await fs.readdir(outputDirectory)).filter((name) => name.endsWith(".mp3"))).toHaveLength(1);
+});
+
 test("rejects malformed or truncated MPEG frame streams", () => {
   expect(() => extractMpegAudioPayload(buildMp3().subarray(0, -1))).toThrow();
 });
@@ -366,10 +406,14 @@ test("MB-10 approves and uploads the verified prepared bytes, then refuses reuse
   const server = await startMockMediabaseServer();
   const browser = await chromium.launch();
   try {
-    const makeCoordinator = () => createSubmissionCoordinator({
+    const contract = { ...TECHNICAL_TEST_CONTRACT, namingProfileId: SPONSOR_TITLE_NAMING_PROFILE.id };
+    const makeCoordinator = (allowUploadRename = true) => createSubmissionCoordinator({
       reviewStore: createReviewSessionStore(stateStores.review, { integrityKey: MB10_KEY }),
       ledger: createSubmissionLedger(stateStores.ledger, { integrityKey: MB10_KEY }),
       audioPreparationStore: stateStores.preparation,
+      clientMetadataContract: contract,
+      namingProfile: SPONSOR_TITLE_NAMING_PROFILE,
+      policy: { allowUploadRename },
       destination: localMockDestination(server.baseUrl),
       workflow: workflowOptions
     });
@@ -390,15 +434,54 @@ test("MB-10 approves and uploads the verified prepared bytes, then refuses reuse
       recording: loaded.session.state.research.recording,
       sourceAudioPath: source,
       outputDirectory: directory,
+      namingProfile: SPONSOR_TITLE_NAMING_PROFILE,
+      clientContract: contract,
       manifestStore: stateStores.preparation
     });
     expect(prep.ok).toBe(true);
     if (!prep.ok) return;
+    const failedRetry = await prepareAudioArtifact({
+      recording: loaded.session.state.research.recording,
+      sourceAudioPath: source,
+      outputDirectory: directory,
+      namingProfile: SPONSOR_TITLE_NAMING_PROFILE,
+      clientContract: contract,
+      manifestStore: stateStores.preparation,
+      tagProfile: {
+        id: "fictional-requires-genre", version: "1",
+        requiredFields: ["title", "artist", "genre"],
+        mappings: ["title", "artist", "genre"], unresolvedSponsorMappings: []
+      }
+    });
+    expect(failedRetry.ok).toBe(false);
+    const blockedAfterFailure = await coordinator.evaluate(imported[0].recordingId);
+    expect(blockedAfterFailure.ok && blockedAfterFailure.exceptions.map((item) => item.code))
+      .toContain("REQUIRED_TAG_VALUE_MISSING");
+    const restoredPrep = await prepareAudioArtifact({
+      recording: loaded.session.state.research.recording,
+      sourceAudioPath: source,
+      outputDirectory: directory,
+      namingProfile: SPONSOR_TITLE_NAMING_PROFILE,
+      clientContract: contract,
+      manifestStore: stateStores.preparation
+    });
+    expect(restoredPrep.ok && restoredPrep.reused).toBe(true);
 
     const resumed = makeCoordinator();
     const basis = await resumed.approvalBasis(imported[0].recordingId);
     expect(basis.ok).toBe(true);
     if (!basis.ok) return;
+    const refused = await makeCoordinator(false).approve({
+      recordingId: imported[0].recordingId,
+      approvalId: "mb11-rename-refused",
+      approvedBy: { reviewerId: "fictional-final-approver" },
+      approvedAt: "2026-11-05T04:00:00.000Z",
+      basis: basis.basis
+    });
+    expect(refused.ok).toBe(false);
+    if (!refused.ok && "exceptions" in refused && refused.exceptions) {
+      expect(refused.exceptions.map((item) => item.code)).toContain("FILENAME_POLICY_VIOLATION");
+    }
     const approval = await resumed.approve({
       recordingId: imported[0].recordingId,
       approvalId: "mb11-approval-1",
@@ -421,6 +504,8 @@ test("MB-10 approves and uploads the verified prepared bytes, then refuses reuse
     const submitted = await resumed.submit(imported[0].recordingId, { openPage: () => browser.newPage() });
     expect(submitted.ok && submitted.status).toBe("SUBMITTED");
     const receipt = server.receipts()[0];
+    expect(receipt.files[0].fileName).toBe("Fictional Song.mp3");
+    expect(receipt.files[0].fileName).toBe(prep.manifest.uploadFileName);
     expect(receipt.files[0].sha256).toBe(prep.artifact.sha256);
     expect(receipt.files[0].sha256).not.toBe(digest(await fs.readFile(source)));
   } finally {

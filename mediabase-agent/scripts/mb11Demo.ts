@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { chromium } from "@playwright/test";
 import { createJsonFileReviewStorage } from "../src/storage/reviewStorageBackend";
 import { createAudioPreparationStore } from "../src/submission/audioPreparationStore";
@@ -20,6 +20,7 @@ import {
   type OrchardRow
 } from "../tests/support/mb10Fixture";
 import { buildMp3, writeFixture } from "../tests/support/audioFixtures";
+import { TECHNICAL_TEST_CONTRACT } from "../tests/support/clientContractFixture";
 
 const ROWS: OrchardRow[] = [
   { track: "Fictional Fully Tagged", artist: "Fictional Artist", product: "Fictional Album", isrc: "USAAA2600111" },
@@ -49,6 +50,8 @@ async function main(): Promise<void> {
         reviewStore,
         ledger,
         audioPreparationStore: preparationStore,
+        clientMetadataContract: TECHNICAL_TEST_CONTRACT,
+        policy: { allowUploadRename: true },
         destination: localMockDestination(server.baseUrl),
         workflow: workflowOptions,
         namingProfile: SAFE_FILENAME_PROFILE
@@ -58,7 +61,7 @@ async function main(): Promise<void> {
     const sourcePaths = ROWS.map((row, index) => writeFixture(
       join(directory, `source-${index + 1}.mp3`),
       index === 1
-        ? buildMp3({ isrc: row.isrc })
+        ? buildMp3({ artist: row.artist, title: row.track, isrc: row.isrc })
         : buildMp3({ artist: row.artist, title: row.track, album: row.product, isrc: row.isrc })
     ));
     const coordinator = openCoordinator();
@@ -77,6 +80,7 @@ async function main(): Promise<void> {
     }
 
     const preparationTimings: Record<string, Record<string, number>> = {};
+    const preparedArtifacts: Record<string, { path: string; sha256: string }> = {};
     for (let index = 0; index < recordingIds.length; index += 1) {
       const loaded = await reviewStore.loadCombined(recordingIds[index]);
       assert.ok(loaded.ok, !loaded.ok ? loaded.message : "");
@@ -86,6 +90,7 @@ async function main(): Promise<void> {
         sourceAudioPath: sourcePaths[index],
         outputDirectory: join(directory, "prepared"),
         namingProfile: SAFE_FILENAME_PROFILE,
+        clientContract: TECHNICAL_TEST_CONTRACT,
         manifestStore: preparationStore
       };
       const prepared = index === 2
@@ -103,6 +108,7 @@ async function main(): Promise<void> {
       preparationTimings[recordingIds[index]] = prepared.timingsMs;
       if (index < 2) {
         assert.ok(prepared.ok, !prepared.ok ? JSON.stringify(prepared.failures) : "");
+        if (prepared.ok) preparedArtifacts[recordingIds[index]] = prepared.artifact;
         if (prepared.ok && index === 1) {
           assert.ok(prepared.manifest.corrections.some((correction) => correction.code === "MISSING_TAG_WRITTEN"));
         }
@@ -133,17 +139,21 @@ async function main(): Promise<void> {
 
     const resumed = openCoordinator();
     const outcomes = await resumed.processQueue(recordingIds, { openPage: () => browser.newPage() });
-    const receipts = await Promise.all(server.receipts().map(async (receipt) => ({
-      recordingId: receipt.files[0]?.fileName.replace(/\.mp3$/i, "") ?? null,
-      confirmationId: receipt.confirmationId,
-      fileCount: receipt.files.length,
-      fileName: receipt.files[0]?.fileName ?? null,
-      size: receipt.files[0]?.size ?? null,
-      sha256MatchesPrepared: receipt.files.length === 1 &&
-        receipt.files[0].sha256 === sha256(await fs.readFile(
-          join(directory, "prepared", receipt.files[0].fileName)
-        ))
-    })));
+    const receipts = await Promise.all(server.receipts().map(async (receipt) => {
+      const index = sourcePaths.findIndex((path) => basename(path) === receipt.files[0]?.fileName);
+      const recordingId = index >= 0 ? recordingIds[index] : null;
+      const artifact = recordingId ? preparedArtifacts[recordingId] : undefined;
+      return {
+        recordingId,
+        confirmationId: receipt.confirmationId,
+        fileCount: receipt.files.length,
+        fileName: receipt.files[0]?.fileName ?? null,
+        size: receipt.files[0]?.size ?? null,
+        sha256MatchesPrepared: receipt.files.length === 1 && !!artifact &&
+          receipt.files[0].sha256 === artifact.sha256 &&
+          artifact.sha256 === sha256(await fs.readFile(artifact.path))
+      };
+    }));
     assert.equal(receipts.length, 2);
     assert.ok(receipts.every((receipt) => receipt.fileCount === 1 && receipt.sha256MatchesPrepared));
     const unresolved = await resumed.evaluate(recordingIds[2]);

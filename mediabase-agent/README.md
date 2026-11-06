@@ -1403,6 +1403,27 @@ identified reviewer, note, and field-level acknowledgment. The source audio
 file is never changed. Existing ID3 metadata, including unrelated user frames
 and artwork, is preserved and checked by tests.
 
+The default `SPONSOR_METADATA_CONTRACT` is separately versioned and requires
+the sponsor's reviewed metadata, including ISRC, release year, album and album
+artist, genre, publisher information, comments, and clean/explicit status.
+Additional artists and versions are required when applicable. It records
+field-level evidence and distinguishes a known value from a supported
+embedded mapping. Missing values and conflicts block the individual record.
+In particular, the publisher and content-rating encodings are **not confirmed**:
+even a known value cannot currently pass the strict contract as an embedded
+tag. `Radio`, `DJ Version`, and `(AI)` are not clean/explicit decisions.
+Publisher aliases require an individually approved, versioned rule; no legal
+identity is inferred from similar names.
+
+The default `SPONSOR_TITLE_NAMING_PROFILE` derives the upload name from the
+reviewed title, applicable version, and detected extension. It rejects unsafe,
+reserved, or overlong names rather than truncating or silently disambiguating
+them. A prepared upload's name is checked against its manifest and actually
+used by the form. `allowUploadRename` must still be explicitly enabled when
+that name differs from the private artifact filename. Title-profile preparation
+requires a shared preparation store, which serializes and checks names across
+recordings as well as within a batch.
+
 The prepared MP3 is independently read back, its MPEG Layer III frame stream
 must exactly match the source, and both streams must decode with the same
 sample rate, channel count, and decoded sample count. MB-10 can be configured
@@ -1411,9 +1432,11 @@ unless a current prepared artifact and manifest verify. Final approval is
 still a separate explicit human decision.
 
 Destination naming is injectable and versioned via
-`UploadNamingProfile`/`createConfigurableNamingProfile`. No production
-Mediabase naming convention is assumed. The included `BASIC_FILENAME_PROFILE`
-is a technical example only.
+`UploadNamingProfile`/`createConfigurableNamingProfile`. The title policy is a
+sponsor requirement, not a claim about production Mediabase policy. The
+included `BASIC_FILENAME_PROFILE` is a technical example only. An ISRC alone
+no longer authorizes automatic audio selection, and conflicting identity or
+duration among files sharing an ISRC requires review.
 
 ### MB-11 limitations and sponsor decisions
 
@@ -1422,9 +1445,9 @@ is a technical example only.
 - The MP3 decoder verifies decodability and preserved frame payload; it is not
   a substitute for listening tests, loudness checks, or a full media-quality
   certification workflow.
-- “Rye M”, genre vocabulary, clean/explicit status, destination naming, exact
-  required tags, multi-artist tag conventions, and WAV requirements need
-  sponsor confirmation. The unresolved questions are tracked in
+- Publisher and clean/explicit frame mappings, genre vocabulary, exact
+  multi-artist representation, and destination compatibility remain unresolved.
+  The confirmed and outstanding decisions are tracked in
   [MB11_SPONSOR_DECISIONS.md](./MB11_SPONSOR_DECISIONS.md).
 - Preparation manifests include the local artifact path so that MB-10 can
   resume. Restrict access to the local storage directory and avoid publishing
@@ -1443,7 +1466,9 @@ npx playwright test tests/audio-preparation.spec.ts --reporter=line
 npm run typecheck
 ```
 
-The offline demo uses fictional records and generated MP3 fixtures. It shows a
+The offline demo uses fictional records, a deliberately separate fictional
+technical-test contract, and generated MP3 fixtures; it does not claim that
+the unresolved strict sponsor mappings are supported. It shows a
 successful preparation and local mock upload, a missing-tag correction sourced
 from reviewed values, and an unresolved required genre that remains blocked.
 It prints measured timings and configured usage counters; cost is not
