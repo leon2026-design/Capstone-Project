@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import { basename } from "node:path";
-import { applyAudioMatch, matchAudioToRecording, type AudioMatchResult } from "../audio/audioMatcher";
+import { applyAudioMatch, assessAudioDecision, matchAudioToRecording, type AudioMatchResult } from "../audio/audioMatcher";
 import { extractAudioMetadata, type AudioExtractionResult, type AudioMetadata } from "../audio/audioMetadata";
 import { analyzeMetadataGaps } from "../metadata/metadataGapAnalyzer";
 import { redactResearchText } from "../metadata/metadataResearch";
@@ -13,10 +13,17 @@ import {
 } from "../metadata/recordValidation";
 import { DECLARATION_FIELDS, humanOnlyGapQueue, type HumanGapReviewState } from "../workflow/humanGapReview";
 import { verifyAudioTags, type AudioTagVerification } from "./audioTagVerification";
-import { DEFAULT_MP3_TAG_PROFILE, type AudioTagProfile, type ExplicitTagValues } from "./audioTagProfile";
+import { DEFAULT_MP3_TAG_PROFILE, resolveAudioTagValues, type AudioTagProfile, type ExplicitTagValues } from "./audioTagProfile";
+import {
+  clientContractDigest,
+  resolveClientMetadata,
+  SPONSOR_METADATA_CONTRACT,
+  type ClientMetadataContract
+} from "./clientMetadataContract";
 import { extractMpegAudioPayload } from "./audioPreparation";
+import { verifyWaveTags, waveAudioUnchanged } from "./wavAudio";
 import type { PreparedAudioManifest } from "./audioPreparationStore";
-import { SAFE_FILENAME_PROFILE, type UploadNamingProfile } from "./namingProfile";
+import { SAFE_FILENAME_PROFILE, SPONSOR_TITLE_NAMING_PROFILE, type UploadNamingProfile } from "./namingProfile";
 import { canonicalJson, sha256Hex, type AutomaticCorrection, type FinalApprovalRecord, type SubmissionException } from "./submissionLedger";
 
 /**
@@ -152,12 +159,14 @@ export type ReadinessInput = {
   preparedAudio?: PreparedAudioManifest | null;
   audioTagProfile?: AudioTagProfile;
   explicitTagValues?: ExplicitTagValues;
+  clientContract?: ClientMetadataContract;
   preparationStoreError?: SubmissionException | null;
+  preparationErrors?: readonly SubmissionException[];
 };
 
 export async function assessSubmissionReadiness(input: ReadinessInput): Promise<ReadinessReport> {
   const { state, policy } = input;
-  const profile = input.namingProfile ?? SAFE_FILENAME_PROFILE;
+  const profile = input.namingProfile ?? (input.preparedAudio ? SPONSOR_TITLE_NAMING_PROFILE : SAFE_FILENAME_PROFILE);
   const originalRecording = state.research.recording;
   let recording = originalRecording;
   const exceptions: SubmissionException[] = [];
@@ -192,7 +201,16 @@ export async function assessSubmissionReadiness(input: ReadinessInput): Promise<
     add(exceptions, input.preparationStoreError.code, input.preparationStoreError.kind,
       input.preparationStoreError.field, input.preparationStoreError.message);
   }
+  for (const problem of input.preparationErrors ?? []) {
+    add(exceptions, problem.code, problem.kind, problem.field, problem.message);
+  }
   const preparedMode = preparedManifest !== null;
+  const activeTagProfile = input.audioTagProfile ?? (preparedMode ? DEFAULT_MP3_TAG_PROFILE : undefined);
+  const clientContract = input.clientContract ?? SPONSOR_METADATA_CONTRACT;
+  if (preparedMode && clientContract.namingProfileId !== profile.id) {
+    add(exceptions, "CONTRACT_NAMING_MISMATCH", "SPONSOR_DECISION", "uploadFileName",
+      "The active naming profile does not match the client contract.");
+  }
   const path = preparedManifest?.artifactPath ?? recording.audioFilePath ?? null;
   const digest = path ? await fileDigest(path) : null;
   let metadata: AudioMetadata | null = null;
@@ -210,6 +228,11 @@ export async function assessSubmissionReadiness(input: ReadinessInput): Promise<
     else {
       metadata = extraction.metadata;
       if (preparedMode) {
+        const sourceAudio = await currentAudio(state);
+        const sourceDecision = assessAudioDecision(originalRecording, sourceAudio.match);
+        for (const problem of sourceDecision.problems) {
+          add(exceptions, "SOURCE_AUDIO_REVIEW_STALE", "SPONSOR_DECISION", "audioFilePath", problem.message);
+        }
         if (preparedManifest.preparationStatus !== "PREPARED" && preparedManifest.preparationStatus !== "REUSED" ||
           preparedManifest.tagVerificationStatus !== "MATCH" || !preparedManifest.audioIntegrityVerified ||
           preparedManifest.preparedSha256 !== digest.sha256 || preparedManifest.preparedFormat !== metadata.format) {
@@ -223,11 +246,44 @@ export async function assessSubmissionReadiness(input: ReadinessInput): Promise<
           try {
             const sourceBytes = await fs.readFile(sourcePath!);
             const preparedBytes = await fs.readFile(path);
-            if (!extractMpegAudioPayload(sourceBytes).equals(extractMpegAudioPayload(preparedBytes))) {
-              add(exceptions, "PREPARED_AUDIO_INTEGRITY_FAILED", "INTEGRITY", "audioFilePath", "Prepared audio frame payload differs from the selected source.");
+            const intact = metadata.format === "WAV"
+              ? waveAudioUnchanged(sourceBytes, preparedBytes)
+              : extractMpegAudioPayload(sourceBytes).equals(extractMpegAudioPayload(preparedBytes));
+            if (!intact) {
+              add(exceptions, "PREPARED_AUDIO_INTEGRITY_FAILED", "INTEGRITY", "audioFilePath", "Prepared audio payload or preserved container chunks differ from the selected source.");
+            }
+            if (metadata.format === "WAV" && activeTagProfile &&
+              !await verifyWaveTags(preparedBytes, resolveAudioTagValues(originalRecording, activeTagProfile, input.explicitTagValues).values)) {
+              add(exceptions, "WAV_TAG_READBACK_MISMATCH", "INTEGRITY", "audioFilePath", "Prepared WAV tags did not pass independent ID3 and INFO read-back.");
             }
           } catch {
             add(exceptions, "PREPARED_AUDIO_INTEGRITY_FAILED", "INTEGRITY", "audioFilePath", "Prepared audio payload could not be independently verified.");
+          }
+        }
+        if (sourcePath && activeTagProfile) {
+          const sourceExtraction = await extractAudioMetadata(sourcePath);
+          if (sourceExtraction.status === "OK") {
+            if (sourceExtraction.metadata.format !== preparedManifest.sourceFormat ||
+              sourceExtraction.metadata.format !== metadata.format) {
+              add(exceptions, "PREPARED_AUDIO_INTEGRITY_FAILED", "INTEGRITY", "audioFilePath",
+                "The prepared audio format differs from the reviewed source.");
+            }
+            const resolved = resolveClientMetadata(originalRecording, sourceExtraction.metadata.format, activeTagProfile, {
+              contract: clientContract,
+              explicitValues: input.explicitTagValues,
+              sourceMetadata: sourceExtraction.metadata
+            });
+            for (const problem of resolved.problems) {
+              add(exceptions, problem.code, problem.code === "UNSUPPORTED_TAG_MAPPING" ? "INTEGRITY" : "SPONSOR_DECISION",
+                problem.field, `${problem.message} ${problem.recommendedAction}`);
+            }
+            if (!preparedManifest.clientMetadata ||
+              preparedManifest.clientMetadata.contractDigest !== resolved.contractDigest ||
+              preparedManifest.clientMetadata.metadataDigest !== resolved.metadataDigest ||
+              preparedManifest.tagProfileDigest !== sha256Hex(canonicalJson(activeTagProfile))) {
+              add(exceptions, "PREPARED_METADATA_STALE", "INTEGRITY", null,
+                "The client contract, reviewed evidence, or tag profile changed after audio preparation.");
+            }
           }
         }
         const matchingRecord: DemoRecording = { ...originalRecording, audioFilePath: null, audioMatch: undefined };
@@ -246,7 +302,6 @@ export async function assessSubmissionReadiness(input: ReadinessInput): Promise<
     }
   }
   if (!path || !digest || !metadata) audio = await currentAudio(state);
-  const activeTagProfile = input.audioTagProfile ?? (preparedMode ? DEFAULT_MP3_TAG_PROFILE : undefined);
   const activeTagProfileIdentity = preparedMode && preparedManifest
     ? { id: activeTagProfile?.id ?? preparedManifest.tagProfileId, version: activeTagProfile?.version ?? preparedManifest.tagProfileVersion }
     : null;
@@ -260,6 +315,9 @@ export async function assessSubmissionReadiness(input: ReadinessInput): Promise<
       preparedArtifactSha256: digest?.sha256 ?? null,
       preparationId: preparedManifest?.preparationId ?? null,
       tagProfile: activeTagProfileIdentity,
+      tagProfileDigest: activeTagProfile ? sha256Hex(canonicalJson(activeTagProfile)) : null,
+      clientContractDigest: clientContractDigest(clientContract),
+      metadataDigest: preparedManifest?.clientMetadata?.metadataDigest ?? null,
       namingProfile: namingProfileIdentity,
       uploadFileName: preparedManifest?.uploadFileName ?? null
     } : undefined)
@@ -364,12 +422,19 @@ export async function assessSubmissionReadiness(input: ReadinessInput): Promise<
 
     const sourceFileName = basename(path);
     let uploadFileName = sourceFileName;
-    const naming = profile.check({ fileName: sourceFileName, format: metadata.format, record: target });
+    const manifestName = preparedMode ? preparedManifest?.uploadFileName ?? null : null;
+    if (preparedMode && (!manifestName || preparedManifest?.namingProfileId !== profile.id ||
+      preparedManifest.namingProfileVersion !== (profile.version ?? "1"))) {
+      add(exceptions, "PREPARED_FILENAME_STALE", "INTEGRITY", "uploadFileName",
+        "The prepared filename or naming profile does not match the current submission policy.");
+    }
+    const candidateName = manifestName ?? sourceFileName;
+    const naming = profile.check({ fileName: candidateName, format: metadata.format, record: target });
     if (!naming.ok) {
       const suggestion = naming.suggestedName;
       const suggestionOk = suggestion !== null &&
         profile.check({ fileName: suggestion, format: metadata.format, record: target }).ok;
-      if (policy.allowUploadRename && suggestionOk && suggestion) {
+      if (!preparedMode && policy.allowUploadRename && suggestionOk && suggestion) {
         uploadFileName = suggestion;
         corrections.push({
           code: "UPLOAD_FILENAME_APPLIED",
@@ -382,6 +447,20 @@ export async function assessSubmissionReadiness(input: ReadinessInput): Promise<
         for (const problem of naming.problems) {
           add(exceptions, "FILENAME_POLICY_VIOLATION", "SPONSOR_DECISION", problem.code, problem.message);
         }
+      }
+    } else if (candidateName !== sourceFileName) {
+      if (policy.allowUploadRename) {
+        uploadFileName = candidateName;
+        corrections.push({
+          code: "UPLOAD_FILENAME_APPLIED",
+          rule: `naming-profile:${profile.id}`,
+          field: "uploadFileName",
+          previous: redactResearchText(sourceFileName),
+          resulting: candidateName
+        });
+      } else {
+        add(exceptions, "FILENAME_POLICY_VIOLATION", "SPONSOR_DECISION", "uploadFileName",
+          "The prepared upload name requires an explicitly permitted upload rename.");
       }
     }
     upload = {

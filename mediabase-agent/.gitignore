@@ -12,3 +12,9 @@ node_modules/
 
 # MB-08 local review sessions (contain recording and contact details)
 /.review-sessions/
+
+# Sponsor reference recordings and potentially sensitive local audit reports
+*.mp3
+*.wav
+*.wave
+mb11-audit*.json

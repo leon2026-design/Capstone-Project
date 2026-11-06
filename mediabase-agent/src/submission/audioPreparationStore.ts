@@ -1,5 +1,6 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { ReviewStorageLockedError, type ReviewStorageBackend } from "../storage/reviewStorageBackend";
+import type { ClientMetadataResolution } from "./clientMetadataContract";
 import { canonicalJson } from "./submissionLedger";
 
 export const AUDIO_PREPARATION_SCHEMA_VERSION = 1;
@@ -25,6 +26,9 @@ export type PreparationIssue = {
   recoveryAction: string | null;
   recoverySucceeded: boolean | null;
   humanInterventionRequired: boolean;
+  message?: string;
+  evidenceReferences?: string[];
+  recommendedAction?: string;
 };
 
 export type PreparedAudioManifest = {
@@ -43,6 +47,9 @@ export type PreparedAudioManifest = {
   tagProfileVersion: string;
   namingProfileId: string;
   namingProfileVersion: string;
+  /** Private evidence record; summaries must not print its raw catalog values. */
+  clientMetadata?: ClientMetadataResolution;
+  tagProfileDigest?: string;
   uploadFileName: string | null;
   tagVerificationStatus: "MATCH" | "FAILED" | "NOT_RUN";
   audioIntegrityVerified: boolean;
@@ -57,6 +64,7 @@ export type PreparationStoreErrorCode =
   | "CORRUPTED_DATA"
   | "INTEGRITY_CHECK_FAILED"
   | "HISTORY_REWRITE"
+  | "UPLOAD_FILENAME_COLLISION"
   | "LOCKED"
   | "STORAGE_ERROR";
 
@@ -172,6 +180,33 @@ export function createAudioPreparationStore(
     }
     return { ok: true, manifests: structuredClone(parsed.manifests), revision: parsed.revision };
   };
+  const findNameConflict = async (manifest: PreparedAudioManifest): Promise<PreparationStoreResult | null> => {
+    if (!manifest.uploadFileName) return error("CORRUPTED_DATA", "A prepared manifest must include its upload filename.");
+    const wanted = manifest.uploadFileName.normalize("NFKC").toUpperCase();
+    for (const storageKey of await backend.keys()) {
+      if (!storageKey.startsWith("audio-prep-") || storageKey === documentKey(manifest.recordingId)) continue;
+      const raw = await backend.read(storageKey);
+      if (raw === null) continue;
+      let document: unknown;
+      try {
+        document = JSON.parse(raw);
+      } catch {
+        return error("CORRUPTED_DATA", "A preparation manifest used for collision checking is invalid.");
+      }
+      if (!validDocument(document) || !verify(document, key)) {
+        return error("INTEGRITY_CHECK_FAILED", "A preparation manifest used for collision checking is unverified.");
+      }
+      if (document.manifests.some((item) => documentKey(item.recordingId) !== storageKey)) {
+        return error("CORRUPTED_DATA", "A preparation manifest has a mismatched recording identifier.");
+      }
+      if (document.manifests.some((item) =>
+        (item.preparationStatus === "PREPARED" || item.preparationStatus === "REUSED") &&
+        item.uploadFileName?.normalize("NFKC").toUpperCase() === wanted)) {
+        return error("UPLOAD_FILENAME_COLLISION", "Another recording already uses this upload filename; review the collision.");
+      }
+    }
+    return null;
+  };
   return {
     load: read,
     async withLock(recordingId, task) {
@@ -179,7 +214,7 @@ export function createAudioPreparationStore(
     },
     async append(manifest) {
       try {
-        return await backend.withLock(documentKey(manifest.recordingId), async () => {
+        const appendDocument = (): Promise<PreparationStoreResult> => backend.withLock(documentKey(manifest.recordingId), async () => {
           const current = await read(manifest.recordingId);
           if (!current.ok) return current;
           if (current.manifests.some((item) => item.eventId === manifest.eventId)) {
@@ -198,6 +233,13 @@ export function createAudioPreparationStore(
           };
           await backend.replace(documentKey(manifest.recordingId), JSON.stringify(document));
           return { ok: true, manifests: document.manifests, revision: document.revision };
+        });
+        if (manifest.preparationStatus !== "PREPARED" && manifest.preparationStatus !== "REUSED") {
+          return await appendDocument();
+        }
+        return await backend.withLock("audio-prep-upload-names", async () => {
+          const collision = await findNameConflict(manifest);
+          return collision ?? await appendDocument();
         });
       } catch (failure) {
         if (failure instanceof ReviewStorageLockedError) return error("LOCKED", "Another preparation is writing this recording.");

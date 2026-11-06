@@ -102,6 +102,46 @@ export const SAFE_FILENAME_PROFILE: UploadNamingProfile = {
   }
 };
 
+/** Sponsor-facing name; the reviewed title, not a local download name, is authoritative. */
+export const SPONSOR_TITLE_NAMING_PROFILE: UploadNamingProfile = {
+  id: "sponsor-title",
+  version: "1",
+  description: "Reviewed title and applicable version, followed by the detected audio extension.",
+  check({ fileName, format, record }) {
+    const title = normalizeFilename(record.title ?? "", "NFC", "-");
+    const version = normalizeFilename(record.version ?? "", "NFC", "-").replace(/^\((.*)\)$/u, "$1").trim();
+    const comparableTitle = title.normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+    const comparableVersion = version.normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+    const alreadyPresent = comparableVersion &&
+      (` ${comparableTitle} `).includes(` ${comparableVersion} `);
+    const stem = `${title}${version && !alreadyPresent ? ` (${version})` : ""}`.replace(/[. ]+$/g, "");
+    const expected = stem ? `${stem}${EXTENSIONS[format][0]}` : null;
+    const unsafe = (name: string) => {
+      const windowsBase = name.split(".")[0].replace(/[. ]+$/u, "").normalize("NFKC");
+      return /[<>:"/\\|?*\p{Cc}]/u.test(name) ||
+        /[. ]$/u.test(name) ||
+        /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/iu.test(windowsBase) ||
+        name === "." || name === "..";
+    };
+    const validExpected = expected !== null && expected.length <= DEFAULT_MAX_NAME_LENGTH && !unsafe(expected);
+    const problems: NamingProblem[] = [];
+    if (!stem) problems.push({ code: "EMPTY_NAME", message: "A reviewed title is required for the upload filename." });
+    if (expected && expected.length > DEFAULT_MAX_NAME_LENGTH) {
+      problems.push({ code: "NAME_TOO_LONG", message: `Upload filename exceeds ${DEFAULT_MAX_NAME_LENGTH} characters.` });
+    }
+    if (expected && unsafe(expected) || unsafe(fileName)) {
+      problems.push({ code: "UNSAFE_CHARACTERS", message: "The filename is unsafe or reserved on Windows." });
+    }
+    if (!EXTENSIONS[format].includes(extname(fileName).toLowerCase())) {
+      problems.push({ code: "EXTENSION_MISMATCH", message: `Upload filename extension does not match ${format}.` });
+    }
+    if (expected && fileName !== expected) {
+      problems.push({ code: "CONVENTION_MISMATCH", message: "Upload filename must use the reviewed title and version." });
+    }
+    return { ok: problems.length === 0, problems, suggestedName: validExpected ? expected : null };
+  }
+};
+
 export const BASIC_FILENAME_PROFILE: UploadNamingProfile = {
   id: "basic-filename",
   version: "1",

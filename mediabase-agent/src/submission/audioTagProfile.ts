@@ -1,5 +1,6 @@
 import { normalizeIsrcValue } from "../audio/audioMetadata";
 import type { DemoRecording } from "../metadata/recordValidation";
+import { reviewedVersionFromTitle } from "../metadata/versionDesignation";
 
 export const AUDIO_TAG_FIELDS = [
   "title",
@@ -34,9 +35,12 @@ export type ExplicitTagValue = {
   /** Opaque reference to the trusted source or sponsor-approved decision. */
   sourceReference: string;
   approvedBy: string;
+  /** References to conflicting evidence that the reviewer explicitly considered. */
+  acknowledgedEvidence?: readonly string[];
+  note?: string;
 };
 
-export type ExplicitTagValues = Partial<Record<"genre" | "contentRating", ExplicitTagValue>>;
+export type ExplicitTagValues = Partial<Record<"genre" | "contentRating" | "publisher", ExplicitTagValue>>;
 
 export type ResolvedAudioTagValues = {
   values: AudioTagValues;
@@ -49,8 +53,8 @@ export const DEFAULT_MP3_TAG_PROFILE: AudioTagProfile = Object.freeze<AudioTagPr
   id: "mediabase-mp3-standard",
   version: "1",
   requiredFields: ["title", "artist"],
-  mappings: ["title", "artist", "album", "isrc", "version", "year", "albumArtist", "comments"],
-  unresolvedSponsorMappings: ["Rye M"]
+  mappings: ["title", "artist", "album", "isrc", "version", "genre", "year", "albumArtist", "comments"],
+  unresolvedSponsorMappings: ["Rye Music publisher frame", "clean/explicit encoding"]
 });
 
 export const BASIC_MP3_TAG_PROFILE: AudioTagProfile = Object.freeze<AudioTagProfile>({
@@ -80,7 +84,7 @@ export function resolveAudioTagValues(
     isrc: recording.isrcValidation?.status === "invalid" || recording.isrcValidation?.status === "missing"
       ? null
       : normalizeIsrcValue(recording.isrc),
-    version: recording.version,
+    version: recording.version ?? reviewedVersionFromTitle(recording.title),
     year: recording.officialReleaseDate && /^\d{2}\/\d{2}\/\d{4}$/.test(recording.officialReleaseDate)
       ? recording.officialReleaseDate.slice(-4)
       : null,
@@ -94,7 +98,7 @@ export function resolveAudioTagValues(
     artist: "human-confirmed-exact-artist",
     album: "reviewed-record.albumTitle",
     isrc: "validated-record.isrc",
-    version: "reviewed-record.version",
+    version: recording.version ? "reviewed-record.version" : "reviewed-record.title-version",
     year: "validated-officialReleaseDate",
     albumArtist: "orchard-product-artist",
     comments: "reviewed-record.comments",

@@ -11,7 +11,8 @@
     "review:persistence:demo": "tsx scripts/reviewPersistenceDemo.ts",
     "gap:demo": "tsx scripts/humanGapReviewDemo.ts",
     "mb10:demo": "tsx scripts/mb10Demo.ts",
-    "mb11:demo": "tsx scripts/mb11Demo.ts"
+    "mb11:demo": "tsx scripts/mb11Demo.ts",
+    "mb11:audit": "tsx scripts/mb11SampleAudit.ts"
   },
   "keywords": [],
   "author": "",
