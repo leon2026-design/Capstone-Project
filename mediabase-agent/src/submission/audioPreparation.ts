@@ -1,10 +1,10 @@
 import { createHash, randomBytes } from "node:crypto";
 import { constants as fsConstants, promises as fs } from "node:fs";
 import { basename, join, relative, resolve, sep } from "node:path";
-import NodeID3 = require("node-id3");
 import { MPEGDecoder } from "mpg123-decoder";
 import { extractAudioMetadata, normalizeIsrcValue, type AudioFormat, type AudioMetadata } from "../audio/audioMetadata";
 import { getArtistAttributionProblem, isValidDate, type DemoRecording } from "../metadata/recordValidation";
+import { ReviewStorageLockedError } from "../storage/reviewStorageBackend";
 import {
   findNamingCollisions,
   SPONSOR_TITLE_NAMING_PROFILE,
@@ -21,9 +21,10 @@ import {
   unsupportedTagFields,
   type AudioTagField,
   type AudioTagProfile,
-  type ExplicitTagValues,
-  type WritableAudioTagField
+  type ExplicitTagValues
 } from "./audioTagProfile";
+import { AudioTagFormatError, readId3Values, readId3v1Values, updateId3Values } from "./audioId3";
+import { inspectWave, updateWaveTags, verifyWaveTags, waveAudioUnchanged, waveTagAgrees } from "./wavAudio";
 import {
   createAudioPreparationStore,
   type AudioPreparationStore,
@@ -124,27 +125,35 @@ function issue(
   recoverySucceeded: boolean | null = null,
   humanInterventionRequired = category === "SPONSOR_DECISION" || category === "UNSUPPORTED" || category === "INTEGRITY"
 ): AudioPreparationFailure {
-  return { recordingId, code, stage, field, category, recoveryAttempted, recoveryAction, recoverySucceeded, humanInterventionRequired };
+  const messages: Record<string, string> = {
+    CONFLICTING_ISRC: "The selected audio contains an invalid or conflicting ISRC.",
+    SOURCE_TAG_CONFLICT: "Embedded metadata disagrees with the reviewed value or another tag representation.",
+    UNTRUSTED_SOURCE_TAG: "An embedded value has no approved reviewed source.",
+    UNSUPPORTED_TAG_MAPPING: "The existing or required metadata cannot be represented safely.",
+    UPLOAD_FILENAME_COLLISION: "Multiple recordings would use the same upload filename."
+  };
+  const actions: Record<PreparationIssue["category"], string> = {
+    SPONSOR_DECISION: "Review the affected evidence with an authorized reviewer before preparing again.",
+    UNSUPPORTED: "Confirm the format and tag mapping, or use an authorized supported source.",
+    INTEGRITY: "Investigate the integrity failure and prepare again from a verified unchanged source.",
+    RECOVERABLE: "Resolve the reported storage or workflow condition before retrying."
+  };
+  const evidenceReferences = stage.startsWith("SOURCE")
+    ? ["selected-audio", ...(stage === "SOURCE_TAG_CHECK" ? ["reviewed-record"] : [])]
+    : stage === "METADATA_RESOLUTION" || stage === "NAMING_PREFLIGHT" ? ["reviewed-record"]
+      : stage === "AUDIO_INTEGRITY" || stage === "TAG_VERIFICATION" ? ["selected-audio", "prepared-artifact"]
+        : stage === "LOCK" || stage === "MANIFEST_PERSIST" ? ["preparation-manifest-store"] : [];
+  return {
+    recordingId, code, stage, field, category, recoveryAttempted, recoveryAction, recoverySucceeded,
+    humanInterventionRequired,
+    message: messages[code] ?? `Audio preparation reported ${code.replace(/_/g, " ").toLowerCase()} during ${stage.replace(/_/g, " ").toLowerCase()}.`,
+    evidenceReferences,
+    recommendedAction: actions[category]
+  };
 }
 
 function issueForManifest(failure: AudioPreparationFailure): PreparationIssue {
   return { ...failure };
-}
-
-function toId3Tags(
-  values: Partial<Record<AudioTagField, string>>
-): NodeID3.Tags {
-  const tags: NodeID3.Tags = {};
-  if (values.title) tags.title = values.title;
-  if (values.artist) tags.artist = values.artist;
-  if (values.album) tags.album = values.album;
-  if (values.isrc) tags.ISRC = values.isrc;
-  if (values.version) tags.subtitle = values.version;
-  if (values.genre) tags.genre = values.genre;
-  if (values.year) tags.year = values.year;
-  if (values.albumArtist) tags.performerInfo = values.albumArtist;
-  if (values.comments) tags.comment = { language: "eng", text: values.comments };
-  return tags;
 }
 
 function id3v2End(bytes: Buffer): number {
@@ -296,8 +305,8 @@ async function removeStaleTemporaryArtifacts(directory: string): Promise<void> {
   }
 }
 
-function collisionSafeTarget(outputDirectory: string, recordingId: string, preparationId: string): string {
-  return join(outputDirectory, `${safeId(recordingId)}-${preparationId.slice(0, 16)}.mp3`);
+function collisionSafeTarget(outputDirectory: string, recordingId: string, preparationId: string, format: AudioFormat): string {
+  return join(outputDirectory, `${safeId(recordingId)}-${preparationId.slice(0, 16)}${MIME_EXTENSION[format]}`);
 }
 
 async function persistManifest(store: AudioPreparationStore | undefined, manifest: PreparedAudioManifest): Promise<void> {
@@ -311,7 +320,8 @@ async function persistManifest(store: AudioPreparationStore | undefined, manifes
 async function validateExistingArtifact(
   path: string,
   expectedHash: string,
-  sourcePayload: Buffer,
+  sourceBytes: Buffer,
+  format: AudioFormat,
   record: Readonly<DemoRecording>,
   profile: AudioTagProfile,
   explicitValues: ExplicitTagValues
@@ -324,9 +334,11 @@ async function validateExistingArtifact(
   }
   if (hash(bytes) !== expectedHash) return null;
   const extracted = await extractAudioMetadata(path);
-  if (extracted.status !== "OK" || extracted.metadata.format !== "MP3") return null;
-  if (!extractMpegAudioPayload(bytes).equals(sourcePayload)) return null;
+  if (extracted.status !== "OK" || extracted.metadata.format !== format) return null;
+  if (format === "MP3" && !extractMpegAudioPayload(bytes).equals(extractMpegAudioPayload(sourceBytes))) return null;
+  if (format === "WAV" && !waveAudioUnchanged(sourceBytes, bytes)) return null;
   const values = resolveAudioTagValues(record, profile, explicitValues);
+  if (format === "WAV" && !await verifyWaveTags(bytes, values.values)) return null;
   for (const [field, expected] of Object.entries(values.values) as Array<[AudioTagField, string]>) {
     if (!sourceTagMatches(field, expected, extracted.metadata)) return null;
   }
@@ -334,7 +346,7 @@ async function validateExistingArtifact(
     artifact: {
       path,
       fileName: extracted.fileName,
-      format: "MP3",
+      format,
       size: bytes.length,
       sha256: expectedHash,
       uploadFileName: extracted.fileName,
@@ -368,6 +380,7 @@ async function prepareUnlocked(input: PrepareAudioArtifactInput, batchCollision 
   let manifest = createManifest(input, recordingId, preparationId, sourceName, "FAILED", createdAt);
   const failures: AudioPreparationFailure[] = [];
   const warnings: string[] = [];
+  const warningIssues: PreparationIssue[] = [];
   let tempPath: string | null = null;
   let newlyPublishedPath: string | null = null;
 
@@ -394,7 +407,7 @@ async function prepareUnlocked(input: PrepareAudioArtifactInput, batchCollision 
 
   try {
     if (batchCollision) {
-      return await fail("UPLOAD_FILENAME_COLLISION", "NAMING_PREFLIGHT", null, "RECOVERABLE", "RECOVERABLE_FAILURE");
+      return await fail("UPLOAD_FILENAME_COLLISION", "NAMING_PREFLIGHT", "uploadFileName", "SPONSOR_DECISION", "MISSING_SPONSOR_DATA");
     }
 
     const sourceInfo = await time("sourceValidation", async () => {
@@ -419,6 +432,14 @@ async function prepareUnlocked(input: PrepareAudioArtifactInput, batchCollision 
     const sourceBytes = sourceInfo.bytes;
     const sourceSha256 = hash(sourceBytes);
     const before = sourceInfo.info;
+    const sourceUnchanged = async (): Promise<boolean> => {
+      const current = await fs.lstat(sourcePath);
+      return !current.isSymbolicLink() && current.isFile() && current.size === before.size &&
+        current.mtimeMs === before.mtimeMs && hash(await fs.readFile(sourcePath)) === sourceSha256;
+    };
+    if (["RF64", "RIFX", "BW64"].includes(sourceBytes.toString("latin1", 0, 4))) {
+      return await fail("UNSUPPORTED_WAV_VARIANT", "SOURCE_VALIDATION", null, "UNSUPPORTED", "UNSUPPORTED_FORMAT");
+    }
     const extraction = await extractAudioMetadata(sourcePath);
     if (extraction.status !== "OK") {
       return await fail("INVALID_OR_UNSUPPORTED_AUDIO", "SOURCE_VALIDATION", null, "UNSUPPORTED", "UNSUPPORTED_FORMAT");
@@ -432,9 +453,13 @@ async function prepareUnlocked(input: PrepareAudioArtifactInput, batchCollision 
     if (!extraction.metadata.extensionMatchesFormat) {
       return await fail("EXTENSION_MISMATCH", "SOURCE_VALIDATION", null, "INTEGRITY", "FAILED");
     }
-    if (extraction.metadata.format !== "MP3") {
-      return await fail("UNSUPPORTED_TAG_WRITE", "TAG_WRITE", null, "UNSUPPORTED", "UNSUPPORTED_TAG_WRITE");
+    if (!await sourceUnchanged()) {
+      return await fail("SOURCE_CHANGED_DURING_PREPARATION", "SOURCE_VALIDATION", null, "INTEGRITY", "FAILED_VERIFICATION");
     }
+    const format = extraction.metadata.format;
+    const sourceWave = format === "WAV" ? inspectWave(sourceBytes) : null;
+    const sourceId3 = format === "MP3" ? readId3Values(sourceBytes) : null;
+    const sourceId3v1 = format === "MP3" ? await readId3v1Values(sourceBytes) : null;
 
     const artistProblem = getArtistAttributionProblem(input.recording as DemoRecording);
     if (artistProblem && profile.mappings.includes("artist")) {
@@ -488,36 +513,62 @@ async function prepareUnlocked(input: PrepareAudioArtifactInput, batchCollision 
     const unsupported = unsupportedTagFields(profile);
     const requiredUnsupported = unsupported.filter((field) => profile.requiredFields.includes(field));
     if (requiredUnsupported.length > 0) {
-      return await fail("UNSUPPORTED_TAG_WRITE", "TAG_WRITE", requiredUnsupported.join(","), "UNSUPPORTED", "UNSUPPORTED_TAG_WRITE");
+      return await fail("UNSUPPORTED_TAG_MAPPING", "TAG_WRITE", requiredUnsupported.join(","), "UNSUPPORTED", "UNSUPPORTED_TAG_WRITE");
     }
 
-    const sourcePayload = await time("audioIntegrityCheck", async () => extractMpegAudioPayload(sourceBytes));
-    let sourceDecode: Awaited<ReturnType<typeof decodeMpegAudio>>;
-    try {
-      sourceDecode = await time("sourceDecoding", async () => decodeMpegAudio(sourcePayload));
-    } catch {
-      return await fail("AUDIO_DECODE_FAILED", "SOURCE_DECODING", null, "INTEGRITY", "FAILED_VERIFICATION");
+    const sourcePayload = format === "MP3"
+      ? await time("audioIntegrityCheck", async () => extractMpegAudioPayload(sourceBytes))
+      : null;
+    let sourceDecode: Awaited<ReturnType<typeof decodeMpegAudio>> | null = null;
+    if (sourcePayload) {
+      try {
+        sourceDecode = await time("sourceDecoding", async () => decodeMpegAudio(sourcePayload));
+      } catch {
+        return await fail("AUDIO_DECODE_FAILED", "SOURCE_DECODING", null, "INTEGRITY", "FAILED_VERIFICATION");
+      }
     }
     const sourceMetadata = extraction.metadata;
     const conflicts: AudioTagField[] = [];
+    if (sourceWave) {
+      for (const [field, infoValues] of Object.entries(sourceWave.infoValues) as Array<[AudioTagField, string[]]>) {
+        const values = [sourceWave.id3[field], ...infoValues].filter((value): value is string => !!value);
+        if (values.some((value) => !waveTagAgrees(field, value, values[0]))) {
+          if (!profile.mappings.includes(field) || !resolved.values[field]) {
+            return await fail("SOURCE_TAG_CONFLICT", "SOURCE_TAG_CHECK", field, "SPONSOR_DECISION", "MISSING_SPONSOR_DATA");
+          }
+          conflicts.push(field);
+        }
+      }
+    }
     for (const field of profile.mappings) {
       const expected = resolved.values[field];
       if (!ID3_SUPPORTED.has(field)) continue;
+      const legacyValue = sourceId3v1?.[field];
+      if (legacyValue && (!expected || !waveTagAgrees(field, legacyValue, expected))) {
+        return await fail("UNSUPPORTED_TAG_MAPPING", "SOURCE_TAG_CHECK", field, "UNSUPPORTED", "UNSUPPORTED_TAG_WRITE");
+      }
       const embedded = field === "contentRating" ? null : sourceMetadata[field];
-      const normalizedIsrcs = new Set(sourceMetadata.rawIsrcs.map(normalizeIsrcValue));
+      const representations = sourceWave
+        ? [sourceWave.id3[field], ...(sourceWave.infoValues[field] ?? [])].filter((value): value is string => !!value)
+        : [sourceId3?.[field], typeof embedded === "string" ? embedded : undefined]
+          .filter((value): value is string => !!value);
+      const isrcs = field === "isrc" ? [...sourceMetadata.rawIsrcs, ...representations] : [];
+      const normalizedIsrcs = new Set(isrcs.map(normalizeIsrcValue));
       const invalidIsrc = field === "isrc" && (
-        sourceMetadata.rawIsrcs.some((item) => normalizeIsrcValue(item) === null) ||
+        isrcs.some((item) => normalizeIsrcValue(item) === null) ||
         normalizedIsrcs.size > 1
       );
       if (field === "isrc" && (invalidIsrc ||
-        (expected && sourceMetadata.rawIsrcs.length > 0 && !sourceTagMatches(field, expected, sourceMetadata)) ||
-        (!expected && sourceMetadata.rawIsrcs.length > 0))) {
+        (expected && isrcs.some((value) => normalizeIsrcValue(value) !== normalizeIsrcValue(expected))) ||
+        (!expected && isrcs.length > 0))) {
         return await fail("CONFLICTING_ISRC", "SOURCE_TAG_CHECK", "isrc", "SPONSOR_DECISION", "FAILED");
       }
-      if (!expected && typeof embedded === "string") {
+      if (!expected && representations.length > 0) {
         return await fail("UNTRUSTED_SOURCE_TAG", "SOURCE_TAG_CHECK", field, "SPONSOR_DECISION", "MISSING_SPONSOR_DATA");
       }
-      if (expected && typeof embedded === "string" && !sourceTagMatches(field, expected, sourceMetadata)) conflicts.push(field);
+      if (expected && representations.some((value) => !waveTagAgrees(field, value, expected)) && !conflicts.includes(field)) {
+        conflicts.push(field);
+      }
     }
     const unresolvedConflicts = conflicts.filter((field) => {
       if (IDENTITY_TAGS.has(field) && field === "isrc") return true;
@@ -527,6 +578,15 @@ async function prepareUnlocked(input: PrepareAudioArtifactInput, batchCollision 
     if (unresolvedConflicts.length > 0) {
       return await fail("SOURCE_TAG_CONFLICT", "SOURCE_TAG_CHECK", unresolvedConflicts.join(","), "SPONSOR_DECISION", "MISSING_SPONSOR_DATA");
     }
+    const corrections = Object.keys(resolved.values)
+      .filter((field) => conflicts.includes(field as AudioTagField) || !(sourceMetadata[field as keyof AudioMetadata]))
+      .map((field) => ({
+        code: conflicts.includes(field as AudioTagField) ? "ACKNOWLEDGED_TAG_CORRECTED" : "MISSING_TAG_WRITTEN",
+        field,
+        rule: conflicts.includes(field as AudioTagField)
+          ? `explicit-human-acknowledgment:${input.acknowledgedSourceConflicts?.reviewerId ?? "unknown"}`
+          : `trusted-tag-source:${resolved.provenance[field as AudioTagField] ?? "approved-configuration"}`
+      }));
 
     preparationId = `PREP-${hash(Buffer.from([
       recordingId,
@@ -545,24 +605,47 @@ async function prepareUnlocked(input: PrepareAudioArtifactInput, batchCollision 
       ...manifest,
       preparationId,
       sourceSha256,
-      sourceFormat: "MP3",
+      sourceFormat: format,
       sourceFileName: extraction.fileName
     };
-    const finalPath = collisionSafeTarget(resolve(input.outputDirectory), recordingId, preparationId.slice(5));
-    const id3Tags = toId3Tags(resolved.values as Partial<Record<AudioTagField, string>>);
-    const taggedBytes = await time("tagWriting", async () => NodeID3.Promise.update(id3Tags, sourceBytes));
+    const finalPath = collisionSafeTarget(resolve(input.outputDirectory), recordingId, preparationId.slice(5), format);
+    const taggedBytes = await time("tagWriting", async () => format === "MP3"
+      ? updateId3Values(sourceBytes, resolved.values)
+      : updateWaveTags(sourceBytes, resolved.values));
     const expectedPreparedHash = hash(taggedBytes);
-    const namingInput = { fileName: extraction.fileName, format: "MP3" as const, record: input.recording };
+    const namingInput = { fileName: extraction.fileName, format, record: input.recording };
     const naming = namingProfile.check(namingInput);
     const uploadFileName = naming.suggestedName ?? (naming.ok ? extraction.fileName : null);
     if (!uploadFileName || !namingProfile.check({ ...namingInput, fileName: uploadFileName }).ok) {
       return await fail("FILENAME_POLICY_VIOLATION", "NAMING_PREFLIGHT", "uploadFileName", "SPONSOR_DECISION", "MISSING_SPONSOR_DATA");
     }
     warnings.push(...clientMetadata.warnings.map((item) => `${item.code}:${item.field}`));
+    warningIssues.push(...clientMetadata.warnings.map((item) => ({
+      ...issue(recordingId, item.code, "METADATA_RESOLUTION", item.field, "SPONSOR_DECISION", false, null, null, false),
+      message: item.message, evidenceReferences: item.evidenceReferences, recommendedAction: item.recommendedAction
+    })));
     const unsupportedOptional = unsupported.filter((field) => !profile.requiredFields.includes(field));
-    if (unsupportedOptional.length > 0) warnings.push(`OPTIONAL_TAG_UNSUPPORTED:${unsupportedOptional.join(",")}`);
+    if (unsupportedOptional.length > 0) {
+      warnings.push(`OPTIONAL_TAG_UNSUPPORTED:${unsupportedOptional.join(",")}`);
+      for (const field of unsupportedOptional) {
+        warningIssues.push({
+          ...issue(recordingId, "OPTIONAL_TAG_UNSUPPORTED", "METADATA_RESOLUTION", field, "UNSUPPORTED", false, null, null, false),
+          message: "An optional field has no supported embedded tag mapping.",
+          evidenceReferences: [`tag-profile:${profile.id}@${profile.version}`],
+          recommendedAction: "Confirm the mapping before making the field mandatory."
+        });
+      }
+    }
     if (resolved.unresolvedSponsorMappings.length > 0) {
       warnings.push(`UNRESOLVED_SPONSOR_MAPPING:${resolved.unresolvedSponsorMappings.join(",")}`);
+      for (const mapping of resolved.unresolvedSponsorMappings) {
+        warningIssues.push({
+          ...issue(recordingId, "UNRESOLVED_SPONSOR_MAPPING", "METADATA_RESOLUTION", mapping, "SPONSOR_DECISION", false, null, null, false),
+          message: "A sponsor mapping remains unconfirmed and was not invented.",
+          evidenceReferences: [`tag-profile:${profile.id}@${profile.version}`],
+          recommendedAction: "Obtain sponsor confirmation before relying on this mapping."
+        });
+      }
     }
 
     await fs.mkdir(resolve(input.outputDirectory), { recursive: true, mode: 0o700 });
@@ -579,17 +662,21 @@ async function prepareUnlocked(input: PrepareAudioArtifactInput, batchCollision 
     const existing = await validateExistingArtifact(
       finalPath,
       expectedPreparedHash,
-      sourcePayload,
+      sourceBytes,
+      format,
       input.recording,
       profile,
       input.explicitValues ?? {}
     );
     if (existing) {
+      if (!await sourceUnchanged()) {
+        return await fail("SOURCE_CHANGED_DURING_PREPARATION", "SOURCE_VALIDATION", null, "INTEGRITY", "FAILED_VERIFICATION");
+      }
       manifest = {
         ...manifest, artifactFileName: existing.artifact.fileName, artifactPath: finalPath,
-        preparedSha256: existing.artifact.sha256, preparedFormat: "MP3",
+        preparedSha256: existing.artifact.sha256, preparedFormat: format,
         tagVerificationStatus: "MATCH", audioIntegrityVerified: true, preparationStatus: "REUSED",
-        uploadFileName, corrections: [], issues: []
+        uploadFileName, corrections, issues: warningIssues
       };
       await persistManifest(input.manifestStore, manifest);
       return { ok: true, artifact: { ...existing.artifact, uploadFileName }, manifest, reused: true, warnings, timingsMs };
@@ -606,30 +693,44 @@ async function prepareUnlocked(input: PrepareAudioArtifactInput, batchCollision 
     await writeExclusive(tempPath, taggedBytes);
     const tempInfo = await fs.stat(tempPath);
     if (!tempInfo.isFile()) return await fail("TEMP_OUTPUT_INVALID", "TAG_WRITE", null, "INTEGRITY", "FAILED");
+    const tempBytes = await fs.readFile(tempPath);
+    if (hash(tempBytes) !== expectedPreparedHash) {
+      return await fail("PREPARED_ARTIFACT_UNVERIFIED", "TAG_WRITE", null, "INTEGRITY", "FAILED_VERIFICATION");
+    }
 
     const readback = await time("readBackVerification", async () => extractAudioMetadata(tempPath!));
-    if (readback.status !== "OK" || readback.metadata.format !== "MP3") {
+    if (readback.status !== "OK" || readback.metadata.format !== format) {
       return await fail("READBACK_FAILED", "TAG_VERIFICATION", null, "INTEGRITY", "FAILED_VERIFICATION", true, "independent-readback", false);
     }
-    const preparedPayload = await time("audioIntegrityCheck", async () => extractMpegAudioPayload(taggedBytes));
-    if (!sourcePayload.equals(preparedPayload)) {
-      return await fail("AUDIO_PAYLOAD_CHANGED", "AUDIO_INTEGRITY", null, "INTEGRITY", "FAILED_VERIFICATION", true, "compare-mpeg-frame-payload", false);
-    }
-    let preparedDecode: Awaited<ReturnType<typeof decodeMpegAudio>>;
-    try {
-      preparedDecode = await time("preparedDecoding", async () => decodeMpegAudio(preparedPayload));
-    } catch {
-      return await fail("PREPARED_AUDIO_DECODE_FAILED", "PREPARED_DECODING", null, "INTEGRITY", "FAILED_VERIFICATION");
-    }
-    if (sourceDecode.samplesDecoded !== preparedDecode.samplesDecoded ||
-      sourceDecode.sampleRate !== preparedDecode.sampleRate ||
-      sourceDecode.channels !== preparedDecode.channels) {
-      return await fail("AUDIO_DECODE_PROPERTIES_CHANGED", "AUDIO_INTEGRITY", null, "INTEGRITY", "FAILED_VERIFICATION", true, "compare-decoded-audio-properties", false);
+    if (format === "MP3" && sourcePayload && sourceDecode) {
+      const preparedPayload = await time("audioIntegrityCheck", async () => extractMpegAudioPayload(tempBytes));
+      if (!sourcePayload.equals(preparedPayload)) {
+        return await fail("AUDIO_PAYLOAD_CHANGED", "AUDIO_INTEGRITY", null, "INTEGRITY", "FAILED_VERIFICATION", true, "compare-mpeg-frame-payload", false);
+      }
+      let preparedDecode: Awaited<ReturnType<typeof decodeMpegAudio>>;
+      try {
+        preparedDecode = await time("preparedDecoding", async () => decodeMpegAudio(preparedPayload));
+      } catch {
+        return await fail("PREPARED_AUDIO_DECODE_FAILED", "PREPARED_DECODING", null, "INTEGRITY", "FAILED_VERIFICATION");
+      }
+      if (sourceDecode.samplesDecoded !== preparedDecode.samplesDecoded ||
+        sourceDecode.sampleRate !== preparedDecode.sampleRate ||
+        sourceDecode.channels !== preparedDecode.channels) {
+        return await fail("AUDIO_DECODE_PROPERTIES_CHANGED", "AUDIO_INTEGRITY", null, "INTEGRITY", "FAILED_VERIFICATION", true, "compare-decoded-audio-properties", false);
+      }
+    } else if (format === "WAV") {
+      if (!waveAudioUnchanged(sourceBytes, tempBytes)) {
+        return await fail("AUDIO_PAYLOAD_CHANGED", "AUDIO_INTEGRITY", null, "INTEGRITY", "FAILED_VERIFICATION", true, "compare-pcm-and-riff-chunks", false);
+      }
+      if (!await verifyWaveTags(tempBytes, resolved.values)) {
+        return await fail("WAV_TAG_READBACK_MISMATCH", "TAG_VERIFICATION", null, "INTEGRITY", "FAILED_VERIFICATION", true, "independent-id3-and-info-readback", false);
+      }
     }
     const technicalMismatch =
       Math.abs((sourceMetadata.durationSeconds ?? 0) - (readback.metadata.durationSeconds ?? 0)) > 0.02 ||
       sourceMetadata.sampleRate !== readback.metadata.sampleRate ||
-      sourceMetadata.channels !== readback.metadata.channels;
+      sourceMetadata.channels !== readback.metadata.channels ||
+      format === "WAV" && sourceMetadata.bitDepth !== readback.metadata.bitDepth;
     if (technicalMismatch) {
       return await fail("AUDIO_TECHNICAL_PROPERTIES_CHANGED", "AUDIO_INTEGRITY", null, "INTEGRITY", "FAILED_VERIFICATION", true, "compare-technical-properties", false);
     }
@@ -647,9 +748,7 @@ async function prepareUnlocked(input: PrepareAudioArtifactInput, batchCollision 
         return await fail("TAG_READBACK_MISMATCH", "TAG_VERIFICATION", field, "INTEGRITY", "FAILED_VERIFICATION", true, "independent-readback", false);
       }
     }
-    const currentInfo = await fs.lstat(sourcePath);
-    if (currentInfo.isSymbolicLink() || currentInfo.size !== before.size ||
-      currentInfo.mtimeMs !== before.mtimeMs || hash(await fs.readFile(sourcePath)) !== sourceSha256) {
+    if (!await sourceUnchanged()) {
       return await fail("SOURCE_CHANGED_DURING_PREPARATION", "SOURCE_VALIDATION", null, "INTEGRITY", "FAILED_VERIFICATION");
     }
 
@@ -666,41 +765,33 @@ async function prepareUnlocked(input: PrepareAudioArtifactInput, batchCollision 
     }
     const preparedBytes = await fs.readFile(finalPath);
     const preparedSha256 = hash(preparedBytes);
+    if (preparedSha256 !== expectedPreparedHash) {
+      await fs.unlink(finalPath);
+      newlyPublishedPath = null;
+      return await fail("PREPARED_ARTIFACT_UNVERIFIED", "PUBLISH", null, "INTEGRITY", "FAILED_VERIFICATION");
+    }
     const artifact: PreparedAudioArtifact = {
       path: finalPath,
       fileName: basename(finalPath),
-      format: "MP3",
+      format,
       size: preparedBytes.length,
       sha256: preparedSha256,
       uploadFileName,
-      metadata: readback.metadata
+      metadata: { ...readback.metadata, filePath: finalPath, fileName: basename(finalPath), extensionMatchesFormat: true }
     };
-    const corrections = Object.keys(resolved.values)
-      .filter((field) => conflicts.includes(field as AudioTagField) || !(sourceMetadata[field as keyof AudioMetadata]))
-      .map((field) => ({
-        code: conflicts.includes(field as AudioTagField) ? "ACKNOWLEDGED_TAG_CORRECTED" : "MISSING_TAG_WRITTEN",
-        field,
-        rule: conflicts.includes(field as AudioTagField)
-          ? `explicit-human-acknowledgment:${input.acknowledgedSourceConflicts?.reviewerId ?? "unknown"}`
-          : `trusted-tag-source:${resolved.provenance[field as AudioTagField] ?? "approved-configuration"}`
-      }));
     const manifestStatus: PreparationStatus = "PREPARED";
     manifest = {
       ...manifest,
       artifactPath: finalPath,
       artifactFileName: artifact.fileName,
       preparedSha256,
-      preparedFormat: "MP3",
+      preparedFormat: format,
       uploadFileName,
       tagVerificationStatus: "MATCH",
       audioIntegrityVerified: true,
       preparationStatus: manifestStatus,
       corrections,
-      issues: warnings.map((code) => ({
-        code, recordingId, stage: "METADATA_RESOLUTION", field: null,
-        category: "SPONSOR_DECISION", recoveryAttempted: false,
-        recoveryAction: null, recoverySucceeded: null, humanInterventionRequired: false
-      }))
+      issues: warningIssues
     };
     await persistManifest(input.manifestStore, manifest);
     newlyPublishedPath = null;
@@ -720,12 +811,18 @@ async function prepareUnlocked(input: PrepareAudioArtifactInput, batchCollision 
     const manifestFailure = failure instanceof Error && failure.message.startsWith("PREPARATION_MANIFEST_");
     const collision = failure instanceof Error && failure.message === "PREPARATION_MANIFEST_UPLOAD_FILENAME_COLLISION";
     const recoverable = manifestFailure || ["ENOSPC", "EACCES", "EPERM", "EIO", "EMFILE", "EBUSY"].includes(systemCode ?? "");
-    const code = collision ? "UPLOAD_FILENAME_COLLISION" : manifestFailure
+    const code = failure instanceof AudioTagFormatError ? failure.code : collision ? "UPLOAD_FILENAME_COLLISION" : manifestFailure
       ? failure instanceof Error ? failure.message : "PREPARATION_MANIFEST_STORAGE_ERROR"
       : systemCode ? `FILESYSTEM_${systemCode}` : "PREPARATION_FAILED";
-    failures.push(issue(recordingId, code, "PREPARATION", collision ? "uploadFileName" : null,
+    const preparationFailure = issue(recordingId, code, "PREPARATION",
+      failure instanceof AudioTagFormatError ? failure.field : collision ? "uploadFileName" : null,
       collision ? "SPONSOR_DECISION" : recoverable ? "RECOVERABLE" : "INTEGRITY",
-      false, null, null, collision || !recoverable));
+      false, null, null, collision || !recoverable);
+    if (failure instanceof AudioTagFormatError) {
+      preparationFailure.message = failure.message;
+      preparationFailure.recommendedAction = "Review the source format and conflicting or unsupported tag representation.";
+    }
+    failures.push(preparationFailure);
     manifest = {
       ...manifest,
       preparationStatus: "FAILED",
@@ -762,34 +859,43 @@ async function prepareAudioArtifactWithCollision(
   batchCollision: boolean
 ): Promise<AudioPreparationResult> {
   if (input.manifestStore) {
+    let workStarted = false;
     try {
       return await input.manifestStore.withLock(
         input.recording.recordingId,
-        () => prepareUnlocked(input, batchCollision)
+        () => {
+          workStarted = true;
+          return prepareUnlocked(input, batchCollision);
+        }
       );
     } catch (failure) {
       const recordingId = input.recording.recordingId;
       const createdAt = (input.now ?? (() => new Date()))().toISOString();
-      const manifest = createManifest(input, recordingId, `PREP-${hash(Buffer.from(recordingId)).slice(0, 32).toUpperCase()}`,
-        basename(input.sourceAudioPath), "RECOVERABLE_FAILURE", createdAt, {
-          issues: [{
-            code: "PREPARATION_LOCKED",
-            recordingId,
-            stage: "LOCK",
-            field: null,
-            category: "RECOVERABLE",
-            recoveryAttempted: false,
-            recoveryAction: null,
-            recoverySucceeded: null,
-            humanInterventionRequired: false
-          }]
+      const code = workStarted ? "PREPARATION_LOCK_OR_TASK_FAILED"
+        : failure instanceof ReviewStorageLockedError ? "PREPARATION_LOCKED" : "PREPARATION_LOCK_FAILED";
+      const category = workStarted ? "INTEGRITY" : "RECOVERABLE";
+      const lockIssue = issue(recordingId, code, "LOCK", null, category, false, null, null, workStarted);
+      let manifest = createManifest(input, recordingId, `PREP-${hash(Buffer.from(recordingId)).slice(0, 32).toUpperCase()}`,
+        basename(input.sourceAudioPath), workStarted ? "FAILED" : "RECOVERABLE_FAILURE", createdAt, {
+          issues: [lockIssue]
         });
+      const failures = [lockIssue];
+      if (workStarted) {
+        try {
+          await persistManifest(input.manifestStore, manifest);
+        } catch (manifestError) {
+          const manifestCode = manifestError instanceof Error && manifestError.message.startsWith("PREPARATION_MANIFEST_")
+            ? manifestError.message
+            : "PREPARATION_MANIFEST_STORAGE_ERROR";
+          failures.push(issue(recordingId, manifestCode, "MANIFEST_PERSIST", null, "INTEGRITY"));
+          manifest = { ...manifest, issues: failures.map(issueForManifest) };
+        }
+      }
       return {
         ok: false,
         recordingId,
         manifest,
-        failures: [issue(recordingId, failure instanceof Error ? "PREPARATION_LOCKED" : "PREPARATION_LOCK_FAILED",
-          "LOCK", null, "RECOVERABLE", false, null, null, false)],
+        failures,
         timingsMs: {}
       };
     }

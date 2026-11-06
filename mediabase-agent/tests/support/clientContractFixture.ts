@@ -2,6 +2,9 @@ import {
   SPONSOR_METADATA_CONTRACT,
   type ClientMetadataContract
 } from "../../src/submission/clientMetadataContract";
+import { createArtistAttributionDecision, confirmArtistAttribution } from "../../src/metadata/artistAttribution";
+import type { DemoRecording } from "../../src/metadata/recordValidation";
+import { fixture } from "./reviewFixture";
 
 /**
  * Fictional technical-test policy, not the sponsor contract. It exercises
@@ -23,3 +26,20 @@ export const TECHNICAL_TEST_CONTRACT: ClientMetadataContract = {
     contentRating: { ...SPONSOR_METADATA_CONTRACT.fields.contentRating, requirement: "OPTIONAL" }
   }
 };
+
+export function approvedAudioRecord(): DemoRecording {
+  const { record } = fixture();
+  const decision = createArtistAttributionDecision("Fictional Artist", "Fictional Artist");
+  return {
+    ...record,
+    artist: "Fictional Artist",
+    artistAttribution: confirmArtistAttribution(decision, {
+      exactArtist: "Fictional Artist",
+      primaryArtist: "Fictional Artist"
+    }),
+    officialReleaseDate: "11/15/2026",
+    albumTitle: "Fictional Album",
+    comments: "Approved fictional comment",
+    approvalStatus: "DRAFT"
+  };
+}

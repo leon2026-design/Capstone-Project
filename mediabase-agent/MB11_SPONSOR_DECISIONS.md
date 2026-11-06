@@ -50,13 +50,23 @@ Mediabase production policy.
 
 - The current strict contract blocks known publisher and clean/explicit values
   with `UNSUPPORTED_TAG_MAPPING`; neither is silently treated as embedded.
-- WAV tag writing currently fails closed; no conversion is attempted.
+- WAV preparation supports well-formed RIFF PCM/IEEE float, including supported
+  extensible variants. RF64, BW64, RIFX, compressed audio, ambiguous chunks,
+  and unsupported INFO encodings fail closed; no conversion is attempted.
+- Only supported ID3v2.3/v2.4 and representable INFO values are written.
+  Unsupported ID3 flags or conflicting preserved ID3v1 values require review.
 - Unapproved publisher aliases and additional-artist encoding are not inferred.
 
 ## Verified by automated tests
 
 - Source-preserving MP3 preparation, independent tag read-back, MPEG payload
-  comparison, and decoding are covered by synthetic tests.
+  comparison, decoding, ID3v2.4, artwork, unknown frames, and legacy ID3v1
+  conflicts are covered by synthetic tests.
+- Synthetic WAV tests cover independent ID3/INFO read-back, PCM and format
+  equality, ancillary chunks and padding, artwork/unknown-frame preservation,
+  conflicting metadata, malformed/unsupported variants, and local mock receipt
+  verification. This does not certify the unidentified Tag Editor or a
+  production destination; the README describes a compatibility procedure.
 - Missing mandatory metadata, clean/explicit ambiguity, approved publisher
   aliases, title naming, and same-ISRC conflicts are covered by synthetic tests.
 - Mock submission remains loopback-only and requires explicit final approval.

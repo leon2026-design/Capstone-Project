@@ -13,7 +13,7 @@ import {
 } from "../metadata/recordValidation";
 import { DECLARATION_FIELDS, humanOnlyGapQueue, type HumanGapReviewState } from "../workflow/humanGapReview";
 import { verifyAudioTags, type AudioTagVerification } from "./audioTagVerification";
-import { DEFAULT_MP3_TAG_PROFILE, type AudioTagProfile, type ExplicitTagValues } from "./audioTagProfile";
+import { DEFAULT_MP3_TAG_PROFILE, resolveAudioTagValues, type AudioTagProfile, type ExplicitTagValues } from "./audioTagProfile";
 import {
   clientContractDigest,
   resolveClientMetadata,
@@ -21,6 +21,7 @@ import {
   type ClientMetadataContract
 } from "./clientMetadataContract";
 import { extractMpegAudioPayload } from "./audioPreparation";
+import { verifyWaveTags, waveAudioUnchanged } from "./wavAudio";
 import type { PreparedAudioManifest } from "./audioPreparationStore";
 import { SAFE_FILENAME_PROFILE, SPONSOR_TITLE_NAMING_PROFILE, type UploadNamingProfile } from "./namingProfile";
 import { canonicalJson, sha256Hex, type AutomaticCorrection, type FinalApprovalRecord, type SubmissionException } from "./submissionLedger";
@@ -245,8 +246,15 @@ export async function assessSubmissionReadiness(input: ReadinessInput): Promise<
           try {
             const sourceBytes = await fs.readFile(sourcePath!);
             const preparedBytes = await fs.readFile(path);
-            if (!extractMpegAudioPayload(sourceBytes).equals(extractMpegAudioPayload(preparedBytes))) {
-              add(exceptions, "PREPARED_AUDIO_INTEGRITY_FAILED", "INTEGRITY", "audioFilePath", "Prepared audio frame payload differs from the selected source.");
+            const intact = metadata.format === "WAV"
+              ? waveAudioUnchanged(sourceBytes, preparedBytes)
+              : extractMpegAudioPayload(sourceBytes).equals(extractMpegAudioPayload(preparedBytes));
+            if (!intact) {
+              add(exceptions, "PREPARED_AUDIO_INTEGRITY_FAILED", "INTEGRITY", "audioFilePath", "Prepared audio payload or preserved container chunks differ from the selected source.");
+            }
+            if (metadata.format === "WAV" && activeTagProfile &&
+              !await verifyWaveTags(preparedBytes, resolveAudioTagValues(originalRecording, activeTagProfile, input.explicitTagValues).values)) {
+              add(exceptions, "WAV_TAG_READBACK_MISMATCH", "INTEGRITY", "audioFilePath", "Prepared WAV tags did not pass independent ID3 and INFO read-back.");
             }
           } catch {
             add(exceptions, "PREPARED_AUDIO_INTEGRITY_FAILED", "INTEGRITY", "audioFilePath", "Prepared audio payload could not be independently verified.");
@@ -255,6 +263,11 @@ export async function assessSubmissionReadiness(input: ReadinessInput): Promise<
         if (sourcePath && activeTagProfile) {
           const sourceExtraction = await extractAudioMetadata(sourcePath);
           if (sourceExtraction.status === "OK") {
+            if (sourceExtraction.metadata.format !== preparedManifest.sourceFormat ||
+              sourceExtraction.metadata.format !== metadata.format) {
+              add(exceptions, "PREPARED_AUDIO_INTEGRITY_FAILED", "INTEGRITY", "audioFilePath",
+                "The prepared audio format differs from the reviewed source.");
+            }
             const resolved = resolveClientMetadata(originalRecording, sourceExtraction.metadata.format, activeTagProfile, {
               contract: clientContract,
               explicitValues: input.explicitTagValues,

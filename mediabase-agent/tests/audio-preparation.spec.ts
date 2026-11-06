@@ -3,7 +3,6 @@ import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import NodeID3 = require("node-id3");
 import { createArtistAttributionDecision, confirmArtistAttribution } from "../src/metadata/artistAttribution";
-import type { DemoRecording } from "../src/metadata/recordValidation";
 import { BASIC_MP3_TAG_PROFILE, DEFAULT_MP3_TAG_PROFILE, type AudioTagProfile } from "../src/submission/audioTagProfile";
 import {
   prepareAudioArtifact as prepareWithContract,
@@ -29,7 +28,7 @@ import { chromium } from "@playwright/test";
 import { fixture } from "./support/reviewFixture";
 import { buildMp3, buildWav, writeFixture } from "./support/audioFixtures";
 import { MB10_KEY, fullReview, orchardCsv, reviewDesk, workflowOptions } from "./support/mb10Fixture";
-import { TECHNICAL_TEST_CONTRACT } from "./support/clientContractFixture";
+import { approvedAudioRecord as approvedRecord, TECHNICAL_TEST_CONTRACT } from "./support/clientContractFixture";
 
 function technicalInput(input: PrepareAudioArtifactInput): PrepareAudioArtifactInput {
   const namingProfile = input.namingProfile ?? SAFE_FILENAME_PROFILE;
@@ -46,23 +45,6 @@ const prepareAudioArtifactsBatch = (inputs: readonly PrepareAudioArtifactInput[]
 
 function digest(bytes: Buffer): string {
   return createHash("sha256").update(bytes).digest("hex");
-}
-
-function approvedRecord(): DemoRecording {
-  const { record } = fixture();
-  const decision = createArtistAttributionDecision("Fictional Artist", "Fictional Artist");
-  return {
-    ...record,
-    artist: "Fictional Artist",
-    artistAttribution: confirmArtistAttribution(decision, {
-      exactArtist: "Fictional Artist",
-      primaryArtist: "Fictional Artist"
-    }),
-    officialReleaseDate: "11/15/2026",
-    albumTitle: "Fictional Album",
-    comments: "Approved fictional comment",
-    approvalStatus: "DRAFT"
-  };
 }
 
 test("writes and independently verifies trusted MP3 tags in a separate artifact", async ({}, testInfo) => {
@@ -170,13 +152,16 @@ test("allows a human-acknowledged artist mismatch only when read-back verifies t
   }));
 });
 
-test("fails closed for WAV writing and required tag values not present in approved sources", async ({}, testInfo) => {
+test("prepares supported WAV and fails closed for required tag values not present in approved sources", async ({}, testInfo) => {
   const wavSource = writeFixture(testInfo.outputPath("source.wav"), buildWav());
   const wav = await prepareAudioArtifact({
     recording: approvedRecord(), sourceAudioPath: wavSource, outputDirectory: testInfo.outputPath("wav-out")
   });
-  expect(wav.ok).toBe(false);
-  if (!wav.ok) expect(wav.failures[0].code).toBe("UNSUPPORTED_TAG_WRITE");
+  expect(wav.ok, !wav.ok ? JSON.stringify(wav.failures) : "").toBe(true);
+  if (wav.ok) {
+    expect(wav.artifact.format).toBe("WAV");
+    expect(wav.manifest.audioIntegrityVerified).toBe(true);
+  }
 
   const source = writeFixture(testInfo.outputPath("source.mp3"), buildMp3());
   const requiringGenre: AudioTagProfile = {
