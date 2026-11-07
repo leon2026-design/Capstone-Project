@@ -51,6 +51,7 @@ function runScripts() {
   
   findProgramDirectorsWithVerification();
   cleanAndSortAllSheets();  //Remove duplicates and order each sheet alphabetically by the first column.
+  importReportContacts();  //Update contact profiles, campaign summaries and history notes.
   } finally {
     printApiInventory(); // Print the API call inventory at the end of the script run
   }
