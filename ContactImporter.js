@@ -68,7 +68,13 @@ function findContactMatch(contacts, candidate) {
     const result = contactMatchClassify(person, candidate);
 
     if (result.status === "EXACT_MATCH") {
-      exactMatches.push(person);
+      const emailMatch = result.matchingFields.includes("Email");
+      const verifiedSocial = (person.verifiedSocialProfiles || [])
+        .map(profile => profile.profileUrl).join("\n");
+      const safeSocial = contactMatchHasSharedSocial(verifiedSocial, candidate["Social Accounts"]) &&
+        !(person.Email && candidate.Email && !emailMatch);
+      if (emailMatch || safeSocial) exactMatches.push(person);
+      else possibleMatches.push(person);
     } else if (result.status === "POSSIBLE_MATCH") {
       possibleMatches.push(person);
     } else if (result.status === "NO_MATCH") {
@@ -107,6 +113,13 @@ function findContactMatch(contacts, candidate) {
 function importReportContacts(reportTabIds) {
   const lock = LockService.getScriptLock();
   lock.waitLock(10000);
+  try {
+    return importReportContactsUnlocked_(reportTabIds);
+  } finally { lock.releaseLock(); }
+}
+
+// Internal caller must hold the script lock.
+function importReportContactsUnlocked_(reportTabIds) {
   let log, runId, logReady = false, events = [];
   const stats = {read:0, created:0, matched:0, review:0, skipped:0};
   function flushLog() {
@@ -157,6 +170,7 @@ function importReportContacts(reportTabIds) {
       MASTER_CONTACT_HEADERS.forEach(h => person[h] = trimCellText(r[col[h]]));
       const id = person["Contact ID"];
       if (!id || ids.has(id)) throw Error("Missing or duplicate Contact ID at master row " + (i+2));
+      person.verifiedSocialProfiles = djSocialProfileGetVerified(db, id);
       contacts.push(person); ids.add(id);
     });
 
@@ -220,13 +234,16 @@ function importReportContacts(reportTabIds) {
         let outcome, related="", detail=observation;
         const identity = candidate["Name / DJ Alias"] || candidate.Email ||
           candidate["Social Accounts"] || candidate["Station / Venue / Organization"];
-        const match = identity ? findContactMatch(contacts,candidate) : {review:[]};
+        // A deterministic ID repairs a new-row write interrupted before its log entry.
+        const recovered = contacts.find(person => person["Contact ID"] === "CT-" + key);
+        const match = recovered ? {person: recovered} :
+          identity ? findContactMatch(contacts,candidate) : {review:[]};
         if (match.review) {
           outcome = "Review identity"; stats.review++;
           related = match.review.map(p=>p["Contact ID"]).join(", ");
         } else {
           const existing = match.person;
-          const person = existing || {sheetRow:nextRow++, "Contact ID":"CT-"+Utilities.getUuid()};
+          const person = existing || {sheetRow:nextRow++, "Contact ID":"CT-"+key};
           const patch = {}, notes = [];
           for (const [field,val] of Object.entries(candidate)) {
             if (!val) continue;
@@ -251,8 +268,14 @@ function importReportContacts(reportTabIds) {
             ensureSheetRowCapacity(master,person.sheetRow);
             master.getRange(person.sheetRow,1,1,out.length).setValues([out]);
           } else {
-            for (const h of Object.keys(patch))
-              master.getRange(person.sheetRow,col[h]+1).setValue(asLiteralCellValue(patch[h]));
+            // Write one complete row so a failed field write cannot leave a mixed profile.
+            if (Object.keys(patch).length) {
+              const range = master.getRange(person.sheetRow,1,1,grid[0].length);
+              const formulas = range.getFormulas()[0];
+              const out = range.getValues()[0].map((value, i) => formulas[i] || asLiteralCellValue(value));
+              for (const h of Object.keys(patch)) out[col[h]] = asLiteralCellValue(patch[h]);
+              range.setValues([out]);
+            }
           }
           if (existing) stats.matched++; else {stats.created++; contacts.push(person); ids.add(person["Contact ID"]);}
           related=person["Contact ID"];
@@ -278,7 +301,7 @@ function importReportContacts(reportTabIds) {
       flushLog();
     }
     throw e;
-  } finally { try { SpreadsheetApp.flush(); } finally { lock.releaseLock(); } }
+  } finally { SpreadsheetApp.flush(); }
 }
 function ensureSheetRowCapacity(sheet,rows) {
   const max = sheet.getMaxRows();
@@ -301,7 +324,13 @@ const status = get("Campaign Status", "Status");
 const rating = get("Rating");
 const favoriteTrack = get("Favorite Track", "Favourite Track", "Fave");
 const comments = get("Comments");
-if (![status, rating, favoriteTrack, comments].some(Boolean)) return null;
+const engagement = get("Downloaded", "Downloads", "Listened", "Listens");
+if (![status, rating, favoriteTrack, comments, engagement].some(Boolean)) return null;
+const reportedFields = {};
+fields.forEach((field, i) => {
+  if (field && trimCellText(row[i]) && !["reportsourceid", "reportsourceurl", "reportextractedat"].includes(field))
+    reportedFields[field] = trimCellText(row[i]);
+});
 const sourceUrl = get("Report Source URL");
 const fileId = get("Report Source ID");
 const urlId = sourceUrl.match(/\/d\/([A-Za-z0-9_-]+)/);
@@ -311,7 +340,7 @@ return {
   reportId,
   campaign: get("Campaign / Release", "Campaign Name") || tabName,
   reportGeneratedAt: get("Report Generated At"),
-  status, rating, favoriteTrack, comments,
+  status, rating, favoriteTrack, comments, reportedFields,
   activityTime: get("Activity Time") || (/^listened\b.*\bago\b/i.test(status) ? status : ""),
   sourceUrl: sourceUrl || tabUrl,
   sourceTabUrl: tabUrl,
@@ -347,7 +376,8 @@ return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value || "") &&
 
 function campaignResponseContent(entry) {
 return JSON.stringify([entry.campaign, entry.reportGeneratedAt, entry.status,
-  entry.rating, entry.favoriteTrack, entry.comments, entry.activityTime]);
+  entry.rating, entry.favoriteTrack, entry.comments, entry.activityTime,
+  entry.reportedFields ? Object.keys(entry.reportedFields).sort().map(key => [key, entry.reportedFields[key]]) : []]);
 }
 
 // One response summary per report inside each already-confirmed contact's history.
@@ -405,6 +435,10 @@ entries.forEach(entry => {
       !fields.every(field => typeof entry[field] === "string") ||
       !entry.reportId || !campaignExtractionTime(entry.firstSavedAt) || seen.has(entry.reportId))
     throw Error("Invalid or duplicate campaign history entry for " + contactId);
+  if (entry.reportedFields !== undefined &&
+      (!entry.reportedFields || typeof entry.reportedFields !== "object" || Array.isArray(entry.reportedFields) ||
+       !Object.values(entry.reportedFields).every(value => typeof value === "string")))
+    throw Error("Invalid report-specific fields for " + contactId);
   seen.add(entry.reportId);
 });
 return entries;
