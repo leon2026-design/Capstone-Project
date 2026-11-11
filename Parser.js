@@ -217,8 +217,7 @@ function geminiParsePDFUndefined(blob){
                  "Only include contact details belonging to that recipient; preserve full social URLs and their platforms. " +
                  "Use simple JSON values, not nested objects. Do not guess missing information.";
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${GEMINI_API_KEY}`;
-  
+  const url = GEMINI_URL;
   const payload = {
     contents: [{
       parts: [
