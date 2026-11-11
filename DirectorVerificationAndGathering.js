@@ -47,9 +47,7 @@ function findProgramDirectorsWithVerification() {
   }
 
   if (rowsToProcess.length === 0) return;
-
-  const url =
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+  const url = GEMINI_URL;
 
   // 2. PROMPT & GOOGLE SEARCH TOOL
   const prompt = `Research the Program Directors for these iHeartRadio stations:

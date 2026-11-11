@@ -666,6 +666,9 @@ function contactSafeMergeApplyApproved(ss, mergeId) {
 			throw new Error("Invalid merge contact IDs.");
 		}
 
+		//MA-04 history is outside the original 14-column merge/undo backup.
+		contactSafeMergeCheckCampaignHistory(ss, [primaryId, duplicateId]);
+
 		//Read the current database records.
 		const primary = contactSafeMergeReadMasterContact(
 			ss,
@@ -1005,6 +1008,9 @@ function contactSafeMergeUndo(ss, mergeId) {
 			throw new Error("Invalid contact IDs in backup.");
 		}
 
+		//Do not restore a 14-column backup over contacts with campaign history.
+		contactSafeMergeCheckCampaignHistory(ss, [primaryId, duplicateId]);
+
 		const history = contactMergeHistoryEnsureSheet(ss);
 		const historyRow = history.getRange(
 			backup.rowNumber,
@@ -1237,4 +1243,23 @@ function contactSafeMergeUndo(ss, mergeId) {
 	} finally {
 		lock.releaseLock();
 	}
+}
+
+// Temporary MA-04 compatibility guard, not a new matching or merge policy.
+// MA-05 must include campaign history and notes in merge/undo before removing it.
+function contactSafeMergeCheckCampaignHistory(ss, contactIds) {
+  const sheet = ss.getSheetByName("Master_Contacts");
+  if (!sheet || sheet.getLastRow() < 2) return;
+  const values = sheet.getDataRange().getDisplayValues();
+  const idCol = values[0].indexOf("Contact ID");
+  const historyCol = values[0].indexOf("Campaign History Data");
+  if (historyCol < 0) return;
+  if (idCol < 0) throw Error("Contact ID column missing.");
+  const targetIds = new Set(contactIds);
+  for (const row of values.slice(1)) {
+    const history = String(row[historyCol] || "").trim();
+    if (targetIds.has(String(row[idCol]).trim()) && history && history !== "[]") {
+      throw Error("MA-05 must support campaign history in merge/undo before merging or undoing this contact.");
+    }
+  }
 }
