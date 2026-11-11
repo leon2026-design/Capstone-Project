@@ -70,7 +70,15 @@ function makeSheet(initialRows) {
 		getLastRow() {
 			return rows.length;
 		},
-
+		
+		getDataRange() {
+			return sheet.getRange(
+				1,
+				1,
+				rows.length,
+				Math.max(1, ...rows.map(row => row.length))
+	);
+},
 		getMaxRows() {
 			return 100;
 		},
