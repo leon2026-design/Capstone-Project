@@ -666,8 +666,10 @@ function contactSafeMergeApplyApproved(ss, mergeId) {
 			throw new Error("Invalid merge contact IDs.");
 		}
 
-		//MA-04 history is outside the original 14-column merge/undo backup.
-		contactSafeMergeCheckCampaignHistory(ss, [primaryId, duplicateId]);
+		// Validate the full campaign backup before the original merge starts.
+		const djCampaignMerge = typeof djMergeReadyForApply === "function"
+			? djMergeReadyForApply(ss, id, primaryId, duplicateId)
+			: (contactSafeMergeCheckCampaignHistory(ss, [primaryId, duplicateId]), null);
 
 		//Read the current database records.
 		const primary = contactSafeMergeReadMasterContact(
@@ -924,6 +926,13 @@ function contactSafeMergeApplyApproved(ss, mergeId) {
 			}
 		}
 
+		// Save combined campaign history before deleting its original owner.
+		if (djCampaignMerge) {
+			djMergeWriteCampaignSnapshot(
+				ss, primary.sheetRow, djCampaignMerge.merged
+			);
+		}
+
 		//Delete the duplicate after verifying the primary.
 		master.deleteRow(duplicate.sheetRow);
 
@@ -944,6 +953,13 @@ function contactSafeMergeApplyApproved(ss, mergeId) {
 
 		if (remainingIds.includes(duplicateId)) {
 			throw new Error("Duplicate contact still exists.");
+		}
+
+		// Verify that the merged campaign history survived row deletion.
+		if (djCampaignMerge) {
+			djMergeVerifyCampaignSnapshot(
+				ss, primaryId, djCampaignMerge.merged
+			);
 		}
 
 		//Mark the merge as completed.
@@ -1008,8 +1024,10 @@ function contactSafeMergeUndo(ss, mergeId) {
 			throw new Error("Invalid contact IDs in backup.");
 		}
 
-		//Do not restore a 14-column backup over contacts with campaign history.
-		contactSafeMergeCheckCampaignHistory(ss, [primaryId, duplicateId]);
+		// Verify MA-04 data before starting the original Undo.
+		const djCampaignUndo = typeof djMergeReadyForUndo === "function"
+			? djMergeReadyForUndo(ss, id, primaryId, duplicateId)
+			: (contactSafeMergeCheckCampaignHistory(ss, [primaryId, duplicateId]), null);
 
 		const history = contactMergeHistoryEnsureSheet(ss);
 		const historyRow = history.getRange(
@@ -1226,6 +1244,22 @@ function contactSafeMergeUndo(ss, mergeId) {
 					"Primary restore verification failed: " + headers[index]
 				);
 			}
+		}
+
+		// Restore and verify both original histories before completing Undo.
+		if (djCampaignUndo) {
+			djMergeWriteCampaignSnapshot(
+				ss, restoredDuplicate.sheetRow, djCampaignUndo.duplicateRestore
+			);
+			djMergeWriteCampaignSnapshot(
+				ss, restoredPrimary.sheetRow, djCampaignUndo.primaryRestore
+			);
+			djMergeVerifyCampaignSnapshot(
+				ss, duplicateId, djCampaignUndo.duplicateRestore
+			);
+			djMergeVerifyCampaignSnapshot(
+				ss, primaryId, djCampaignUndo.primaryRestore
+			);
 		}
 
 		//Finish the audit trail only after both records are verified.
