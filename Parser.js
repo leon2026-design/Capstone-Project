@@ -135,13 +135,34 @@ function parseUndefinedFile(file, blob, targetFolder) {
     });
   });
 
-  const ss = SpreadsheetApp.openById(SPREADSHEET_DATA_EXTRACTION);
+  const ss = SpreadsheetApp.openById(
+    SPREADSHEET_DATA_EXTRACTION
+  );
+
   const name = file.getName().replace(/\.pdf$/i, "");
-  const sheet = ss.getSheetByName(name) || ss.insertSheet(name);
+
+  const sheet =
+    ss.getSheetByName(name) ||
+    ss.insertSheet(name);
+
+  // Write the extracted records using the existing header mapping.
   appendCampaignReportRows(sheet, records);
-  sheet.getDataRange().setWrapStrategy(SpreadsheetApp.WrapStrategy.WRAP);
+
+  // Arrange and format this specific report.
+  formatCampaignReportSheet(sheet);
+
   SpreadsheetApp.flush();
+
+  // Import this exact tab automatically.
+  importReportContacts([sheet.getSheetId()]);
+
+  SpreadsheetApp.flush();
+
+  // Move the PDF only after contact importing completes.
+  // If importing throws an error, the PDF stays in the input folder.
   file.moveTo(targetFolder);
+
+  return sheet.getSheetId();
 }
 
 // Preserve the existing dynamic extraction; normalize only known header labels.
@@ -198,45 +219,81 @@ function appendCampaignReportRows(sheet, records) {
 
 function geminiParsePDFUndefined(blob){
   // Keep the original extraction approach and add campaign history fields.
-  const prompt = "Extract all feedback data from this PDF into a JSON array. " +
-                 "Headers should be defined as needed for the data from the PDF first." +
-                 " Return ONLY the raw JSON array." + 
-                 "Additionally, for names, make the first and last name separate as well as " +
-                 "include the email, phone number, country, city, state/Region, and Music genre " +
-                  "as columns as well if mentioned in the document. If some header has no data in the document, just leave it out. " +
-                 "Use the exact keys Rating, Favorite Track and Comments for feedback. " +
-                 "Preserve the full displayed recipient name in Name / DJ Alias as well. " +
-                 "Include recipients in Not For Me, Downloaded No Feedback and Checked No Feedback sections. " +
-                 "Copy each explicit status verbatim into Campaign Status. Use Not For Me for that section. " +
-                 "If no explicit status is present, omit Campaign Status; do not infer listening or downloads from ratings, favorite tracks or comments. " +
-                 "Use Campaign / Release for the campaign artist and release title on each recipient row. " +
-                 "Copy the report generation date/time as printed into Report Generated At. " +
-                 "Use Activity Time only for a reported recipient activity time; preserve relative wording exactly. " +
-                 "Never use the report date or release date as an activity time. " +
-                 "Do not create recipient rows from charts, publicity text or support summaries. " +
-                 "Only include contact details belonging to that recipient. " +
-                 "Look for social media URLs or handles anywhere in the recipient's entry, including their comments. " +
-                 "Put these in a column named Social Media Account, preserving platform names and the exact account text. " +
-                 "Keep the original comments unchanged. Do not guess accounts or complete truncated links. " +
-                 "If no social account is provided for a recipient, leave it blank. " +
-                 "Use simple JSON values, not nested objects. Do not guess missing information.";
+  const prompt =
+  "Extract one record per recipient from all individual feedback, " +
+  "Not For Me, Downloaded No Feedback, and Checked No Feedback sections. " +
+
+  "Return only a compact JSON array of flat objects, without Markdown. " +
+  "Use these exact keys when information is present: " +
+  "Name / DJ Alias, First Name, Last Name, Additional Info / Stations, " +
+  "Radio Station, Reach, Rating, Favorite Track, Comments, " +
+  "Email Address, Phone Number, Social Media Account, " +
+  "City, State/Region, Country, Music Genre, " +
+  "Campaign / Release, Report Generated At, Campaign Status, Activity Time. " +
+  "Retain other recipient-specific fields if needed. " +
+
+  "Preserve the full displayed name in Name / DJ Alias. " +
+  "Separate First Name and Last Name only when clear; preserve DJ aliases. " +
+
+  "Copy feedback and comments verbatim. " +
+  "Extract recipient social URLs or handles from their entry, including comments, " +
+  "into Social Media Account. Preserve platform names and exact account text " +
+  "without changing the original Comments. " +
+
+  "Copy explicit platform status verbatim into Campaign Status. " +
+  "Use Not For Me for recipients in that section. " +
+  "Do not infer listening or downloads from ratings, favorite tracks, or comments. " +
+
+  "Include the campaign artist/release in Campaign / Release and the printed " +
+  "report generation date/time in Report Generated At on each recipient record. " +
+  "Activity Time must contain only explicitly reported recipient activity timing; " +
+  "preserve relative wording and never substitute report or release dates. " +
+
+  "Exclude aggregate statistics, charts, publicity, and support summaries. " +
+  "Include only contact details belonging to the recipient. " +
+  "Omit unavailable fields. Never guess missing information or complete truncated links.";
 
   const url = GEMINI_URL;
   const payload = {
     contents: [{
       parts: [
         { text: prompt },
-        { inline_data: { mime_type: "application/pdf", data: Utilities.base64Encode(blob.getBytes()) }}
+        {
+          inline_data: {
+            mime_type: "application/pdf",
+            data: Utilities.base64Encode(blob.getBytes())
+          }
+        }
       ]
-    }]
+    }],
+    generationConfig: {
+      responseMimeType: "application/json",
+      thinkingConfig: {
+        thinkingLevel: "low"
+      }
+    }
   };
 
-  return trackedFetch("Gemini", url, {
+  const startedAt = Date.now();
+  console.log("Sending PDF to Gemini.");
+
+  const response = trackedFetch("Gemini", url, {
     method: "post",
     contentType: "application/json",
+    headers: {
+      "x-goog-api-key": GEMINI_API_KEY
+    },
     payload: JSON.stringify(payload),
     muteHttpExceptions: true
   });
+
+  console.log(
+    "Gemini returned HTTP " + response.getResponseCode() +
+    " after " + Math.round((Date.now() - startedAt) / 1000) +
+    " seconds."
+  );
+
+  return response;
 }
 
 /**
@@ -322,3 +379,171 @@ function convertDocxToPdf(fileId, docName, targetFolder) {
 
   return pdfFile.getId();
 }
+
+  // Preferred order for fields present in a processed campaign report.
+  const CAMPAIGN_REPORT_COLUMN_ORDER = [
+    "Name / DJ Alias",
+    "First Name",
+    "Last Name",
+    "Role",
+    "Radio Station",
+    "Additional Info / Stations",
+    "City",
+    "State/Region",
+    "State",
+    "Region",
+    "Country",
+    "Email Address",
+    "Phone Number",
+    "Social Media Account",
+    "Reach",
+    "Rating",
+    "Favorite Track",
+    "Comments",
+    "Music Genre",
+    "Campaign / Release",
+    "Campaign Status",
+    "Activity Time",
+    "Report Generated At"
+  ];
+
+  const CAMPAIGN_REPORT_SOURCE_COLUMNS = [
+    "Report Source ID",
+    "Report Source URL",
+    "Report Extracted At"
+  ];
+
+  /**
+   * Normalize header labels and reorder complete columns.
+   * Preserve unfamiliar fields and existing data.
+   */
+  function formatCampaignReportSheet(sheet) {
+    const width = sheet.getLastColumn();
+    if (!width) return;
+
+    const headers = sheet
+      .getRange(1, 1, 1, width)
+      .getDisplayValues()[0]
+      .map(canonicalCampaignReportHeader);
+
+    // Stop before changing anything if headers are ambiguous.
+    const keys = headers.map(normalizeKey);
+
+    if (
+      keys.some(key => !key) ||
+      new Set(keys).size !== keys.length
+    ) {
+      throw new Error(
+        "Blank or duplicate report headers in " + sheet.getName()
+      );
+    }
+
+    // Locate the actual header matching each preferred label.
+    const findHeader = label =>
+      headers.find(
+        header => normalizeKey(header) === normalizeKey(label)
+      );
+
+    const front = CAMPAIGN_REPORT_COLUMN_ORDER
+      .map(findHeader)
+      .filter(Boolean);
+
+    const source = CAMPAIGN_REPORT_SOURCE_COLUMNS
+      .map(findHeader)
+      .filter(Boolean);
+
+    // Keep additional fields between the main fields and source fields.
+    const known = new Set([...front, ...source]);
+
+    const extra = headers.filter(header => !known.has(header));
+
+    const ordered = [...front, ...extra, ...source];
+
+    // Rename headers only. Do not rewrite existing data rows.
+    sheet
+      .getRange(1, 1, 1, width)
+      .setValues([headers.map(asLiteralCellValue)]);
+
+    // Move complete columns, keeping their contents together.
+    ordered.forEach((header, destination) => {
+      const current = headers.indexOf(header);
+
+      if (current === destination) return;
+
+      sheet.moveColumns(
+        sheet.getRange(1, current + 1, 1, 1),
+        destination + 1
+      );
+
+      // Track the updated positions after each move.
+      headers.splice(
+        destination,
+        0,
+        headers.splice(current, 1)[0]
+      );
+    });
+
+    sheet
+      .getRange(1, 1, 1, width)
+      .setFontWeight("bold");
+
+    sheet.setFrozenRows(1);
+
+    sheet
+      .getDataRange()
+      .setWrapStrategy(SpreadsheetApp.WrapStrategy.WRAP);
+
+    // Keep the source URL visible, but hide technical fields.
+    ["Report Source ID", "Report Extracted At"].forEach(header => {
+      const index = headers.indexOf(header);
+
+      if (index !== -1) {
+        sheet.hideColumns(index + 1);
+      }
+    });
+  }
+
+  /**
+   * Format and import reports that have already been parsed.
+   * Does not call Gemini or require manually entered tab IDs.
+   */
+  function importProcessedReportContacts() {
+    const spreadsheet = SpreadsheetApp.openById(
+      SPREADSHEET_DATA_EXTRACTION
+    );
+
+    // Select only nonempty tabs carrying our PDF source fields.
+    const reports = spreadsheet.getSheets().filter(sheet => {
+      if (
+        sheet.getLastRow() < 2 ||
+        !sheet.getLastColumn()
+      ) {
+        return false;
+      }
+
+      const headers = sheet
+        .getRange(1, 1, 1, sheet.getLastColumn())
+        .getDisplayValues()[0]
+        .map(header =>
+          normalizeKey(canonicalCampaignReportHeader(header))
+        );
+
+      return CAMPAIGN_REPORT_SOURCE_COLUMNS.every(header =>
+        headers.includes(normalizeKey(header))
+      );
+    });
+
+    if (!reports.length) {
+      throw new Error(
+        "No processed PDF report tabs with source information were found."
+      );
+    }
+
+    reports.forEach(formatCampaignReportSheet);
+
+    SpreadsheetApp.flush();
+
+    return importReportContacts(
+      reports.map(sheet => sheet.getSheetId())
+    );
+  }

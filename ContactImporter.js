@@ -104,7 +104,7 @@ function findContactMatch(contacts, candidate) {
 }
 
 // Run this from Apps Script to import the configured campaign report tabs.
-function importReportContacts() {
+function importReportContacts(reportTabIds) {
   const lock = LockService.getScriptLock();
   lock.waitLock(10000);
   let log, runId, logReady = false, events = [];
@@ -122,7 +122,23 @@ function importReportContacts() {
     runId = Utilities.getUuid();
     const props = PropertiesService.getScriptProperties();
     const dbId = trimCellText(props.getProperty("CONTACT_DATABASE_SPREADSHEET_ID"));
-    const raw = trimCellText(props.getProperty("CONTACT_REPORT_TAB_IDS"));
+    // Automatically supplied IDs take priority over manual configuration.
+    if (
+      reportTabIds !== undefined &&
+      (
+        !Array.isArray(reportTabIds) ||
+        !reportTabIds.length ||
+        reportTabIds.some(id => !/^\d+$/.test(String(id)))
+      )
+    ) {
+      throw new Error(
+        "Pass a nonempty array of report tab IDs, " +
+        "or run without arguments for manual selection."
+      );
+    }
+    const raw = reportTabIds === undefined
+      ? trimCellText(props.getProperty("CONTACT_REPORT_TAB_IDS"))
+      : reportTabIds.map(String).join(",");
     if (!dbId || !SPREADSHEET_DATA_EXTRACTION || dbId === SPREADSHEET_DATA_EXTRACTION)
       throw Error("Set distinct extraction and contact spreadsheet IDs.");
     if (!/^\d+(\s*,\s*\d+)*$/.test(raw))
