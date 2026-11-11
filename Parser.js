@@ -214,7 +214,11 @@ function geminiParsePDFUndefined(blob){
                  "Use Activity Time only for a reported recipient activity time; preserve relative wording exactly. " +
                  "Never use the report date or release date as an activity time. " +
                  "Do not create recipient rows from charts, publicity text or support summaries. " +
-                 "Only include contact details belonging to that recipient; preserve full social URLs and their platforms. " +
+                 "Only include contact details belonging to that recipient. " +
+                 "Look for social media URLs or handles anywhere in the recipient's entry, including their comments. " +
+                 "Put these in a column named Social Media Account, preserving platform names and the exact account text. " +
+                 "Keep the original comments unchanged. Do not guess accounts or complete truncated links. " +
+                 "If no social account is provided for a recipient, leave it blank. " +
                  "Use simple JSON values, not nested objects. Do not guess missing information.";
 
   const url = GEMINI_URL;
