@@ -170,28 +170,13 @@ function installMarketingAgentTrigger() {
 
 function marketingSyncIdentityReviews_(db, source) {
   const stats = {queued: 0, linked: 0, failed: 0};
-  const contacts = djEngagementReadSheet(db.getSheetByName("Master_Contacts"), MASTER_CONTACT_HEADERS, "Master_Contacts");
-  const people = contacts.rows.filter(row => row.some(trimCellText)).map(row =>
-    Object.fromEntries(MASTER_CONTACT_HEADERS.map(header => [header, row[contacts.columns[header]]])));
+  const people = importIntegrationContacts(db);
   for (const pending of djEngagementPendingReviews(db)) {
     try {
       let reviewSheet = db.getSheetByName(DJ_IDENTITY_REVIEW_SHEET);
       let review = reviewSheet ? djIdentityFindReviewRow(reviewSheet, pending.observationId) : null;
       if (!review) {
-        const observation = {...pending, sourceReportId: pending.sourceReportId || pending.sourceTab,
-          sourceUrl: pending.sourceReportUrl || pending.sourceUrl};
-        const result = djResolveIdentity(observation, people);
-        for (const id of pending.candidateContactIds.split(",").map(trimCellText).filter(Boolean)) {
-          if (result.candidates.some(candidate => candidate.contactId === id)) continue;
-          const person = people.find(candidate => candidate["Contact ID"] === id);
-          const evidence = person ? contactMatchClassify(person, djIdentityBuildCandidate(observation).candidate) :
-            {status: "CONTACT_NOT_FOUND", matchScore: 0, matchingFields: [], conflictingFields: []};
-          result.candidates.push({...evidence, contactId: id, safeToAutoLink: false,
-            reason: "IMPORT_LOG_IDENTITY_REVIEW"});
-        }
-        // Import_Log remains authoritative until the existing review/link operation completes.
-        result.decision = "REVIEW";
-        result.status = "REVIEW_REQUIRED";
+        const {observation, result} = importIntegrationReviewResult(pending, people);
         djIdentitySaveReview(db, observation, result);
         reviewSheet = db.getSheetByName(DJ_IDENTITY_REVIEW_SHEET);
         review = djIdentityFindReviewRow(reviewSheet, pending.observationId);

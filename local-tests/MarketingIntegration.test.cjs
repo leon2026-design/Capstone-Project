@@ -4,7 +4,8 @@ const {BASE_HEADERS, setup, sourceRecord} = require('./support/marketingFixture.
 
 function integration() {
   const t = setup(['DJIdentityResolver.js', 'DJIdentityReview.js', 'DJSocialProfileStore.js',
-    'DJEngagementLinker.js', 'DJFollowUpQueue.js', 'apiInventory.js', 'MarketingAgent.js', 'Main.js']);
+    'DJEngagementLinker.js', 'DJFollowUpQueue.js', 'apiInventory.js', 'ImportIntegration.js',
+    'MarketingAgent.js', 'Main.js']);
   const files = [], conversions = [], trashed = [], calls = [];
   const iterator = values => {
     let index = 0;

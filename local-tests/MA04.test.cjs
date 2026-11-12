@@ -161,9 +161,16 @@ test('parser aligns append columns with the existing header order', () => {
   const t = setup(); const sheet = new Sheet('campaign_report_pdf', 115, [['Comments', 'Name'], ['old', 'Old DJ']]);
   t.books.SOURCE.sheets.push(sheet);
   const pdf = mockPdf(t, [{ Name: 'New DJ', Rating: 3, Comments: 'new' }]); t.context.parseUndefinedFile(pdf.file, {}, {});
-  assert.equal(sheet.rows[1][sheet.rows[0].indexOf('Comments')], 'old');
-  assert.equal(sheet.rows[2][sheet.rows[0].indexOf('Comments')], 'new');
-  assert.equal(sheet.rows[2][sheet.rows[0].indexOf('Name / DJ Alias')], 'New DJ');
+  const headers = sheet.rows[0];
+  const nameColumn = headers.indexOf('Name / DJ Alias');
+  const commentsColumn = headers.indexOf('Comments');
+  assert.ok(nameColumn >= 0);
+  assert.ok(commentsColumn >= 0);
+  assert.ok(nameColumn < commentsColumn);
+  assert.equal(sheet.rows[1][nameColumn], 'Old DJ');
+  assert.equal(sheet.rows[1][commentsColumn], 'old');
+  assert.equal(sheet.rows[2][nameColumn], 'New DJ');
+  assert.equal(sheet.rows[2][commentsColumn], 'new');
 });
 test('empty/truncated/malformed Gemini results do not move the input PDF', () => {
   for (const [records, finish] of [[[], 'STOP'], [[{ Name: 'DJ' }], 'MAX_TOKENS'], [[{ Name: { nested: true } }], 'STOP']]) {

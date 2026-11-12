@@ -14,6 +14,25 @@ function joinUniqueLines(values) {
   return [...new Set(values.flatMap(v => trimCellText(v).split(/\r?\n/))
     .map(trimCellText).filter(Boolean))].join("\n");
 }
+function contactImportValueAlreadyKnown(field, existing, incoming) {
+  const normalize = field === "Phone"
+    ? contactMatchNormalizePhone
+    : field === "Social Accounts"
+      ? contactMatchNormalizeSocial
+      : contactMatchNormalizeText;
+
+  const known = new Set(
+    contactMatchSplitValues(existing)
+      .map(normalize)
+      .filter(Boolean)
+  );
+
+  return contactMatchSplitValues(incoming)
+    .map(normalize)
+    .filter(Boolean)
+    .every(value => known.has(value));
+}
+
 // Write report text literally even if it starts with an equals sign.
 function asLiteralCellValue(v) { return typeof v === "string" && v.startsWith("=") ? "'" + v : v; }
 
@@ -69,11 +88,13 @@ function findContactMatch(contacts, candidate) {
 
     if (result.status === "EXACT_MATCH") {
       const emailMatch = result.matchingFields.includes("Email");
+      const sharedOfficeEmail = emailMatch &&
+        contactMatchHasSharedOfficeEmail(person.Email, candidate.Email);
       const verifiedSocial = (person.verifiedSocialProfiles || [])
         .map(profile => profile.profileUrl).join("\n");
       const safeSocial = contactMatchHasSharedSocial(verifiedSocial, candidate["Social Accounts"]) &&
         !(person.Email && candidate.Email && !emailMatch);
-      if (emailMatch || safeSocial) exactMatches.push(person);
+      if ((emailMatch && !sharedOfficeEmail) || safeSocial) exactMatches.push(person);
       else possibleMatches.push(person);
     } else if (result.status === "POSSIBLE_MATCH") {
       possibleMatches.push(person);
@@ -245,8 +266,23 @@ function importReportContactsUnlocked_(reportTabIds) {
           const existing = match.person;
           const person = existing || {sheetRow:nextRow++, "Contact ID":"CT-"+key};
           const patch = {}, notes = [];
+          const protectedFields = new Set([
+            "Email",
+            "Phone",
+            "Station / Venue / Organization",
+            "Social Accounts"
+          ]);
+
           for (const [field,val] of Object.entries(candidate)) {
             if (!val) continue;
+
+            //Existing contact details require manual review before updating.
+            if (existing && protectedFields.has(field)) {
+              if (!contactImportValueAlreadyKnown(field, person[field], val))
+                notes.push(field + ": report says " + val + " (manual review required)");
+              continue;
+            }
+
             if (!person[field]) patch[field]=val;
             else if (normalizeContactText(person[field])!==normalizeContactText(val))
               notes.push(field + ": report says " + val);
@@ -530,7 +566,3 @@ return {
   }
 };
 }
-
-  
-  
-  
