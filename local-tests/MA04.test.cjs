@@ -32,12 +32,62 @@ class Sheet {
   insertColumnsAfter(_, count) { this.maxCols += count; }
   setFrozenRows() {}
   hideColumns(column) { this.hidden.add(column); }
+
+  //Simulate Google Sheets moving entire columns.
+  moveColumns(columnSpec, destinationIndex) {
+    const sourceColumn = columnSpec.getColumn();
+    const count = columnSpec.getNumColumns();
+    const width = this.maxCols;
+
+    assert.ok(sourceColumn >= 1);
+    assert.ok(count >= 1);
+    assert.ok(sourceColumn + count - 1 <= width);
+    assert.ok(destinationIndex >= 1 && destinationIndex <= width + 1);
+
+    if (destinationIndex >= sourceColumn &&
+        destinationIndex <= sourceColumn + count) return;
+
+    //Destination coordinates refer to the original grid.
+    const order = Array.from({ length: width }, (_, i) => i + 1);
+    const moved = order.splice(sourceColumn - 1, count);
+    const insertAt = destinationIndex - 1 -
+      (sourceColumn < destinationIndex ? count : 0);
+
+    order.splice(insertAt, 0, ...moved);
+
+    //Move data in every row, not just header labels.
+    this.rows = this.rows.map(row => {
+      const original = Array.from(
+        { length: width },
+        (_, i) => row[i] ?? ''
+      );
+      return order.map(column => original[column - 1]);
+    });
+
+    const newPosition = new Map(
+      order.map((oldColumn, i) => [oldColumn, i + 1])
+    );
+
+    //Preserve notes and hidden-column positions.
+    this.notes = new Map([...this.notes].map(([cell, note]) => {
+      const [row, column] = cell.split(',').map(Number);
+      return [`${row},${newPosition.get(column)}`, note];
+    }));
+
+    this.hidden = new Set(
+      [...this.hidden].map(column => newPosition.get(column))
+    );
+
+    this.writes++;
+  }
   getDataRange() { return this.getRange(1, 1, Math.max(1, this.getLastRow()), Math.max(1, this.getLastColumn())); }
   getRange(r, c, nr = 1, nc = 1) {
     assert.ok(r > 0 && c > 0 && nr > 0 && nc > 0, 'valid range');
     assert.ok(r + nr - 1 <= this.maxRows && c + nc - 1 <= this.maxCols, 'range within allocated grid');
     const s = this;
     return {
+      getColumn() { return c; },
+      getNumColumns() { return nc; },
       getValues() { return Array.from({ length: nr }, (_, i) => Array.from({ length: nc }, (_, j) => s.rows[r + i - 1]?.[c + j - 1] ?? '')); },
       getDisplayValues() { return this.getValues().map(row => row.map(v =>
         Object.prototype.toString.call(v) === '[object Date]' ? v.toISOString() : String(v).replace(/^'(?==)/, ''))); },
@@ -277,7 +327,18 @@ test('parser aligns append columns with the existing header order', () => {
   const t = setup(); const sheet = new Sheet('campaign_report_pdf', 115, [['Comments', 'Name'], ['old', 'Old DJ']]);
   t.books.SOURCE.sheets.push(sheet);
   const pdf = mockPdf(t, [{ Name: 'New DJ', Rating: 3, Comments: 'new' }]); t.context.parseUndefinedFile(pdf.file, {}, {});
-  assert.equal(sheet.rows[1][0], 'old'); assert.equal(sheet.rows[2][0], 'new'); assert.equal(sheet.rows[2][1], 'New DJ');
+  const headers = sheet.rows[0];
+  const nameColumn = headers.indexOf('Name / DJ Alias');
+  const commentsColumn = headers.indexOf('Comments');
+
+  assert.ok(nameColumn >= 0);
+  assert.ok(commentsColumn >= 0);
+  assert.ok(nameColumn < commentsColumn);
+
+  assert.equal(sheet.rows[1][nameColumn], 'Old DJ');
+  assert.equal(sheet.rows[1][commentsColumn], 'old');
+  assert.equal(sheet.rows[2][nameColumn], 'New DJ');
+  assert.equal(sheet.rows[2][commentsColumn], 'new');
 });
 test('empty/truncated/malformed Gemini results do not move the input PDF', () => {
   for (const [records, finish] of [[[], 'STOP'], [[{ Name: 'DJ' }], 'MAX_TOKENS'], [[{ Name: { nested: true } }], 'STOP']]) {
