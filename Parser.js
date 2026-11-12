@@ -158,9 +158,17 @@ function parseUndefinedFile(file, blob, targetFolder) {
 
   SpreadsheetApp.flush();
 
-  // Move the PDF only after contact importing completes.
-  // If importing throws an error, the PDF stays in the input folder.
+  //Move the PDF only after MA-04 import succeeds.
   file.moveTo(targetFolder);
+
+  //Sync MA-05 after ContactImporter releases its Script Lock.
+  try {
+    const reviewStats = importIntegrationSync();
+    console.log("MA-05 review sync: " + JSON.stringify(reviewStats));
+  } catch (error) {
+    //Keep the imported PDF and allow a separate review sync retry.
+    console.error("MA-05 review sync failed: " + String(error));
+  }
 
   return sheet.getSheetId();
 }
@@ -542,8 +550,20 @@ function convertDocxToPdf(fileId, docName, targetFolder) {
     reports.forEach(formatCampaignReportSheet);
 
     SpreadsheetApp.flush();
-
-    return importReportContacts(
+    const importStats = importReportContacts(
       reports.map(sheet => sheet.getSheetId())
     );
+
+    SpreadsheetApp.flush();
+
+    //Sync MA-05 after the MA-04 import finishes.
+    try {
+      const reviewStats = importIntegrationSync();
+      console.log("MA-05 review sync: " + JSON.stringify(reviewStats));
+    } catch (error) {
+      //Keep the MA-04 import and allow a separate MA-05 sync retry.
+      console.error("MA-05 review sync failed: " + String(error));
+    }
+
+    return importStats;
   }
