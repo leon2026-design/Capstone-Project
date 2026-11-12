@@ -89,19 +89,37 @@ from PDF/Word contact importing.
 - Do not edit imported extraction tabs or overwrite source files in place.
   Upload a corrected report as a new Drive file so both reports retain provenance.
   Missing/corrupt checkpoints fail explicitly rather than guessing at identity.
-- Each report is locked through extraction/import/archive. No destructive merge
-  is automatic. A failed existing-contact update writes a complete row, while
+- Runs never overlap. A run owns the `MA_RUN_LEASE` Script Property (owner id plus
+  a seven-minute expiry, renewed at each save). A timer that fires while another run
+  holds a live lease logs a skip and exits. A lease left by a killed execution
+  expires and is reclaimed by a later timer. A run that lost its lease cannot save
+  results. The script lock is held only for short checkpoint/sheet writes, never
+  during a Gemini request. No destructive merge is automatic. A failed existing-contact update writes a complete row, while
   history is saved before its disposable summary. Retries repair incomplete
   history/summary writes from preserved report rows.
 - The current MA-04 store retains its 40,000-character history-cell safety limit
   and one response per contact/report. Conflicting responses within one report
   fail visibly and retain the source for investigation rather than overwriting
   an existing history.
-- Processing stops starting new files after four minutes to reserve Apps Script
-  runtime for output. One very large extraction can still exceed Google's hard
-  execution limit; inspect Executions and retry. Provider, Drive, Sheets, and
-  Script Property storage quotas still apply. No new queue/enrichment subsystem
-  is introduced.
+- Gemini extraction is resumable per section. A report is split into sections of
+  about four pages (at most eight, the last one open-ended), requested one at a
+  time with `UrlFetchApp` `timeoutSeconds: 90`. Each validated section is saved
+  immediately to the `MA_Section_Staging` tab of the extraction spreadsheet, and
+  its state is kept in the `MA_JOB_<Drive ID>` Script Property, keyed to a digest
+  of the original file. A later run requests only unfinished sections. A changed
+  file restarts its job. The importer never reads the staging tab.
+- A timeout, network error, malformed response, HTTP 429, or HTTP 5xx is retryable:
+  that section waits about 4, 9, 19, 39, then 59 minutes, while other sections and
+  reports continue. Other HTTP errors, or six failed attempts, mark the section
+  failed and block only its report. After fixing the cause, run
+  `marketingRetryFailedReports()` (it refuses while a run is active).
+- A new Gemini request starts only if it can finish within four minutes of run
+  start, which reserves time for import and output within Google's six-minute
+  limit. The report is imported only after every section is saved and its staged
+  rows re-validate. Missing or damaged staged sections are requested again rather
+  than importing a partial report. Each section attempt costs one Gemini request.
+  Provider, Drive, Sheets, and Script Property quotas still apply. No new
+  queue/enrichment subsystem is introduced.
 
 ## Validation
 
@@ -117,7 +135,10 @@ writer with mocked Google/Gemini boundaries and fictional recipients. It covers
 new/known/ambiguous identities, low-rating downloaders, independent written
 support, repeats, extraction/archive/contact/history failures and retries,
 Word conversion/provenance, duplicate observations, safe social rules, trigger
-installation, and completed output. These tests are **not a live demonstration**.
+installation, and completed output. Simulated Gemini cases cover slow and timed-out
+sections, HTTP 503 backoff, permanent errors, overlapping timers, killed executions
+with stale leases, late results from a lost lease, corrupted staging, and resuming
+a partially completed report. These tests are **not a live demonstration**.
 
 For actual acceptance, use private copies of Brad's Inflyte PDF and Word report:
 install the timer, upload, wait for an actual scheduled execution, compare every

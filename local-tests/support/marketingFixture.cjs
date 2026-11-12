@@ -1,4 +1,4 @@
-const assert = require('node:assert/strict');
+﻿const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
@@ -95,7 +95,9 @@ function setup(extraFiles = []) {
     console: { log() {}, warn() {}, error() {} }, Date: ClockDate,
     PropertiesService: { getScriptProperties: () => ({
       getProperty: key => properties[key] ?? null,
-      setProperty: (key, value) => { properties[key] = value; }
+      setProperty: (key, value) => { properties[key] = value; },
+      deleteProperty: key => { delete properties[key]; },
+      getKeys: () => Object.keys(properties)
     }) },
     SpreadsheetApp: {
       openById: id => { assert.ok(books[id], 'known spreadsheet ID'); return books[id]; },
@@ -109,7 +111,9 @@ function setup(extraFiles = []) {
     }) },
     Utilities: { DigestAlgorithm: { SHA_256: 'sha256' }, Charset: { UTF_8: 'utf8' }, getUuid: () => crypto.randomUUID(),
       computeDigest: (alg, text, enc) => crypto.createHash(alg).update(text, enc).digest(),
-      base64EncodeWebSafe: value => Buffer.from(value).toString('base64url'), base64Encode: value => Buffer.from(value).toString('base64') },
+      base64EncodeWebSafe: value => Buffer.from(value).toString('base64url'), base64Encode: value => Buffer.from(value).toString('base64'),
+      base64Decode: value => [...Buffer.from(value, 'base64')],
+      newBlob: bytes => ({ getDataAsString: () => Buffer.from(bytes).toString('utf8') }), sleep() {} },
     trackedFetch() { throw Error('Unexpected external API call in local test'); }
   };
   vm.createContext(context);

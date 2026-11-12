@@ -1,4 +1,4 @@
-const test = require('node:test');
+﻿const test = require('node:test');
 const assert = require('node:assert/strict');
 const {BASE_HEADERS, setup, sourceRecord} = require('./support/marketingFixture.cjs');
 
@@ -21,7 +21,10 @@ function integration() {
       return id === 'INPUT' ? input : output;
     },
     getFileById: id => ({
-      getAs: type => { assert.equal(type, 'application/pdf'); return {id: id.replace('TEMP_', '')}; },
+      getAs: type => {
+        assert.equal(type, 'application/pdf');
+        return files.find(file => file.getId() === id.replace('TEMP_', '')).getBlob();
+      },
       setTrashed: value => { assert.equal(value, true); trashed.push(id); }
     })
   };
@@ -31,20 +34,30 @@ function integration() {
     conversions.push(id);
     return {id: 'TEMP_' + id};
   }}};
-  t.context.geminiParsePDFUndefined = blob => {
-    calls.push(blob.id);
-    const file = files.find(item => item.getId() === blob.id);
-    if (file.failExtraction) return {getResponseCode: () => 429};
-    return {getResponseCode: () => 200, getContentText: () => JSON.stringify({
-      candidates: [{finishReason: 'STOP', content: {parts: [{text: JSON.stringify(file.records)}]}}]
+  // Simulated Gemini endpoint: the file is identified from the PDF bytes actually sent.
+  const fetches = [];
+  t.context.UrlFetchApp = {fetch: (url, options) => {
+    fetches.push(options);
+    const parts = JSON.parse(options.payload).contents[0].parts;
+    const scope = (parts[0].text.match(/PDF page (\d+)/) || [, '1'])[1];
+    const id = Buffer.from(parts[1].inline_data.data, 'base64').toString().match(/%PDF (\S+)/)[1];
+    calls.push(id);
+    assert.equal(t.isLocked(), false, 'Gemini must never be called while the script lock is held');
+    assert.equal(options.timeoutSeconds, 90);
+    const file = files.find(item => item.getId() === id);
+    const [code, rows] = file.respond ? file.respond(scope) :
+      file.failExtraction ? [429, []] : [200, scope === '1' ? file.records : []];
+    return {getResponseCode: () => code, getContentText: () => JSON.stringify({
+      candidates: [{finishReason: 'STOP', content: {parts: [{text: JSON.stringify(rows)}]}}]
     })};
-  };
-  function upload(id, records, type = 'application/pdf', name = id + '.pdf') {
+  }};
+  function upload(id, records, type = 'application/pdf', name = id + '.pdf', pages = 1) {
+    const pdf = '%PDF ' + id + ' ' + Array(pages).fill('<< /Type /Page >>').join(' ');
     const file = {
-      records, folder: 'INPUT', failExtraction: false, failMove: false,
+      records, folder: 'INPUT', failExtraction: false, failMove: false, respond: null,
       getId: () => id, getName: () => name, getMimeType: () => type,
       getUrl: () => 'https://drive.google.com/file/d/' + id + '/view',
-      getBlob: () => ({id}),
+      getBlob: () => ({getBytes: () => Buffer.from(pdf), getDataAsString: () => pdf}),
       moveTo: target => {
         assert.equal(target, output);
         if (file.failMove) throw Error('Recoverable Drive move failure');
@@ -64,7 +77,7 @@ function integration() {
     return sheet.rows.slice(1, sheet.getLastRow()).map(row =>
       Object.fromEntries(sheet.rows[0].map((header, i) => [header, row[i]])));
   }
-  return {...t, files, conversions, trashed, calls, upload, seed, actionable};
+  return {...t, files, conversions, trashed, calls, fetches, upload, seed, actionable};
 }
 
 test('one entry point completes mixed report ingestion, identity review, output, failure and retry', () => {
@@ -111,6 +124,9 @@ test('one entry point completes mixed report ingestion, identity review, output,
   const contacts = t.master.getLastRow();
   const reportRows = t.books.SOURCE.sheets[0].getLastRow();
   failed.failExtraction = false;
+  // HTTP 429 is retried on a later timer run, not immediately.
+  assert.equal(t.context.runMarketingAgent().processed, 0);
+  t.clock.now += 5 * 60 * 1000;
   const result = t.context.runMarketingAgent();
   assert.equal(result.processed, 1);
   assert.equal(t.actionable().length, 6);
@@ -274,7 +290,9 @@ test('same-name different files do not mix provenance or contact activity', () =
   t.upload('FIRST', [sourceRecord({'Name / DJ Alias': 'First DJ', 'Email Address': 'first@example.test'})], 'application/pdf', 'same.pdf');
   t.upload('SECOND', [sourceRecord({'Name / DJ Alias': 'Second DJ', 'Email Address': 'second@example.test'})], 'application/pdf', 'same.pdf');
   t.context.runMarketingAgent();
-  assert.equal(t.books.SOURCE.sheets.length, 2);
+  const staging = t.books.SOURCE.getSheetByName('MA_Section_Staging');
+  assert.equal(staging.getLastRow(), 1, 'staged sections are removed after import');
+  assert.equal(t.books.SOURCE.sheets.filter(sheet => sheet !== staging).length, 2);
   assert.deepEqual(t.actionable().map(row => row['Source Report']).sort(), [
     'https://drive.google.com/file/d/FIRST/view', 'https://drive.google.com/file/d/SECOND/view'
   ]);
@@ -354,4 +372,233 @@ test('a Word conversion failure leaves the original in input and does not block 
   assert.equal(word.folder, 'OUTPUT');
   assert.equal(t.actionable().length, 2);
   assert.deepEqual(t.calls, ['PDF_OK', 'WORD_FAIL']);
+});
+
+function oneShot(pageCount, script) {
+  const t = setup(['apiInventory.js']);
+  const sent = [];
+  t.context.UrlFetchApp = {fetch: (url, options) => {
+    assert.equal(options.timeoutSeconds, 90);
+    const scope = (JSON.parse(options.payload).contents[0].parts[0].text.match(/PDF page (\d+)/) || [, '1'])[1];
+    sent.push(scope);
+    const [code, rows] = script(scope);
+    return {getResponseCode: () => code, getContentText: () => JSON.stringify({candidates: [{finishReason: 'STOP',
+      content: {parts: [{text: JSON.stringify(rows)}]}}]})};
+  }};
+  const pdf = '%PDF ' + Array.from({length: pageCount}, () => '<< /Type /Page >>').join(' ') + ' << /Type /Pages >>';
+  const response = t.context.geminiParsePDFUndefined({getBytes: () => Buffer.from(pdf), getDataAsString: () => pdf});
+  return {t, sent, response, rows: () => JSON.parse(JSON.parse(response.getContentText()).candidates[0].content.parts[0].text)};
+}
+
+test('one-shot extraction requests bounded page sections in order and merges a split entry', () => {
+  const run = oneShot(19, scope => {
+    if (scope === '1') return [200, [{'Name / DJ Alias': 'Split DJ'}, {'Name / DJ Alias': 'First DJ', Rating: '2'}]];
+    if (scope === '5') return [200, [{'Name / DJ Alias': 'Split DJ', Comments: 'Great', Rating: '4'}]];
+    return [200, []];
+  });
+  assert.deepEqual(run.sent, ['1', '5', '9', '13', '17']);
+  assert.deepEqual(run.rows().map(row => [row['Name / DJ Alias'], row.Rating]), [['Split DJ', '4'], ['First DJ', '2']]);
+  assert.equal(run.t.context.printApiInventory(), 5);
+});
+
+test('a failed section rejects one-shot extraction without requesting later sections', () => {
+  const run = oneShot(9, scope => scope === '4' ? [503, []] : [200, [{'Name / DJ Alias': 'DJ ' + scope}]]);
+  assert.equal(run.response.getResponseCode(), 503);
+  assert.deepEqual(run.sent, ['1', '4']);
+});
+
+test('short reports use one unscoped request and unknown page counts keep an open-ended final range', () => {
+  const short = oneShot(3, () => [200, [{'Name / DJ Alias': 'Only DJ'}]]);
+  assert.deepEqual(short.sent, ['1']);
+  const ranges = setup(['apiInventory.js']).context.marketingPageRanges_(0);
+  assert.equal(ranges.length, 8);
+  assert.equal(ranges[7].last, null);
+});
+
+// Nine pages become three sections, beginning on pages 1, 4 and 7.
+const sectionRecord = scope => sourceRecord({'Name / DJ Alias': 'DJ ' + scope, 'Email Address': 'dj' + scope + '@example.test'});
+const job = (t, id) => JSON.parse(t.properties['MA_JOB_' + id]);
+const stagedRows = t => {
+  const sheet = t.books.SOURCE.getSheetByName('MA_Section_Staging');
+  return sheet ? sheet.getLastRow() - 1 : 0;
+};
+const djNames = t => t.actionable().map(row => row['DJ Name']).sort();
+
+test('slow and timed-out Gemini sections are bounded, saved independently and resumed later', () => {
+  const t = integration();
+  const file = t.upload('LONG', [], 'application/pdf', 'long.pdf', 9);
+  const attempts = {};
+  file.respond = scope => {
+    attempts[scope] = (attempts[scope] || 0) + 1;
+    if (scope === '1') { t.clock.now += 80000; return [200, [sectionRecord('1')]]; }
+    if (scope === '4' && attempts[scope] === 1) {
+      // UrlFetchApp throws once timeoutSeconds elapses.
+      t.clock.now += 90000;
+      throw new Error('Timeout: https://generativelanguage.googleapis.com/v1beta/models/m:generateContent?key=FAKE-SECRET-KEY');
+    }
+    return [200, [sectionRecord(scope)]];
+  };
+  assert.throws(() => t.context.runMarketingAgent(), /1 report\(s\) failed/);
+  // Section 7 was not started: it could still be running when the run must finish.
+  assert.deepEqual(attempts, {'1': 1, '4': 1});
+  assert.equal(stagedRows(t), 1, 'the successful slow section was saved before the timeout');
+  const state = job(t, 'LONG');
+  assert.deepEqual(state.sections.map(section => section.done), [true, false, false]);
+  assert.equal(state.sections[1].attempts, 1);
+  assert.match(state.sections[1].error, /Timeout: .*key=\[redacted\]/);
+  assert.equal(file.folder, 'INPUT');
+  assert.deepEqual(t.actionable(), []);
+  const runLog = t.books.DATABASE.getSheetByName('Marketing_Run_Log').rows;
+  assert.match(runLog.map(row => row[1]).join(','), /GEMINI_SECTION/);
+  assert.doesNotMatch(JSON.stringify(runLog) + JSON.stringify(t.properties), /FAKE-SECRET-KEY/,
+    'the API key in a UrlFetchApp error URL is never stored');
+  assert.equal(t.properties.MA_RUN_LEASE, undefined);
+
+  t.clock.now += 5 * 60 * 1000;
+  assert.equal(t.context.runMarketingAgent().processed, 1);
+  assert.deepEqual(attempts, {'1': 1, '4': 2, '7': 1});
+  assert.deepEqual(djNames(t), ['DJ 1', 'DJ 4', 'DJ 7']);
+  assert.equal(file.folder, 'OUTPUT');
+  assert.equal(stagedRows(t), 0);
+  assert.equal(t.properties.MA_JOB_LONG, undefined);
+});
+
+test('HTTP 503 sections back off without blocking other sections or reports', () => {
+  const t = integration();
+  const busy = t.upload('BUSY', [], 'application/pdf', 'busy.pdf', 9);
+  const other = t.upload('OTHER', [sourceRecord({'Name / DJ Alias': 'Other DJ', 'Email Address': 'other@example.test'})]);
+  let unavailable = 2;
+  busy.respond = scope => scope === '4' && unavailable-- > 0 ? [503, []] : [200, [sectionRecord(scope)]];
+  assert.throws(() => t.context.runMarketingAgent(), /1 report\(s\) failed/);
+  assert.equal(other.folder, 'OUTPUT');
+  assert.equal(busy.folder, 'INPUT');
+  assert.deepEqual(job(t, 'BUSY').sections.map(section => section.done), [true, false, true]);
+  assert.deepEqual(djNames(t), ['Other DJ']);
+
+  // The next timer inside the backoff window sends nothing.
+  const sent = t.calls.length;
+  t.clock.now += 60 * 1000;
+  t.context.runMarketingAgent();
+  assert.equal(t.calls.length, sent);
+
+  t.clock.now += 4 * 60 * 1000;
+  assert.throws(() => t.context.runMarketingAgent(), /1 report\(s\) failed/);
+  assert.equal(job(t, 'BUSY').sections[1].attempts, 2);
+
+  t.clock.now += 10 * 60 * 1000;
+  assert.equal(t.context.runMarketingAgent().processed, 1);
+  assert.deepEqual(djNames(t), ['DJ 1', 'DJ 4', 'DJ 7', 'Other DJ']);
+  assert.equal(t.calls.filter(id => id === 'BUSY').length, 5, 'only the unavailable section was re-sent');
+  assert.equal(t.master.getLastRow(), 5);
+});
+
+test('a permanent Gemini error blocks only its report until an explicit retry', () => {
+  const t = integration();
+  const file = t.upload('DENIED', [], 'application/pdf', 'denied.pdf', 9);
+  let denied = true;
+  file.respond = scope => scope === '7' && denied ? [403, []] : [200, [sectionRecord(scope)]];
+  assert.throws(() => t.context.runMarketingAgent(), /1 report\(s\) failed/);
+  assert.equal(job(t, 'DENIED').sections[2].failed, true);
+  t.clock.now += 2 * 60 * 60 * 1000;
+  const sent = t.calls.length;
+  assert.equal(t.context.runMarketingAgent().blocked, 1);
+  assert.equal(t.calls.length, sent);
+  denied = false;
+  assert.equal(t.context.marketingRetryFailedReports(), 1);
+  assert.equal(t.context.runMarketingAgent().processed, 1);
+  assert.equal(t.calls.length, sent + 1, 'saved sections were not requested again');
+  assert.deepEqual(djNames(t), ['DJ 1', 'DJ 4', 'DJ 7']);
+});
+
+test('a timer that fires during a Gemini request is skipped and no lock is held during the request', () => {
+  const t = integration();
+  const file = t.upload('OVERLAP', [sourceRecord({'Name / DJ Alias': 'Overlap DJ', 'Email Address': 'overlap@example.test'})]);
+  let overlapped;
+  file.respond = () => {
+    overlapped = overlapped || t.context.runMarketingAgent();
+    return [200, file.records];
+  };
+  t.context.runMarketingAgent();
+  assert.equal(overlapped.skipped, true);
+  assert.deepEqual(t.calls, ['OVERLAP']);
+  assert.deepEqual(djNames(t), ['Overlap DJ']);
+  assert.equal(t.properties.MA_RUN_LEASE, undefined);
+  // Legacy direct callers honour an active lease too.
+  t.properties.MA_RUN_LEASE = JSON.stringify({owner: 'other', expiresAt: t.clock.now + 60000});
+  assert.equal(t.context.processNewPDFs().skipped, true);
+  assert.equal(t.context.runMarketingAgent().skipped, true);
+});
+
+test('an execution killed mid-report keeps saved sections; its stale lease expires and the next run resumes', () => {
+  const t = integration();
+  const file = t.upload('KILLED', [], 'application/pdf', 'killed.pdf', 9);
+  const scopes = [];
+  let kill = true;
+  file.respond = scope => {
+    scopes.push(scope);
+    if (scope === '7' && kill) throw new Error('Exceeded maximum execution time');
+    return [200, [sectionRecord(scope)]];
+  };
+  // Apps Script terminates the execution: no failure handler or lease release runs.
+  const saved = ['marketingRecordSectionFailure_', 'marketingReleaseRun_', 'logMarketingFailure_']
+    .map(name => [name, t.context[name]]);
+  t.context.marketingRecordSectionFailure_ = (run, state, index, error) => { throw error; };
+  t.context.logMarketingFailure_ = (stage, id, error) => { throw error; };
+  t.context.marketingReleaseRun_ = () => {};
+  assert.throws(() => t.context.runMarketingAgent(), /maximum execution time/);
+  saved.forEach(([name, value]) => { t.context[name] = value; });
+  kill = false;
+  assert.equal(stagedRows(t), 2);
+  assert.deepEqual(job(t, 'KILLED').sections.map(section => section.done), [true, true, false]);
+  assert.ok(t.properties.MA_RUN_LEASE, 'the killed run left its lease behind');
+
+  t.clock.now += 5 * 60 * 1000;
+  assert.equal(t.context.runMarketingAgent().skipped, true);
+  t.clock.now += 3 * 60 * 1000;
+  assert.equal(t.context.runMarketingAgent().processed, 1);
+  assert.deepEqual(scopes, ['1', '4', '7', '7']);
+  assert.deepEqual(djNames(t), ['DJ 1', 'DJ 4', 'DJ 7']);
+  assert.equal(t.master.getLastRow(), 4);
+});
+
+test('a run whose lease was reclaimed cannot save a late Gemini result', () => {
+  const t = integration();
+  const file = t.upload('STALE', [], 'application/pdf', 'stale.pdf', 9);
+  let takeover, reclaiming = false;
+  file.respond = scope => {
+    if (scope === '4' && !reclaiming) {
+      // This request outlives the lease; a later timer reclaims it and completes the report.
+      reclaiming = true;
+      t.clock.now += 8 * 60 * 1000;
+      takeover = t.context.runMarketingAgent();
+      return [200, [sectionRecord('4 late')]];
+    }
+    return [200, [sectionRecord(scope)]];
+  };
+  assert.throws(() => t.context.runMarketingAgent(), /lease was taken over/);
+  assert.equal(takeover.processed, 1);
+  assert.deepEqual(djNames(t), ['DJ 1', 'DJ 4', 'DJ 7']);
+  assert.equal(file.folder, 'OUTPUT');
+  assert.equal(stagedRows(t), 0);
+  assert.equal(t.properties.MA_JOB_STALE, undefined);
+  assert.equal(t.isLocked(), false);
+});
+
+test('a staged section lost before finalization is requested again instead of finalizing a partial report', () => {
+  const t = integration();
+  const file = t.upload('PARTIAL', [], 'application/pdf', 'partial.pdf', 9);
+  file.respond = scope => scope === '7' && !file.ready ? [503, []] : [200, [sectionRecord(scope)]];
+  assert.throws(() => t.context.runMarketingAgent(), /1 report/);
+  // Simulate damage to one saved section, then let the last section succeed.
+  const staging = t.books.SOURCE.getSheetByName('MA_Section_Staging');
+  staging.rows[1][4] = 'b64:corrupt';
+  file.ready = true;
+  t.clock.now += 5 * 60 * 1000;
+  assert.throws(() => t.context.runMarketingAgent(), /1 report/);
+  assert.match(t.books.DATABASE.getSheetByName('Marketing_Run_Log').rows.map(row => row[3]).join('\n'),
+    /will be requested again/);
+  assert.equal(file.folder, 'INPUT');
+  assert.deepEqual(t.actionable(), []);
+  assert.equal(t.context.runMarketingAgent().processed, 1);
+  assert.deepEqual(djNames(t), ['DJ 1', 'DJ 4', 'DJ 7']);
 });
