@@ -27,7 +27,8 @@ const MARKETING_OPENAI_FIELDS = {
   email_address: "Email Address", phone_number: "Phone Number",
   social_media_account: "Social Media Account", city: "City", state_region: "State/Region",
   country: "Country", music_genre: "Music Genre", campaign_release: "Campaign / Release",
-  report_generated_at: "Report Generated At", campaign_status: "Campaign Status",
+  report_generated_at: "Report Generated At", report_section: "Report Section",
+  campaign_status: "Campaign Status",
   activity_time: "Activity Time", downloaded: "Downloaded", downloads: "Downloads",
   listened: "Listened", listens: "Listens"
 };
@@ -85,8 +86,8 @@ function marketingOpenAISchema_() {
   };
 }
 
-function marketingOpenAIPrompt_(range) {
-  return marketingExtractionPrompt_() + " " + marketingPageScope_(range) +
+function marketingOpenAIPrompt_(scope) {
+  return marketingExtractionPrompt_() + " " + scope +
     " Return the recipients in the records array of the supplied JSON schema instead of a bare array." +
     " Each schema field holds the key of the same name listed above; use null when it is not present." +
     " Put any other recipient-specific field in additional_fields, using the report's own label.";
@@ -120,7 +121,8 @@ function marketingOpenAIError_(message, permanent) {
  * marked permanent (authentication, quota, refusal, bad request) or retryable
  * (rate limit, server error, timeout, incomplete or invalid output).
  */
-function marketingOpenAIRequestSection_(data, range, provider) {
+function marketingOpenAIRequestSection_(payload, range, provider) {
+  payload = marketingPayload_(payload, range);
   const key = String(PropertiesService.getScriptProperties().getProperty("OPENAI_API_KEY") || "").trim();
   if (!key) throw marketingOpenAIError_("Missing Script Property: OPENAI_API_KEY", true);
   const effort = String(PropertiesService.getScriptProperties().getProperty("OPENAI_REASONING_EFFORT") || "").trim();
@@ -129,8 +131,8 @@ function marketingOpenAIRequestSection_(data, range, provider) {
     store: false,
     max_output_tokens: MARKETING_OPENAI_MAX_OUTPUT_TOKENS,
     input: [{role: "user", content: [
-      {type: "input_file", filename: "report.pdf", file_data: "data:application/pdf;base64," + data},
-      {type: "input_text", text: marketingOpenAIPrompt_(range)}
+      {type: "input_file", filename: "report.pdf",       file_data: "data:application/pdf;base64," + payload.data},
+            {type: "input_text", text: marketingOpenAIPrompt_(payload.scope)}
     ]}],
     text: {format: {type: "json_schema", name: "campaign_report_recipients", strict: true,
       schema: marketingOpenAISchema_()}}

@@ -224,8 +224,10 @@ function marketingEngagement_(entry) {
     marketingExplicitCount_(fields.downloaded) || marketingExplicitCount_(fields.downloads);
   const listened = affirmative("listened") ||
     marketingExplicitCount_(fields.listened) || marketingExplicitCount_(fields.listens);
+  const section = trimCellText(fields.reportsection);
   return {
-    status: joinUniqueLines([status, downloaded ? "Confirmed download" : "",
+    status: joinUniqueLines([section && section.toLowerCase() !== String(status).trim().toLowerCase() ?
+      "Report section: " + section : "", status, downloaded ? "Confirmed download" : "",
       listened ? "Confirmed listen" : "", trimCellText(entry.comments) ? "Written feedback" : ""]) ||
       "No explicit engagement reported",
     followUp: downloaded ? "THANK_YOU_DOWNLOAD" : trimCellText(entry.comments) ?

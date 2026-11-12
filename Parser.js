@@ -183,7 +183,7 @@ function marketingWithProvenance_(file, records, extractedAt) {
 }
 
 // Caller holds the script lock. Resumes import/archive without another Gemini request.
-function marketingResumeCheckpoint_(file, targetFolder) {
+function marketingResumeCheckpoint_(file, targetFolder, digest) {
   const props = PropertiesService.getScriptProperties();
   const checkpointKey = "MA_REPORT_" + file.getId();
   const checkpoint = JSON.parse(props.getProperty(checkpointKey));
@@ -195,15 +195,72 @@ function marketingResumeCheckpoint_(file, targetFolder) {
     SpreadsheetApp.flush();
     props.setProperty(checkpointKey, JSON.stringify({sheetId: sheet.getSheetId(), state: "IMPORTED"}));
   }
+  if (!checkpoint.duplicateOf) marketingRememberContent_(file, sheet.getSheetId(), digest);
   file.moveTo(targetFolder);
   return sheet.getSheetId();
 }
 
+// Records which imported file and report tab hold this exact content. The first valid
+// import wins; an entry whose checkpoint or report tab is gone is replaced.
+// Callers pass the digest computed outside the lock where possible, avoiding a Drive download here.
+// The fingerprint only avoids re-extraction, so a failure here never fails the import.
+function marketingRememberContent_(file, sheetId, digest) {
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const key = "MA_CONTENT_" + (digest || marketingDigest_(file.getBlob().getBytes()));
+    let current = null;
+    try { current = JSON.parse(props.getProperty(key) || "null"); } catch (error) {}
+    if (current && current.fileId !== file.getId() && marketingContentValid_(current)) return;
+    props.setProperty(key, JSON.stringify({fileId: file.getId(), sheetId: sheetId}));
+  } catch (error) {
+    console.warn("Content fingerprint not recorded for " + file.getId() + ": " + String(error && error.message || error));
+  }
+}
+
+// The earlier import of identical content, if its checkpoint and report tab still exist.
+function marketingContentOriginal_(digest, fileId) {
+  const props = PropertiesService.getScriptProperties();
+  let original;
+  try { original = JSON.parse(props.getProperty("MA_CONTENT_" + digest) || "null"); } catch (error) {}
+  if (!original || original.fileId === fileId) return null;
+  return marketingContentValid_(original) ? original : null;
+}
+
+function marketingContentValid_(original) {
+  let checkpoint;
+  try {
+    checkpoint = JSON.parse(PropertiesService.getScriptProperties().getProperty("MA_REPORT_" + original.fileId) || "null");
+  } catch (error) {}
+  if (!checkpoint || checkpoint.state !== "IMPORTED" || checkpoint.sheetId !== original.sheetId) return false;
+  const tabs = SpreadsheetApp.openById(SPREADSHEET_DATA_EXTRACTION).getSheets();
+  return tabs.some(tab => tab.getSheetId() === original.sheetId);
+}
+
+// Another live, unblocked job for identical content. Jobs whose file was deleted, trashed or
+// moved out of the input folder, or that have a permanently failed section, do not hold copies.
+function marketingContentInProgress_(digest, fileId) {
+  const props = PropertiesService.getScriptProperties();
+  return props.getKeys().some(key => {
+    if (!key.startsWith("MA_JOB_") || key === "MA_JOB_" + fileId) return false;
+    try {
+      const job = JSON.parse(props.getProperty(key));
+      if (job.digest !== digest || job.sections.some(section => section.failed)) return false;
+      const other = DriveApp.getFileById(key.slice("MA_JOB_".length));
+      if (other.isTrashed()) return false;
+      const parents = other.getParents();
+      while (parents.hasNext()) if (parents.next().getId() === PARSER_INPUT_FOLDER) return true;
+      return false;
+    } catch (error) {
+      return false;
+    }
+  });
+}
+
 // Caller holds the script lock. Writes the complete report tab, imports it, then archives.
-function marketingFinalizeReport_(file, records, targetFolder) {
+function marketingFinalizeReport_(file, records, targetFolder, digest) {
   const props = PropertiesService.getScriptProperties();
   const checkpointKey = "MA_REPORT_" + file.getId();
-  if (props.getProperty(checkpointKey)) return marketingResumeCheckpoint_(file, targetFolder);
+  if (props.getProperty(checkpointKey)) return marketingResumeCheckpoint_(file, targetFolder, digest);
   const ss = SpreadsheetApp.openById(SPREADSHEET_DATA_EXTRACTION);
   const name = file.getName().replace(/\.(pdf|docx?)$/i, "")
     .replace(/[\[\]:*?\/\\]/g, " ").trim().slice(0, 45) || "Report";
@@ -230,6 +287,7 @@ function marketingFinalizeReport_(file, records, targetFolder) {
 
   SpreadsheetApp.flush();
   props.setProperty(checkpointKey, JSON.stringify({sheetId: sheet.getSheetId(), state: "IMPORTED"}));
+  marketingRememberContent_(file, sheet.getSheetId(), digest);
 
   // Move the PDF only after contact importing completes.
   // If importing throws an error, the PDF stays in the input folder.
@@ -315,7 +373,7 @@ function marketingExtractionPrompt_() {
   "Radio Station, Reach, Rating, Favorite Track, Comments, " +
   "Email Address, Phone Number, Social Media Account, " +
   "City, State/Region, Country, Music Genre, " +
-  "Campaign / Release, Report Generated At, Campaign Status, Activity Time. " +
+  "Campaign / Release, Report Generated At, Report Section, Campaign Status, Activity Time. " +
   "Retain other recipient-specific fields if needed. " +
 
   "Preserve the full displayed name in Name / DJ Alias. " +
@@ -326,9 +384,13 @@ function marketingExtractionPrompt_() {
   "into Social Media Account. Preserve platform names and exact account text " +
   "without changing the original Comments. " +
 
-  "Copy explicit platform status verbatim into Campaign Status. " +
-  "For Downloaded No Feedback use Downloaded No Feedback as Campaign Status; " +
-  "for Checked No Feedback use Checked No Feedback. Preserve explicit download " +
+  "Report Section is the exact heading printed above the recipient's table, such as " +
+  "Not For Me, Checked No Feedback or a feedback group name; leave it out when the " +
+  "table has no heading of its own or the heading is not in the supplied pages. " +
+  "Never assign recipients to a heading that has no rows beneath it. " +
+  "Campaign Status is the recipient's own status cell copied verbatim when the table " +
+  "has a status column (for example Listened 3 days ago or Downloaded No Feedback); " +
+  "otherwise use the printed section heading. Preserve explicit download " +
   "and listen counts or flags in Downloaded, Downloads, Listened, or Listens. " +
   "Use Not For Me for recipients in that section. " +
   "Do not infer listening or downloads from ratings, favorite tracks, or comments. " +
@@ -345,10 +407,10 @@ function marketingExtractionPrompt_() {
 
 // One-shot extraction used by parseUndefinedFile: every section must succeed.
 function geminiParsePDFUndefined(blob) {
-  const data = Utilities.base64Encode(blob.getBytes());
+  const source = marketingPdfSource_(blob);
   const sections = [];
-  for (const range of marketingPageRanges_(marketingPdfPageCount_(blob))) {
-    const response = marketingRequestSection_(data, range);
+  for (const range of marketingPageRanges_(source.pageCount)) {
+    const response = marketingRequestSection_(marketingSectionPayload_(source, range), range);
     if (!marketingCompleteResponse_(response)) return response;
     sections.push(marketingResponseRows_(response, "page " + range.first));
   }
@@ -372,14 +434,16 @@ const MARKETING_STAGING_CHUNK = 40000;
 const MARKETING_GEMINI_URL = String(GEMINI_URL).split("?")[0];
 
 // Dispatches to the configured provider (MarketingExtractionProvider.js); no fallback.
-function marketingRequestSection_(data, range) {
+// `payload` is {data, scope} from marketingSectionPayload_, or the whole PDF as base64.
+function marketingRequestSection_(payload, range) {
+  payload = marketingPayload_(payload, range);
   const provider = marketingExtractionProvider_();
-  if (provider.name === "openai") return marketingOpenAIRequestSection_(data, range, provider);
+  if (provider.name === "openai") return marketingOpenAIRequestSection_(payload, range, provider);
   API_CALL_INVENTORY["Gemini"] = (API_CALL_INVENTORY["Gemini"] || 0) + 1;
   const started = Date.now();
   let response;
   try {
-    response = marketingGeminiFetch_(data, range);
+    response = marketingGeminiFetch_(payload, range);
   } catch (error) {
     marketingRecordExtractionUsage_("Gemini", "", Date.now() - started, null);
     throw error;
@@ -393,7 +457,8 @@ function marketingRequestSection_(data, range) {
   return response;
 }
 
-function marketingGeminiFetch_(data, range) {
+function marketingGeminiFetch_(payload, range) {
+  payload = marketingPayload_(payload, range);
   return UrlFetchApp.fetch(MARKETING_GEMINI_URL, {
     method: "post",
     contentType: "application/json",
@@ -402,8 +467,8 @@ function marketingGeminiFetch_(data, range) {
     timeoutSeconds: MARKETING_GEMINI_TIMEOUT_SECONDS,
     payload: JSON.stringify({
       contents: [{ parts: [
-        { text: marketingExtractionPrompt_() + " " + marketingPageScope_(range) },
-        { inline_data: { mime_type: "application/pdf", data: data } }
+        { text: marketingExtractionPrompt_() + " " + payload.scope },
+        { inline_data: { mime_type: "application/pdf", data: payload.data } }
       ] }],
       generationConfig: {
         responseMimeType: "application/json",
@@ -434,24 +499,48 @@ function marketingProcessReport_(file, blobFn, targetFolder, run) {
   const outcome = {state: "pending", failed: 0, deferred: false};
   const fileId = file.getId();
   if (PropertiesService.getScriptProperties().getProperty("MA_REPORT_" + fileId)) {
+    const resumeDigest = marketingDigest_(file.getBlob().getBytes());
     marketingWithLock_(() => {
       marketingAssertOwner_(run);
-      marketingResumeCheckpoint_(file, targetFolder);
+      marketingResumeCheckpoint_(file, targetFolder, resumeDigest);
       marketingDropJob_(fileId);
     });
     outcome.state = "processed";
     return outcome;
   }
   let job = marketingLoadJob_(fileId);
-  let data = null;
+  if (!job) {
+    // An identical report uploaded as a new Drive file reuses the earlier import.
+    const digest = marketingDigest_(file.getBlob().getBytes());
+    const original = marketingContentOriginal_(digest, fileId);
+    if (original) {
+      marketingWithLock_(() => {
+        marketingAssertOwner_(run);
+        PropertiesService.getScriptProperties().setProperty("MA_REPORT_" + fileId, JSON.stringify(
+          {sheetId: original.sheetId, state: "IMPORTED", duplicateOf: original.fileId}));
+        file.moveTo(targetFolder);
+      });
+      console.log("Skipped " + file.getName() + " (" + fileId + "): identical content was already imported from " +
+        original.fileId + "; no extraction or import was repeated.");
+      outcome.state = "processed";
+      return outcome;
+    }
+    if (marketingContentInProgress_(digest, fileId)) {
+      console.log("Deferred " + file.getName() + ": identical content is still being extracted from another file.");
+      outcome.deferred = true;
+      return outcome;
+    }
+  }
+  let source = null;
   // Loads the report once per visit; a new or changed file gets a fresh job.
   const load = () => {
-    if (data) return data;
+    if (source) return source;
     const digest = marketingDigest_(file.getBlob().getBytes());
     const blob = blobFn();
+    source = marketingPdfSource_(blob);
     if (!job || job.digest !== digest) {
       job = {fileId: fileId, digest: digest, createdAt: Date.now(),
-        sections: marketingPageRanges_(marketingPdfPageCount_(blob)).map(range => ({
+        sections: marketingPageRanges_(source.pageCount).map(range => ({
           first: range.first, last: range.last, done: false, failed: false,
           attempts: 0, nextAt: 0, error: ""
         }))};
@@ -461,8 +550,7 @@ function marketingProcessReport_(file, blobFn, targetFolder, run) {
         marketingSaveJob_(job);
       });
     }
-    data = Utilities.base64Encode(blob.getBytes());
-    return data;
+    return source;
   };
   if (!job) {
     if (!marketingCanRequest_(run)) { outcome.deferred = true; return outcome; }
@@ -472,14 +560,14 @@ function marketingProcessReport_(file, blobFn, targetFolder, run) {
     const section = job.sections[i];
     if (section.done || section.failed || section.nextAt > Date.now()) continue;
     if (!marketingCanRequest_(run)) { outcome.deferred = true; break; }
-    const payload = load();
+    const pdf = load();
     if (job.sections[i] !== section) { i = -1; continue; }
     const label = file.getName() + " section " + (i + 1) + "/" + job.sections.length;
     let rows;
     const started = Date.now();
     const provider = marketingExtractionProvider_();
     try {
-      const response = marketingRequestSection_(payload, section);
+      const response = marketingRequestSection_(marketingSectionPayload_(pdf, section), section);
       const code = response.getResponseCode();
       if (code !== 200) {
         const error = new Error(provider.label + " HTTP " + code + " for " + label);
@@ -535,7 +623,7 @@ function marketingProcessReport_(file, blobFn, targetFolder, run) {
     }
     const extractedAt = new Date(Math.max(...[...staged.values()].map(entry => entry.savedAt))).toISOString();
     marketingFinalizeReport_(file,
-      marketingWithProvenance_(file, marketingCleanReportRecords_(combined), extractedAt), targetFolder);
+      marketingWithProvenance_(file, marketingCleanReportRecords_(combined), extractedAt), targetFolder, job.digest);
     marketingDropJob_(fileId);
   });
   outcome.state = "processed";
@@ -705,8 +793,179 @@ function marketingPageScope_(range) {
     "campaign-wide fields. If no recipient entry begins in that range, return [].";
 }
 
+// Accepts the legacy whole-PDF base64 string as well as a section payload.
+function marketingPayload_(payload, range) {
+  return typeof payload === "string" ? {data: payload, scope: marketingPageScope_(range)} : payload;
+}
+
+function marketingPdfSource_(blob) {
+  return {bytes: blob.getBytes(), pageCount: marketingPdfPageCount_(blob)};
+}
+
+/**
+ * Sends only the section's pages plus context (page 1 for campaign fields, the page
+ * before for a section heading, the page after for a continued entry). Section page
+ * numbers stay in original numbering, so checkpoints and provenance are unchanged.
+ * Falls back to the whole PDF when the file cannot be safely subset.
+ */
+function marketingSectionPayload_(source, range) {
+  if (source.layout === undefined) {
+    try { source.layout = marketingPdfLayout_(source.bytes); }
+    catch (error) { source.layout = null; }
+  }
+  const layout = source.layout;
+  const whole = () => {
+    source.whole = source.whole || Utilities.base64Encode(source.bytes);
+    return {data: source.whole, scope: marketingPageScope_(range)};
+  };
+  if (!layout) return whole();
+  const total = layout.kids.length;
+  const last = range.last === null ? total : Math.min(range.last, total);
+  const wanted = new Set([1, range.first - 1, last + 1]);
+  for (let page = range.first; page <= last; page++) wanted.add(page);
+  const pages = [...wanted].filter(page => page >= 1 && page <= total).sort((a, b) => a - b);
+  if (pages.length >= total || range.first > total) return whole();
+  return {
+    data: Utilities.base64Encode(marketingPdfPageSubset_(source.bytes, layout, pages)),
+    scope: "Scope: this file is an excerpt of the report containing only original pages " +
+      pages.join(", ") + "; " + pages.map((page, i) => "file page " + (i + 1) + " is original page " + page).join(", ") +
+      ". Return only recipients whose entry begins on original page " + range.first +
+      (last > range.first ? " through original page " + last : "") +
+      ". The other pages are context for campaign-wide fields, section headings and entries " +
+      "continued across a page break. If no recipient entry begins in that range, return [].",
+    pages: pages
+  };
+}
+
+function marketingLatin1_(bytes) {
+  let text = "";
+  for (let i = 0; i < bytes.length; i += 8192)
+    text += String.fromCharCode.apply(null, Array.from(bytes.slice(i, i + 8192), b => b & 255));
+  return text;
+}
+
+// Returns the balanced << >> dictionary starting at `at`, skipping strings and hex strings.
+function marketingPdfDict_(text, at) {
+  if (at < 0 || text.slice(at, at + 2) !== "<<") return null;
+  let depth = 0;
+  for (let i = at; i < text.length; i++) {
+    const c = text[i];
+    if (c === "(") {
+      let nest = 1;
+      for (i++; i < text.length && nest; i++) {
+        if (text[i] === "\\") i++;
+        else if (text[i] === "(") nest++;
+        else if (text[i] === ")") nest--;
+      }
+      i--;
+    } else if (c === "<" && text[i + 1] === "<") { depth++; i++; }
+    else if (c === "<") { i = text.indexOf(">", i); if (i < 0) return null; }
+    else if (c === ">" && text[i + 1] === ">") {
+      depth--; i++;
+      if (!depth) return text.slice(at, i + 1);
+    }
+  }
+  return null;
+}
+
+/**
+ * Reads the page tree of a PDF with classic cross-reference tables. Returns null
+ * (whole-PDF fallback) for encrypted files, cross-reference streams, nested page
+ * trees or anything unexpected.
+ */
+function marketingPdfLayout_(bytes) {
+  const text = marketingLatin1_(bytes);
+  const start = text.lastIndexOf("startxref");
+  if (start < 0) return null;
+  const xrefAt = Number((text.slice(start + 9, start + 40).match(/^\s*(\d+)/) || [])[1]);
+  if (!(xrefAt > 0)) return null;
+  const offsets = {};
+  let trailer = null;
+  for (let at = xrefAt, hops = 0; at > 0; hops++) {
+    if (hops > 50 || text.slice(at, at + 4) !== "xref") return null;
+    const word = /\s*trailer/y, head = /\s*(\d+)\s+(\d+)/y, entry = /\s*(\d{10})\s+(\d{5})\s+([nf])/y;
+    let pos = at + 4;
+    for (;;) {
+      word.lastIndex = pos;
+      if (word.test(text)) { pos = word.lastIndex; break; }
+      head.lastIndex = pos;
+      const h = head.exec(text);
+      if (!h) return null;
+      pos = head.lastIndex;
+      for (let k = 0; k < Number(h[2]); k++) {
+        entry.lastIndex = pos;
+        const e = entry.exec(text);
+        if (!e) return null;
+        pos = entry.lastIndex;
+        const num = Number(h[1]) + k;
+        if (!(num in offsets)) offsets[num] = e[3] === "n" ? {offset: Number(e[1]), gen: Number(e[2])} : null;
+      }
+    }
+    const dict = marketingPdfDict_(text, text.indexOf("<<", pos));
+    if (!dict || /\/(Encrypt|XRefStm)\b/.test(dict)) return null;
+    trailer = trailer || dict;
+    const prev = dict.match(/\/Prev\s+(\d+)/);
+    at = prev ? Number(prev[1]) : 0;
+  }
+  const ref = (dict, key) => {
+    const m = dict && dict.match(new RegExp("/" + key + "\\s+(\\d+)\\s+(\\d+)\\s+R"));
+    return m ? {num: Number(m[1]), gen: Number(m[2])} : null;
+  };
+  const object = r => {
+    const o = r && offsets[r.num];
+    if (!o || o.gen !== r.gen) return null;
+    const header = /(\d+)\s+(\d+)\s+obj\s*/y;
+    header.lastIndex = o.offset;
+    const h = header.exec(text);
+    return h && Number(h[1]) === r.num ? marketingPdfDict_(text, header.lastIndex) : null;
+  };
+  const root = ref(trailer, "Root");
+  const pagesRef = ref(object(root), "Pages");
+  const pages = object(pagesRef);
+  if (!pages || !/\/Type\s*\/Pages\b/.test(pages)) return null;
+  const kidsText = (pages.match(/\/Kids\s*\[([^\]]*)\]/) || [])[1];
+  const count = Number((pages.match(/\/Count\s+(\d+)/) || [])[1]);
+  if (kidsText === undefined) return null;
+  const kids = [...kidsText.matchAll(/(\d+)\s+(\d+)\s+R/g)].map(m => m[1] + " " + m[2] + " R");
+  if (!kids.length || kids.length !== count) return null;
+  for (const kid of kids) {
+    const [num, gen] = kid.split(" ").map(Number);
+    const dict = object({num: num, gen: gen});
+    if (!dict || !/\/Type\s*\/Page(?![a-zA-Z])/.test(dict)) return null;
+  }
+  const info = ref(trailer, "Info");
+  const id = (trailer.match(/\/ID\s*\[[^\]]*\]/) || [])[0];
+  return {
+    length: text.length, xrefAt: xrefAt, kids: kids, pagesRef: pagesRef, pagesDict: pages,
+    size: Number((trailer.match(/\/Size\s+(\d+)/) || [])[1]), root: root,
+    trailerExtra: (info ? " /Info " + info.num + " " + info.gen + " R" : "") + (id ? " " + id : "")
+  };
+}
+
+// Incremental update that redefines the page tree with the selected (1-based) pages only.
+function marketingPdfPageSubset_(bytes, layout, pages) {
+  const dict = layout.pagesDict
+    .replace(/\/Kids\s*\[[^\]]*\]/, "/Kids [" + pages.map(page => layout.kids[page - 1]).join(" ") + "]")
+    .replace(/\/Count\s+\d+/, "/Count " + pages.length);
+  const pad = (value, width) => String(value).padStart(width, "0");
+  const objectAt = layout.length + 1;
+  const body = "\n" + layout.pagesRef.num + " " + layout.pagesRef.gen + " obj\n" + dict + "\nendobj\n";
+  const append = body + "xref\n" + layout.pagesRef.num + " 1\n" +
+    pad(objectAt, 10) + " " + pad(layout.pagesRef.gen, 5) + " n\r\n" +
+    "trailer\n<< /Size " + layout.size + " /Root " + layout.root.num + " " + layout.root.gen + " R" +
+    layout.trailerExtra + " /Prev " + layout.xrefAt + " >>\nstartxref\n" +
+    (layout.length + body.length) + "\n%%EOF\n";
+  const out = Array.from(bytes);
+  for (let i = 0; i < append.length; i++) {
+    const code = append.charCodeAt(i) & 255;
+    out.push(code > 127 ? code - 256 : code);
+  }
+  return out;
+}
+
 function marketingCombineSections_(sections) {
   const records = [];
+  const origin = [];
   const byName = new Map();
   sections.forEach((rows, r) => rows.forEach(row => {
     const name = row && typeof row === "object" ?
@@ -721,8 +980,29 @@ function marketingCombineSections_(sections) {
     }
     if (name) byName.set(name, {section: r, index: records.length});
     records.push(row);
+    origin.push(r);
   }));
+  marketingCarryReportSection_(records, origin);
   return records;
+}
+
+/**
+ * A table that continues from a page outside a section's excerpt has no visible
+ * heading. Its leading rows take the previous section's heading only when the row
+ * evidence matches (same status wording, no rating); the inference is labelled.
+ */
+function marketingCarryReportSection_(records, origin) {
+  const word = row => String(row["Campaign Status"] || "").trim().split(/\s+/)[0].toLowerCase();
+  const plain = row => row && typeof row === "object" && !String(row["Rating"] || "").trim();
+  for (let i = 1; i < records.length; i++) {
+    const row = records[i], prev = records[i - 1];
+    // Only the leading rows of a section, chained through rows already carried.
+    if (origin[i] === origin[i - 1] && !prev["Report Section Basis"]) continue;
+    if (!plain(row) || !plain(prev) || row["Report Section"] || !prev["Report Section"]) continue;
+    if (!word(row) || word(row) !== word(prev)) continue;
+    records[i] = Object.assign({}, row, {"Report Section": prev["Report Section"],
+      "Report Section Basis": "Table continued from an earlier page"});
+  }
 }
 
 function marketingCompleteResponse_(response) {

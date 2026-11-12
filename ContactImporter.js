@@ -121,7 +121,7 @@ function importReportContacts(reportTabIds) {
 // Internal caller must hold the script lock.
 function importReportContactsUnlocked_(reportTabIds) {
   let log, runId, logReady = false, events = [];
-  const stats = {read:0, created:0, matched:0, review:0, skipped:0};
+  const stats = {read:0, created:0, matched:0, review:0, warnings:0, skipped:0};
   function flushLog() {
     if (log && events.length) {
       const start = log.getLastRow()+1;
@@ -251,11 +251,15 @@ function importReportContactsUnlocked_(reportTabIds) {
             else if (normalizeContactText(person[field])!==normalizeContactText(val))
               notes.push(field + ": report says " + val);
           }
-          if (rawInfo) notes.push("Unparsed affiliation/location: "+rawInfo);
+          // Unparsed affiliation text is kept for reference; only real conflicts need review.
+          const info = rawInfo ? ["Info: unparsed affiliation/location: "+rawInfo] : [];
+          const changed = Object.keys(patch).length;
+          if (notes.length || info.length)
+            patch["Review Notes"]=joinUniqueLines([person["Review Notes"],...notes.concat(info).map(x=>x+" — "+tabUrl)]);
+          if (info.length) stats.warnings++;
           if (notes.length) {
-            patch["Review Notes"]=joinUniqueLines([person["Review Notes"],...notes.map(x=>x+" — "+tabUrl)]);
             patch["Review Status"]="Needs Review"; stats.review++;
-          } else if (!existing || (Object.keys(patch).length && person["Review Status"]==="Reviewed")) {
+          } else if (!existing || (changed && person["Review Status"]==="Reviewed")) {
             patch["Review Status"]="Not Reviewed";
           }
           patch.Sources=joinUniqueLines([person.Sources,source]);

@@ -25,7 +25,9 @@ function integration() {
         assert.equal(type, 'application/pdf');
         return files.find(file => file.getId() === id.replace('TEMP_', '')).getBlob();
       },
-      setTrashed: value => { assert.equal(value, true); trashed.push(id); }
+      setTrashed: value => { assert.equal(value, true); trashed.push(id); },
+      isTrashed: () => files.find(file => file.getId() === id).folder === 'TRASH',
+      getParents: () => iterator([{getId: () => files.find(file => file.getId() === id).folder}])
     })
   };
   t.context.Drive = {Files: {copy: (metadata, id, options) => {
@@ -611,7 +613,7 @@ test('a staged section lost before finalization is requested again instead of fi
 // --- OpenAI Responses provider (MarketingExtractionProvider.js), simulated endpoint ---
 const OPENAI_FIELDS = ['name_dj_alias', 'first_name', 'last_name', 'additional_info_stations', 'radio_station', 'reach',
   'rating', 'favorite_track', 'comments', 'email_address', 'phone_number', 'social_media_account', 'city',
-  'state_region', 'country', 'music_genre', 'campaign_release', 'report_generated_at', 'campaign_status',
+  'state_region', 'country', 'music_genre', 'campaign_release', 'report_generated_at', 'report_section', 'campaign_status',
   'activity_time', 'downloaded', 'downloads', 'listened', 'listens'];
 const OPENAI_KEY = 'sk-test-SECRET1234567890';
 const oaRecord = fields => ({...Object.fromEntries(OPENAI_FIELDS.map(key => [key, null])), additional_fields: [], ...fields});
@@ -816,4 +818,154 @@ test('provider configuration is validated before any request and the model is co
   assert.equal(custom.context.runMarketingAgent().processed, 1);
   assert.equal(custom.requests[0].body.model, 'gpt-6-sol');
   assert.deepEqual(custom.requests[0].body.reasoning, {effort: 'low'});
+});
+
+// --- Stabilization: page subsets, report sections, informational notes, content fingerprint ---
+function classicPdf(tag, pageCount) {
+  const objects = ['<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /MediaBox [0 0 612 792] /Kids [' +
+      Array.from({length: pageCount}, (_, i) => (i + 3) + ' 0 R').join(' ') + '] /Count ' + pageCount + ' >>'];
+  for (let i = 0; i < pageCount; i++) objects.push('<< /Type /Page /Parent 2 0 R /Contents (page ' + (i + 1) + ' >> text) >>');
+  let out = '%PDF-1.4\n%PDF ' + tag + '\n';
+  const offsets = objects.map((body, i) => { const at = out.length; out += (i + 1) + ' 0 obj\n' + body + '\nendobj\n'; return at; });
+  const xref = out.length;
+  out += 'xref\n0 ' + (objects.length + 1) + '\n0000000000 65535 f\r\n' +
+    offsets.map(at => String(at).padStart(10, '0') + ' 00000 n\r\n').join('') +
+    'trailer\n<< /Size ' + (objects.length + 1) + ' /Root 1 0 R /ID [<AB> <CD>] >>\nstartxref\n' + xref + '\n%%EOF\n';
+  return out;
+}
+
+test('each section sends only its pages plus context, in original page numbering, with whole-PDF fallback', () => {
+  const sent = [];
+  const t = openAI((id, scope, attempt) => {
+    const request = t.requests[t.requests.length - 1];
+    const bytes = Buffer.from(request.body.input[0].content[0].file_data.split(',')[1], 'base64');
+    const layout = t.context.marketingPdfLayout_(bytes);
+    const pages = layout.kids.map(kid => Number(kid.split(' ')[0]) - 2);
+    sent.push(Array.from(pages));
+    const first = Number(request.body.input[0].content[1].text.match(/begins on original page (\d+)/)[1]);
+    return oaOk([oaRecord({name_dj_alias: 'DJ ' + first, email_address: 'dj' + first + '@example.test', comments: 'Nice'})]);
+  });
+  const file = t.upload('SUB', []);
+  const pdf = classicPdf('SUB', 9);
+  file.getBlob = () => ({getBytes: () => Buffer.from(pdf, 'latin1'), getDataAsString: () => pdf});
+  assert.equal(t.context.runMarketingAgent().processed, 1);
+  assert.deepEqual(sent, [[1, 2, 3, 4], [1, 3, 4, 5, 6, 7], [1, 6, 7, 8, 9]]);
+  const scope = t.requests[1].body.input[0].content[1].text;
+  assert.match(scope, /only original pages 1, 3, 4, 5, 6, 7; file page 1 is original page 1, file page 2 is original page 3/);
+  assert.match(scope, /begins on original page 4 through original page 6\./);
+  assert.match(t.requests[2].body.input[0].content[1].text, /begins on original page 7 through original page 9\./);
+  // The excerpt is an incremental update: the original bytes are unchanged and the page objects are shared.
+  const subset = Buffer.from(t.requests[0].body.input[0].content[0].file_data.split(',')[1], 'base64').toString('latin1');
+  assert.ok(subset.startsWith(pdf));
+  assert.match(subset.slice(pdf.length), /^\n2 0 obj\n<< \/Type \/Pages \/MediaBox \[0 0 612 792\] \/Kids \[3 0 R 4 0 R 5 0 R 6 0 R\] \/Count 4 >>/);
+  assert.match(subset, /trailer\n<< \/Size 12 \/Root 1 0 R \/ID \[<AB> <CD>\] \/Prev \d+ >>\nstartxref\n\d+\n%%EOF\n$/);
+  assert.deepEqual(djNames(t), ['DJ 1', 'DJ 4', 'DJ 7']);
+  assert.equal(t.properties.MA_JOB_SUB, undefined, 'job removed after finalizing');
+
+  // Encrypted or cross-reference-stream PDFs and nested page trees fall back to the whole file.
+  const ctx = t.context;
+  assert.equal(ctx.marketingPdfLayout_(Buffer.from(pdf.replace('/ID [<AB> <CD>]', '/Encrypt 9 0 R'), 'latin1')), null);
+  assert.equal(ctx.marketingPdfLayout_(Buffer.from('%PDF-1.5\n1 0 obj << /Type /XRef >> endobj\nstartxref\n9\n%%EOF', 'latin1')), null);
+  assert.equal(ctx.marketingPdfLayout_(Buffer.from(pdf.replace('/Type /Page /Parent', '/Type /Pages /Parent'), 'latin1')), null);
+  const whole = ctx.marketingSectionPayload_({bytes: Buffer.from('%PDF x << /Type /Page >>'), pageCount: 1}, {first: 1, last: null});
+  assert.equal(whole.scope, '');
+});
+
+test('report section headings and row status stay distinct; continued tables are labelled, not reinterpreted', () => {
+  const t = openAI((id, scope) => {
+    if (scope === '1') return oaOk([
+      oaRecord({name_dj_alias: 'Rated DJ', rating: '4', report_section: 'DJs', campaign_status: 'DJs', email_address: 'r@example.test'}),
+      oaRecord({name_dj_alias: 'Quiet DJ', report_section: 'Checked No Feedback', campaign_status: 'Listened 3 days ago',
+        email_address: 'q@example.test'})]);
+    if (scope === '4') return oaOk([
+      oaRecord({name_dj_alias: 'Later DJ', campaign_status: 'Listened 5 days ago', email_address: 'l@example.test'}),
+      oaRecord({name_dj_alias: 'Rated Later', rating: '5', report_section: 'Radio', campaign_status: 'Radio', email_address: 'rl@example.test'})]);
+    return oaOk([oaRecord({name_dj_alias: 'Pool DJ', campaign_status: 'Downloaded No Feedback', email_address: 'p@example.test'})]);
+  });
+  t.upload('SEC', [], 'application/pdf', 'sections.pdf', 9);
+  assert.equal(t.context.runMarketingAgent().processed, 1);
+  const rows = t.actionable();
+  const status = name => rows.find(row => row['DJ Name'] === name)['Engagement Status'];
+  assert.equal(status('Quiet DJ'), 'Report section: Checked No Feedback\nListened 3 days ago\nConfirmed listen');
+  assert.equal(status('Later DJ'), 'Report section: Checked No Feedback\nListened 5 days ago\nConfirmed listen');
+  assert.equal(status('Pool DJ'), 'Downloaded No Feedback\nConfirmed download', 'an unheaded table after a rated row is not relabelled');
+  const report = t.books.SOURCE.sheets.find(sheet => sheet.rows.some(row => row.includes('Later DJ')));
+  const header = report.rows[0];
+  const later = report.rows.find(row => row.includes('Later DJ'));
+  assert.equal(later[header.indexOf('Report Section')], 'Checked No Feedback');
+  assert.equal(later[header.indexOf('Report Section Basis')], 'Table continued from an earlier page');
+  const quiet = report.rows.find(row => row.includes('Quiet DJ'));
+  assert.equal(quiet[header.indexOf('Report Section Basis')], '');
+});
+
+test('unparsed affiliation text is an informational note, not a mandatory review', () => {
+  const t = integration();
+  t.upload('INFO', [sourceRecord({'Name / DJ Alias': 'Info DJ', 'Email Address': 'info@example.test',
+    'Additional Info / Stations': 'Club Night Residency, Somewhere'})]);
+  assert.equal(t.context.runMarketingAgent().processed, 1);
+  const contact = t.contact(1);
+  assert.equal(contact['Review Status'], 'Not Reviewed');
+  assert.match(contact['Review Notes'], /^Info: unparsed affiliation\/location: Club Night Residency, Somewhere — /);
+  const log = t.books.DATABASE.getSheetByName('Import_Log');
+  const completed = JSON.parse(log.rows.find(row => row[6] === 'Completed')[8]);
+  assert.equal(completed.review, 0);
+  assert.equal(completed.warnings, 1);
+});
+
+test('an identical report uploaded as a new Drive file is recognised by content and not extracted or imported again', () => {
+  const t = integration();
+  const original = t.upload('ORIG', [sourceRecord({'Name / DJ Alias': 'Copy DJ', 'Email Address': 'copy@example.test'})]);
+  assert.equal(t.context.runMarketingAgent().processed, 1);
+  const fingerprint = Object.keys(t.properties).find(key => key.startsWith('MA_CONTENT_'));
+  assert.deepEqual(JSON.parse(t.properties[fingerprint]).fileId, 'ORIG');
+  const contacts = JSON.stringify(t.master.rows);
+  const actionable = JSON.stringify(t.actionable());
+  const tabs = t.books.SOURCE.sheets.length;
+  const calls = t.calls.length;
+
+  const copy = t.upload('COPY', [], 'application/pdf', 'renamed copy.pdf');
+  copy.getBlob = original.getBlob;
+  assert.equal(t.context.runMarketingAgent().processed, 1);
+  assert.equal(t.calls.length, calls, 'no extraction request for identical content');
+  assert.equal(copy.folder, 'OUTPUT');
+  assert.equal(JSON.stringify(t.master.rows), contacts, 'no duplicate contacts or campaign history');
+  assert.equal(JSON.stringify(t.actionable()), actionable);
+  assert.equal(t.books.SOURCE.sheets.length, tabs, 'no second report tab');
+  assert.deepEqual(JSON.parse(t.properties.MA_REPORT_COPY),
+    {sheetId: JSON.parse(t.properties[fingerprint]).sheetId, state: 'IMPORTED', duplicateOf: 'ORIG'});
+
+  // A changed file is still extracted normally.
+  t.upload('CHANGED', [sourceRecord({'Name / DJ Alias': 'Changed DJ', 'Email Address': 'changed@example.test'})]);
+  assert.equal(t.context.runMarketingAgent().processed, 1);
+  assert.equal(t.calls.length, calls + 1);
+  assert.deepEqual(djNames(t), ['Changed DJ', 'Copy DJ']);
+});
+
+test('identical copies wait only for a live job, and stale fingerprints are replaced', () => {
+  const t = integration();
+  const original = t.upload('FIRST', [sourceRecord({'Name / DJ Alias': 'Wait DJ', 'Email Address': 'wait@example.test'})]);
+  const digest = t.context.marketingDigest_(original.getBlob().getBytes());
+  t.properties['MA_CONTENT_' + digest] = JSON.stringify({fileId: 'DELETED_EARLIER', sheetId: 999});
+  original.failExtraction = true;
+  assert.throws(() => t.context.runMarketingAgent(), /1 report\(s\) failed/);
+  assert.ok(t.properties.MA_JOB_FIRST, 'retryable failure keeps the job');
+  const calls = t.calls.length;
+
+  const copy = t.upload('SECOND', [], 'application/pdf', 'copy.pdf');
+  copy.getBlob = original.getBlob;
+  t.context.runMarketingAgent();
+  assert.equal(t.calls.length, calls, 'a copy waits while the original job is live in the input folder');
+  assert.equal(copy.folder, 'INPUT');
+  assert.equal(t.properties.MA_JOB_SECOND, undefined);
+
+  // The user deletes the stuck original; its leftover job must not hold the copy forever.
+  original.folder = 'TRASH';
+  original.failExtraction = false;
+  assert.equal(t.context.runMarketingAgent().processed, 1);
+  assert.equal(t.calls.length, calls + 1);
+  assert.equal(copy.folder, 'OUTPUT');
+  assert.deepEqual(djNames(t), ['Wait DJ']);
+  assert.equal(JSON.parse(t.properties['MA_CONTENT_' + digest]).fileId, 'SECOND',
+    'a fingerprint pointing to a missing import is replaced');
 });

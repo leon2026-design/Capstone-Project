@@ -147,7 +147,7 @@ providers by changing the property. Each saved section records its provider.
 
 - `openai` (`MarketingExtractionProvider.js`) sends one Responses API request per
   section to `https://api.openai.com/v1/responses` with `store: false`, the
-  original PDF as a base64 `input_file`, the existing extraction rules plus the
+  section's PDF page excerpt (below) as a base64 `input_file`, the existing extraction rules plus the
   page scope as `input_text`, and a strict JSON schema whose fields map one-to-one
   to the existing report headers. Missing values are null and stay blank;
   other recipient-specific fields are kept through `additional_fields`.
@@ -163,8 +163,68 @@ providers by changing the property. Each saved section records its provider.
 - Each request logs model, pages, HTTP status, latency, and input/output/reasoning
   tokens (never content or credentials). Run totals appear in
   `runMarketingAgent()`'s result as `extraction`.
-- Every section sends the whole PDF with a page-scope instruction, so input tokens
-  are billed once per section (about 56,000 for the 19-page Inflyte test report).
+- Each section sends only its own pages plus context: page 1 (campaign-wide
+  fields), the page before (a section heading) and the page after (an entry
+  continued across a page break). The excerpt is a standard PDF incremental update
+  appended to the unchanged original bytes, redefining only the page tree, so no
+  external service or PDF library is needed. The prompt lists which original page
+  each file page is and asks only for entries that begin in the section's original
+  page range. Section page numbers, checkpoints, splitting and provenance are
+  unchanged. Files that cannot be safely excerpted (encrypted, cross-reference
+  streams, nested page trees, or anything unexpected) fall back to the whole PDF
+  with the previous page-scope instruction. For the 19-page Inflyte test report,
+  the five sections send 5–7 pages each (31 pages in total instead of 95). The
+  request size in bytes is unchanged, because the original file is still included;
+  billed input tokens follow the pages the model receives.
+
+## Report sections, warnings and duplicate uploads
+
+- `Report Section` holds the exact heading printed above a recipient's table
+  (for example `Not For Me`, `Checked No Feedback` or a feedback group). It is left
+  blank when the table has no heading of its own. `Campaign Status` holds the row's
+  own status cell verbatim (for example `Listened 3 days ago` or
+  `Downloaded No Feedback`). In the Inflyte report, `Checked No Feedback` is a real
+  heading over a name/status table whose rows each say `Listened …`. Those rows
+  therefore show `Report section: Checked No Feedback`, the verbatim status and
+  `Confirmed listen`.
+- Sometimes a table continues from a page outside a section's excerpt, so its
+  heading is not visible. Its leading rows inherit the previous section's heading
+  only when the row evidence matches: both rows are unrated and their status starts
+  with the same word. Such rows are labelled
+  `Report Section Basis: Table continued from an earlier page`. Unheaded tables
+  following a rated table, such as `Downloaded No Feedback` rows, are not relabelled.
+- Unparsed affiliation/location text is an informational note
+  (`Info: unparsed affiliation/location: …` in Review Notes, counted as `warnings`
+  in the import summary). It does not set `Needs Review`. Field conflicts with an
+  existing contact still do. Contacts imported before this change keep their
+  earlier status.
+- After a report is imported, `MA_CONTENT_<digest>` records the SHA-256 content
+  fingerprint of the original file and its report tab. An identical report
+  uploaded later as a new Drive file is not extracted or imported again. It gets an
+  `IMPORTED` checkpoint with `duplicateOf` pointing to the original file, is moved
+  to the processed folder, and is logged. If identical content is still being
+  extracted from another file that remains in the input folder without a
+  permanently failed section, the copy waits; a deleted, trashed, moved or blocked
+  original does not hold it. A fingerprint whose original checkpoint or report tab
+  no longer exists is replaced by the next import. Any changed byte means a normal new
+  extraction. Reports imported before this change have no fingerprint, so a copy of
+  one is extracted once more; the existing observation keys still prevent duplicate
+  contacts and history.
+
+## Report compatibility
+
+- The Inflyte PDF format has been verified live end to end.
+- Word (`.doc`/`.docx`) reports are converted temporarily through Advanced Drive
+  and keep the original file's identity. This path is covered only by local tests
+  and a fictional Word sample. **Compatibility with Brad's real Word report
+  remains unverified** until a real file is provided and tested. Note that
+  converted Word files are generated PDFs, so the page-excerpt path applies only if
+  they use classic cross-reference tables; otherwise the whole converted PDF is
+  sent.
+- Inflyte's header reported 137 ratings. The source PDF contains exactly 137
+  printed ratings and 137 distinct rated rows. An earlier live run extracted 138
+  rated entries, so the extra row is an extraction error, not a report
+  inconsistency. No valid record is discarded to force the counts to match.
 
 ## Validation
 
@@ -189,6 +249,10 @@ cost totals, idempotent repeats, retryable 503/429/incomplete/invalid-JSON
 responses that keep completed sections, splitting of timed-out or output-limited
 sections in page order without re-requesting completed sections, permanent
 authentication/quota/refusal errors with redaction, and provider configuration.
+Stabilization cases cover page excerpts on a synthetic classic-xref PDF and the
+whole-PDF fallback, `Report Section` labelling and continued tables,
+informational affiliation notes, an identical report uploaded as a new Drive
+file, and copies that wait only for a live original job.
 These tests are **not a live demonstration**.
 
 For actual acceptance, use private copies of Brad's Inflyte PDF and Word report:
