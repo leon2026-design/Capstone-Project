@@ -120,6 +120,9 @@ from PDF/Word contact importing.
   than importing a partial report. Each section attempt costs one Gemini request.
   Provider, Drive, Sheets, and Script Property quotas still apply. No new
   queue/enrichment subsystem is introduced.
+- `UrlFetchApp` errors can include the request URL. `key`, `api_key`, and
+  `access_token` query values are replaced with `[redacted]` before an error is
+  stored in job state, written to `Marketing_Run_Log`, or logged.
 
 ## Validation
 
