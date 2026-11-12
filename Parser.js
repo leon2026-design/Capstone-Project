@@ -367,10 +367,34 @@ const MARKETING_MAX_SECTION_ATTEMPTS = 6;
 const MARKETING_STAGING_SHEET = "MA_Section_Staging";
 const MARKETING_STAGING_HEADERS = ["Job Key", "Section", "Saved At (ms)", "Records", "Data"];
 const MARKETING_STAGING_CHUNK = 40000;
+// The key travels only in the x-goog-api-key header: UrlFetchApp timeout and network
+// errors echo the request URL, so a ?key= query string would leak into logs.
+const MARKETING_GEMINI_URL = String(GEMINI_URL).split("?")[0];
 
+// Dispatches to the configured provider (MarketingExtractionProvider.js); no fallback.
 function marketingRequestSection_(data, range) {
+  const provider = marketingExtractionProvider_();
+  if (provider.name === "openai") return marketingOpenAIRequestSection_(data, range, provider);
   API_CALL_INVENTORY["Gemini"] = (API_CALL_INVENTORY["Gemini"] || 0) + 1;
-  return UrlFetchApp.fetch(GEMINI_URL, {
+  const started = Date.now();
+  let response;
+  try {
+    response = marketingGeminiFetch_(data, range);
+  } catch (error) {
+    marketingRecordExtractionUsage_("Gemini", "", Date.now() - started, null);
+    throw error;
+  }
+  let usage = null;
+  try {
+    const meta = JSON.parse(response.getContentText()).usageMetadata;
+    if (meta) usage = {input: meta.promptTokenCount, output: meta.candidatesTokenCount, reasoning: meta.thoughtsTokenCount};
+  } catch (error) {}
+  marketingRecordExtractionUsage_("Gemini", "", Date.now() - started, usage);
+  return response;
+}
+
+function marketingGeminiFetch_(data, range) {
+  return UrlFetchApp.fetch(MARKETING_GEMINI_URL, {
     method: "post",
     contentType: "application/json",
     headers: { "x-goog-api-key": GEMINI_API_KEY },
@@ -453,28 +477,35 @@ function marketingProcessReport_(file, blobFn, targetFolder, run) {
     const label = file.getName() + " section " + (i + 1) + "/" + job.sections.length;
     let rows;
     const started = Date.now();
+    const provider = marketingExtractionProvider_();
     try {
       const response = marketingRequestSection_(payload, section);
       const code = response.getResponseCode();
       if (code !== 200) {
-        const error = new Error("Gemini HTTP " + code + " for " + label);
+        const error = new Error(provider.label + " HTTP " + code + " for " + label);
         error.permanent = !MARKETING_TRANSIENT_CODES.includes(code);
         throw error;
       }
       rows = marketingCleanReportRecords_(marketingResponseRows_(response, label));
     } catch (error) {
+      if (marketingSplitSection_(run, job, i, error)) {
+        logMarketingFailure_(provider.stage, fileId + "#" + (i + 1), error);
+        i--;
+        continue;
+      }
       // Timeouts, network errors, HTTP 429/5xx and malformed output are retried later.
       outcome.failed++;
       marketingRecordSectionFailure_(run, job, i, error);
-      logMarketingFailure_("GEMINI_SECTION", fileId + "#" + (i + 1), error);
+      logMarketingFailure_(provider.stage, fileId + "#" + (i + 1), error);
       continue;
     }
-    console.log("Saved " + label + ": " + rows.length + " records after " +
+    console.log("Saved " + label + " (" + provider.label + "): " + rows.length + " records after " +
       Math.round((Date.now() - started) / 1000) + " s.");
     marketingWithLock_(() => {
       marketingAssertOwner_(run);
       marketingStageSection_(job, i, Date.now(), rows);
       section.done = true;
+      section.provider = provider.label + (provider.model ? " " + provider.model : "");
       section.error = "";
       marketingSaveJob_(job);
     });
@@ -492,7 +523,9 @@ function marketingProcessReport_(file, blobFn, targetFolder, run) {
       throw new Error("Staged sections " + missing.map(i => i + 1).join(",") +
         " are missing and will be requested again: " + file.getName());
     }
-    const combined = marketingCombineSections_(job.sections.map((_, i) => staged.get(i).rows));
+    // Split halves are appended to the job, so combine in page order rather than index order.
+    const order = job.sections.map((_, i) => i).sort((a, b) => job.sections[a].first - job.sections[b].first);
+    const combined = marketingCombineSections_(order.map(i => staged.get(i).rows));
     if (!combined.length) {
       job.sections.forEach(section => Object.assign(section,
         {done: false, failed: true, error: "No report rows returned"}));
@@ -511,6 +544,31 @@ function marketingProcessReport_(file, blobFn, targetFolder, run) {
 
 function marketingCanRequest_(run) {
   return Date.now() - run.startedAt + MARKETING_GEMINI_TIMEOUT_SECONDS * 1000 <= MARKETING_REQUEST_DEADLINE_MS;
+}
+
+/**
+ * A multi-page section that times out or exceeds the output limit is halved instead
+ * of retried whole: it keeps its first half and the second half is appended, so the
+ * staged indexes of completed sections never shift. Single pages use normal backoff.
+ */
+function marketingSplitSection_(run, job, index, error) {
+  const section = job.sections[index];
+  const message = String(error && error.message || error);
+  if (!(error && error.splittable) && !/\bTimeout\b/i.test(message)) return false;
+  if (section.last === null || section.last <= section.first) return false;
+  const mid = Math.floor((section.first + section.last) / 2);
+  job.sections.push({first: mid + 1, last: section.last, done: false, failed: false,
+    attempts: 0, nextAt: 0, error: "", splitFrom: section.first + "-" + section.last});
+  Object.assign(section, {last: mid, attempts: 0, nextAt: 0,
+    error: marketingRedact_(message).slice(0, 300)});
+  marketingWithLock_(() => {
+    marketingAssertOwner_(run);
+    marketingSaveJob_(job);
+  });
+  console.log("Split pages " + section.first + "-" + job.sections[job.sections.length - 1].last +
+    " of " + job.fileId + " into " + section.first + "-" + mid + " and " + (mid + 1) + "-" +
+    job.sections[job.sections.length - 1].last + " after: " + marketingRedact_(message).slice(0, 120));
+  return true;
 }
 
 function marketingRecordSectionFailure_(run, job, index, error) {

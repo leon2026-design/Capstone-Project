@@ -117,7 +117,7 @@ function setup(extraFiles = []) {
     trackedFetch() { throw Error('Unexpected external API call in local test'); }
   };
   vm.createContext(context);
-  for (const name of new Set(['Constants.js', 'DataExtractor.js', 'ContactMatcher.js', 'Parser.js', 'ContactImporter.js',
+  for (const name of new Set(['Constants.js', 'DataExtractor.js', 'ContactMatcher.js', 'Parser.js', 'MarketingExtractionProvider.js', 'ContactImporter.js',
     'ContactSafeMerge.js', 'DJSocialProfileStore.js', ...extraFiles]))
     vm.runInContext(fs.readFileSync(path.join(ROOT, name), 'utf8'), context, { filename: name });
   function addReport(records, headers = REPORT_HEADERS, id = 111) {

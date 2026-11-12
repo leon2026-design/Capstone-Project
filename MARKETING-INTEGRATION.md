@@ -16,7 +16,10 @@
 
    | Property | Value |
    | --- | --- |
-   | `GEMINI_API_KEY` | Existing Gemini credential; never commit it |
+   | `GEMINI_API_KEY` | Existing Gemini credential; required only when Gemini is the provider; never commit it |
+   | `MARKETING_EXTRACTION_PROVIDER` | Optional: `gemini` (default when unset) or `openai` |
+   | `OPENAI_API_KEY` | OpenAI credential; required only when `openai` is selected; never commit it |
+   | `OPENAI_EXTRACTION_MODEL` | Optional OpenAI model, default `gpt-6-luna` |
    | `PARSER_INPUT_FOLDER` | Private Drive folder for uploaded PDF/Word files |
    | `PARSER_OUTPUT_FOLDER` | Different private folder for successfully processed originals |
    | `SPREADSHEET_DATA_EXTRACTION` | Existing extraction spreadsheet ID |
@@ -83,7 +86,7 @@ from PDF/Word contact importing.
   Other reports continue, and output is refreshed before the run reports failure.
   `Import_Log` remains the observation/identity audit.
 - `MA_REPORT_<Drive ID>` Script Properties checkpoint extracted/imported states.
-  A retry resumes at import or archive without another Gemini call. Deterministic
+  A retry resumes at import or archive without another extraction call. Deterministic
   new Contact IDs also repair a row write interrupted before its audit entry.
   Unchanged observations and history are idempotent.
 - Do not edit imported extraction tabs or overwrite source files in place.
@@ -94,14 +97,14 @@ from PDF/Word contact importing.
   holds a live lease logs a skip and exits. A lease left by a killed execution
   expires and is reclaimed by a later timer. A run that lost its lease cannot save
   results. The script lock is held only for short checkpoint/sheet writes, never
-  during a Gemini request. No destructive merge is automatic. A failed existing-contact update writes a complete row, while
+  during an extraction request. No destructive merge is automatic. A failed existing-contact update writes a complete row, while
   history is saved before its disposable summary. Retries repair incomplete
   history/summary writes from preserved report rows.
 - The current MA-04 store retains its 40,000-character history-cell safety limit
   and one response per contact/report. Conflicting responses within one report
   fail visibly and retain the source for investigation rather than overwriting
   an existing history.
-- Gemini extraction is resumable per section. A report is split into sections of
+- Extraction is resumable per section. A report is split into sections of
   about four pages (at most eight, the last one open-ended), requested one at a
   time with `UrlFetchApp` `timeoutSeconds: 90`. Each validated section is saved
   immediately to the `MA_Section_Staging` tab of the extraction spreadsheet, and
@@ -113,16 +116,55 @@ from PDF/Word contact importing.
   reports continue. Other HTTP errors, or six failed attempts, mark the section
   failed and block only its report. After fixing the cause, run
   `marketingRetryFailedReports()` (it refuses while a run is active).
-- A new Gemini request starts only if it can finish within four minutes of run
+- A multi-page section that times out, or whose OpenAI response stops at
+  `max_output_tokens`, is split instead of backed off: it keeps the first half of
+  its pages and the second half is appended to the job (recorded as `splitFrom`),
+  so completed sections are never requested again and their staged rows keep
+  their positions. The first half is retried in the same run when time allows.
+  Splitting continues down to single pages, which then use normal backoff. At
+  import, sections are combined in page order, and an entry returned by two
+  sections is kept once (the fuller copy).
+- A new extraction request starts only if it can finish within four minutes of run
   start, which reserves time for import and output within Google's six-minute
   limit. The report is imported only after every section is saved and its staged
   rows re-validate. Missing or damaged staged sections are requested again rather
-  than importing a partial report. Each section attempt costs one Gemini request.
+  than importing a partial report. Each section attempt costs one provider request.
   Provider, Drive, Sheets, and Script Property quotas still apply. No new
   queue/enrichment subsystem is introduced.
 - `UrlFetchApp` errors can include the request URL. `key`, `api_key`, and
-  `access_token` query values are replaced with `[redacted]` before an error is
-  stored in job state, written to `Marketing_Run_Log`, or logged.
+  `access_token` query values, `Bearer` tokens, and `sk-` keys are replaced with
+  `[redacted]` before an error is stored in job state, written to
+  `Marketing_Run_Log`, or logged. The Gemini key is sent only in the
+  `x-goog-api-key` header, never in the URL.
+
+## Extraction providers
+
+`MARKETING_EXTRACTION_PROVIDER` selects the provider for every section request
+without a code change. Both providers return the same rows to the same section
+job, staging, importer, MA-04/MA-05 workflow, and actionable output. There is no
+automatic fallback, so each result is attributable to one provider; switch
+providers by changing the property. Each saved section records its provider.
+
+- `openai` (`MarketingExtractionProvider.js`) sends one Responses API request per
+  section to `https://api.openai.com/v1/responses` with `store: false`, the
+  original PDF as a base64 `input_file`, the existing extraction rules plus the
+  page scope as `input_text`, and a strict JSON schema whose fields map one-to-one
+  to the existing report headers. Missing values are null and stay blank;
+  other recipient-specific fields are kept through `additional_fields`.
+- Optional properties: `OPENAI_REASONING_EFFORT` (sent only when set), and
+  `OPENAI_INPUT_USD_PER_1M_TOKENS` plus `OPENAI_OUTPUT_USD_PER_1M_TOKENS` to log a
+  cost estimate. Prices are not hard-coded.
+- Retryable (normal section backoff): HTTP 408/409/5xx, rate-limit 429, network
+  timeout, `incomplete` responses, and invalid or record-less JSON (timeouts and
+  `max_output_tokens` stops on multi-page sections are split as described above). Permanent
+  (section marked failed; fix the cause, then `marketingRetryFailedReports()`):
+  HTTP 400/401/403/404, 429 `insufficient_quota`, refusals, and content-filter
+  stops. Completed sections are never discarded by a provider failure.
+- Each request logs model, pages, HTTP status, latency, and input/output/reasoning
+  tokens (never content or credentials). Run totals appear in
+  `runMarketingAgent()`'s result as `extraction`.
+- Every section sends the whole PDF with a page-scope instruction, so input tokens
+  are billed once per section (about 56,000 for the 19-page Inflyte test report).
 
 ## Validation
 
@@ -141,7 +183,13 @@ Word conversion/provenance, duplicate observations, safe social rules, trigger
 installation, and completed output. Simulated Gemini cases cover slow and timed-out
 sections, HTTP 503 backoff, permanent errors, overlapping timers, killed executions
 with stale leases, late results from a lost lease, corrupted staging, and resuming
-a partially completed report. These tests are **not a live demonstration**.
+a partially completed report. Simulated OpenAI cases cover the request shape,
+schema mapping, low-rating downloaders, favorites without downloads, usage and
+cost totals, idempotent repeats, retryable 503/429/incomplete/invalid-JSON
+responses that keep completed sections, splitting of timed-out or output-limited
+sections in page order without re-requesting completed sections, permanent
+authentication/quota/refusal errors with redaction, and provider configuration.
+These tests are **not a live demonstration**.
 
 For actual acceptance, use private copies of Brad's Inflyte PDF and Word report:
 install the timer, upload, wait for an actual scheduled execution, compare every

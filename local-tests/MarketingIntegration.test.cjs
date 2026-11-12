@@ -44,6 +44,8 @@ function integration() {
     calls.push(id);
     assert.equal(t.isLocked(), false, 'Gemini must never be called while the script lock is held');
     assert.equal(options.timeoutSeconds, 90);
+    assert.doesNotMatch(url, /[?&]key=/, 'the API key must not be part of the request URL');
+    assert.equal(options.headers['x-goog-api-key'], 'LOCAL_ONLY');
     const file = files.find(item => item.getId() === id);
     const [code, rows] = file.respond ? file.respond(scope) :
       file.failExtraction ? [429, []] : [200, scope === '1' ? file.records : []];
@@ -438,13 +440,16 @@ test('slow and timed-out Gemini sections are bounded, saved independently and re
     }
     return [200, [sectionRecord(scope)]];
   };
-  assert.throws(() => t.context.runMarketingAgent(), /1 report\(s\) failed/);
+  // The timed-out pages 4-6 are split (not failed); no time remains to request them this run.
+  assert.equal(t.context.runMarketingAgent().processed, 0);
   // Section 7 was not started: it could still be running when the run must finish.
   assert.deepEqual(attempts, {'1': 1, '4': 1});
   assert.equal(stagedRows(t), 1, 'the successful slow section was saved before the timeout');
   const state = job(t, 'LONG');
-  assert.deepEqual(state.sections.map(section => section.done), [true, false, false]);
-  assert.equal(state.sections[1].attempts, 1);
+  assert.deepEqual(state.sections.map(s => [s.first, s.last, s.done]),
+    [[1, 3, true], [4, 5, false], [7, null, false], [6, 6, false]]);
+  assert.equal(state.sections[3].splitFrom, '4-6');
+  assert.equal(state.sections[1].attempts, 0);
   assert.match(state.sections[1].error, /Timeout: .*key=\[redacted\]/);
   assert.equal(file.folder, 'INPUT');
   assert.deepEqual(t.actionable(), []);
@@ -456,8 +461,8 @@ test('slow and timed-out Gemini sections are bounded, saved independently and re
 
   t.clock.now += 5 * 60 * 1000;
   assert.equal(t.context.runMarketingAgent().processed, 1);
-  assert.deepEqual(attempts, {'1': 1, '4': 2, '7': 1});
-  assert.deepEqual(djNames(t), ['DJ 1', 'DJ 4', 'DJ 7']);
+  assert.deepEqual(attempts, {'1': 1, '4': 2, '6': 1, '7': 1});
+  assert.deepEqual(djNames(t), ['DJ 1', 'DJ 4', 'DJ 6', 'DJ 7']);
   assert.equal(file.folder, 'OUTPUT');
   assert.equal(stagedRows(t), 0);
   assert.equal(t.properties.MA_JOB_LONG, undefined);
@@ -601,4 +606,214 @@ test('a staged section lost before finalization is requested again instead of fi
   assert.deepEqual(t.actionable(), []);
   assert.equal(t.context.runMarketingAgent().processed, 1);
   assert.deepEqual(djNames(t), ['DJ 1', 'DJ 4', 'DJ 7']);
+});
+
+// --- OpenAI Responses provider (MarketingExtractionProvider.js), simulated endpoint ---
+const OPENAI_FIELDS = ['name_dj_alias', 'first_name', 'last_name', 'additional_info_stations', 'radio_station', 'reach',
+  'rating', 'favorite_track', 'comments', 'email_address', 'phone_number', 'social_media_account', 'city',
+  'state_region', 'country', 'music_genre', 'campaign_release', 'report_generated_at', 'campaign_status',
+  'activity_time', 'downloaded', 'downloads', 'listened', 'listens'];
+const OPENAI_KEY = 'sk-test-SECRET1234567890';
+const oaRecord = fields => ({...Object.fromEntries(OPENAI_FIELDS.map(key => [key, null])), additional_fields: [], ...fields});
+const oaOk = records => [200, {status: 'completed', output: [{type: 'reasoning', summary: []},
+  {type: 'message', content: [{type: 'output_text', text: JSON.stringify({records})}]}],
+  usage: {input_tokens: 1000, output_tokens: 200, output_tokens_details: {reasoning_tokens: 50}}}];
+const oaError = (code, kind, message = 'simulated') => [code, {error: {code: kind, type: kind, message}}];
+
+function openAI(respond, properties = {}) {
+  const t = integration();
+  Object.assign(t.properties, {MARKETING_EXTRACTION_PROVIDER: 'openai', OPENAI_API_KEY: OPENAI_KEY}, properties);
+  // Gemini is configured but must never be used while OpenAI is selected.
+  const requests = [];
+  t.context.UrlFetchApp = {fetch: (url, options) => {
+    assert.equal(url, 'https://api.openai.com/v1/responses', 'no automatic fallback to another provider');
+    assert.equal(t.isLocked(), false, 'OpenAI must never be called while the script lock is held');
+    assert.equal(options.timeoutSeconds, 90);
+    assert.equal(options.headers.Authorization, 'Bearer ' + OPENAI_KEY);
+    const body = JSON.parse(options.payload);
+    const [file, prompt] = body.input[0].content;
+    const scope = (prompt.text.match(/PDF page (\d+)/) || [, '1'])[1];
+    const id = Buffer.from(file.file_data.replace('data:application/pdf;base64,', ''), 'base64')
+      .toString().match(/%PDF (\S+)/)[1];
+    requests.push({id, scope, body});
+    const [code, reply] = respond(id, scope, requests.filter(r => r.id === id && r.scope === scope).length);
+    return {getResponseCode: () => code, getContentText: () => typeof reply === 'string' ? reply : JSON.stringify(reply)};
+  }};
+  const runLog = () => JSON.stringify((t.books.DATABASE.getSheetByName('Marketing_Run_Log') || {rows: []}).rows);
+  return {...t, requests, runLog};
+}
+
+test('OpenAI provider extracts through the unchanged workflow with structured output and usage tracking', () => {
+  const t = openAI((id, scope) => {
+    if (scope === '1') return oaOk([oaRecord({name_dj_alias: 'Low Rating DJ', rating: '1', email_address: 'low@example.test',
+      campaign_status: 'Downloaded No Feedback', campaign_release: 'Release A'})]);
+    if (scope === '4') return oaOk([oaRecord({name_dj_alias: 'Fan DJ', rating: '2', comments: 'Love this, full support!',
+      favorite_track: 'Club Remix', social_media_account: 'Instagram @fan.dj', campaign_release: 'Release A',
+      additional_fields: [{field: 'Station Format', value: 'Club'}, {field: 'Comments', value: 'must not overwrite'}]})]);
+    return oaOk([]);
+  }, {OPENAI_INPUT_USD_PER_1M_TOKENS: '1', OPENAI_OUTPUT_USD_PER_1M_TOKENS: '4'});
+  const file = t.upload('OAI', [], 'application/pdf', 'inflyte.pdf', 9);
+  const stats = t.context.runMarketingAgent();
+  assert.equal(stats.processed, 1);
+  assert.deepEqual(t.requests.map(r => r.scope), ['1', '4', '7']);
+  const body = t.requests[0].body;
+  assert.equal(body.model, 'gpt-6-luna', 'default model when OPENAI_EXTRACTION_MODEL is unset');
+  assert.equal(body.store, false);
+  assert.equal(body.reasoning, undefined, 'reasoning effort is sent only when configured');
+  assert.equal(body.input[0].content[0].type, 'input_file');
+  assert.match(body.input[0].content[0].file_data, /^data:application\/pdf;base64,/);
+  assert.equal(body.input[0].content[1].type, 'input_text');
+  assert.match(body.input[0].content[1].text, /Do not infer listening or downloads/);
+  assert.equal(body.text.format.type, 'json_schema');
+  assert.equal(body.text.format.strict, true);
+  const recordSchema = body.text.format.schema.properties.records.items;
+  assert.deepEqual([...recordSchema.required].sort(), [...OPENAI_FIELDS, 'additional_fields'].sort());
+  assert.equal(file.folder, 'OUTPUT');
+
+  const rows = t.actionable();
+  const low = rows.find(row => row['DJ Name'] === 'Low Rating DJ');
+  assert.equal(low['Suggested Follow-Up'], 'THANK_YOU_DOWNLOAD');
+  const fan = rows.find(row => row['DJ Name'] === 'Fan DJ');
+  assert.equal(fan['Favorite Remix'], 'Club Remix');
+  assert.equal(fan['Engagement Status'], 'Written feedback', 'a favorite track is not a download');
+  assert.equal(fan['Suggested Follow-Up'], 'RESPOND_TO_FEEDBACK');
+  assert.equal(fan.Email, '', 'null contact fields stay blank');
+  const report = t.books.SOURCE.sheets.find(sheet => sheet.rows[0] && sheet.rows[0].includes('Station Format'));
+  assert.ok(report, 'report-specific fields are preserved');
+  const fanRow = report.rows.find(row => row.includes('Fan DJ'));
+  assert.equal(fanRow[report.rows[0].indexOf('Comments')], 'Love this, full support!');
+  assert.ok(!JSON.stringify(report.rows).includes('null'));
+
+  assert.deepEqual(JSON.parse(JSON.stringify(stats.extraction.OpenAI)), {model: 'gpt-6-luna', requests: 3, seconds: 0,
+    inputTokens: 3000, outputTokens: 600, reasoningTokens: 150, estimatedUsd: 0.0054});
+  assert.equal(stats.extraction.Gemini, undefined);
+
+  const contacts = t.master.getLastRow();
+  const history = JSON.stringify(t.master.rows);
+  assert.equal(t.context.runMarketingAgent().processed, 0);
+  assert.equal(t.requests.length, 3, 'a processed report is not requested again');
+  assert.equal(t.master.getLastRow(), contacts);
+  assert.equal(JSON.stringify(t.master.rows), history, 'repeat runs do not duplicate contacts or history');
+});
+
+test('retryable OpenAI failures keep completed sections and resume without re-requesting them', () => {
+  const t = openAI((id, scope, attempt) => {
+    if (scope === '1') return oaOk([oaRecord({name_dj_alias: 'DJ 1', email_address: 'dj1@example.test', comments: 'Nice track'})]);
+    if (scope === '4' && attempt === 1) return oaError(503, 'server_error');
+    if (scope === '4' && attempt === 2) return [200, {status: 'failed', error: {code: 'server_error'}, output: []}];
+    if (scope === '7' && attempt === 1) return oaError(429, 'rate_limit_exceeded');
+    if (scope === '7' && attempt === 2) return [200, {status: 'completed', output: [{type: 'message',
+      content: [{type: 'output_text', text: '{"records": [ truncated'}]}]}];
+    return oaOk([oaRecord({name_dj_alias: 'DJ ' + scope, email_address: 'dj' + scope + '@example.test', comments: 'Nice track'})]);
+  });
+  const file = t.upload('RETRY', [], 'application/pdf', 'retry.pdf', 9);
+  assert.throws(() => t.context.runMarketingAgent(), /2 report\(s\) failed/);
+  let state = job(t, 'RETRY');
+  assert.deepEqual(state.sections.map(s => [s.done, s.failed, s.attempts]), [[true, false, 0], [false, false, 1], [false, false, 1]]);
+  assert.equal(state.sections[0].provider, 'OpenAI gpt-6-luna');
+  assert.match(state.sections[1].error, /OpenAI HTTP 503 \(server_error\)/);
+  assert.match(state.sections[2].error, /OpenAI HTTP 429 \(rate_limit_exceeded\)/);
+  assert.match(t.runLog(), /OPENAI_SECTION/);
+  assert.equal(stagedRows(t), 1);
+
+  t.clock.now += 5 * 60 * 1000;
+  assert.throws(() => t.context.runMarketingAgent(), /2 report\(s\) failed/);
+  state = job(t, 'RETRY');
+  assert.match(state.sections[1].error, /OpenAI response failed/);
+  assert.match(state.sections[2].error, /invalid JSON/);
+  assert.deepEqual(state.sections.map(s => s.failed), [false, false, false]);
+
+  t.clock.now += 10 * 60 * 1000;
+  assert.equal(t.context.runMarketingAgent().processed, 1);
+  assert.equal(t.requests.filter(r => r.scope === '1').length, 1, 'the completed section was never requested again');
+  assert.deepEqual(djNames(t), ['DJ 1', 'DJ 4', 'DJ 7']);
+  assert.equal(file.folder, 'OUTPUT');
+});
+
+test('a section that times out or hits the output limit is split in page order without re-requesting completed sections', () => {
+  const t = openAI((id, scope, attempt) => {
+    const rec = (name, email = name.replace(/\W/g, '').toLowerCase() + '@example.test') =>
+      oaRecord({name_dj_alias: name, email_address: email, comments: 'Nice track'});
+    if (scope === '1') return oaOk([rec('DJ 1'), rec('Boundary DJ', null)]);
+    if (scope === '4' && attempt === 1)
+      return [200, {status: 'incomplete', incomplete_details: {reason: 'max_output_tokens'}, output: []}];
+    if ((scope === '4' && attempt === 2) || (scope === '5' && attempt === 1)) {
+      t.clock.now += 90000;
+      throw new Error('Timeout: https://api.openai.com/v1/responses');
+    }
+    if (scope === '4') return oaOk([rec('Boundary DJ'), rec('DJ 4')]);
+    return oaOk([rec('DJ ' + scope)]);
+  });
+  const file = t.upload('SPLIT', [], 'application/pdf', 'split.pdf', 9);
+  // Pages 4-6 -> 4-5 + 6; 4-5 times out -> 4 + 5; single page 5 then times out and backs off.
+  assert.throws(() => t.context.runMarketingAgent(), /1 report\(s\) failed/);
+  let state = job(t, 'SPLIT');
+  assert.deepEqual(state.sections.map(s => [s.first, s.last, s.done, s.attempts]),
+    [[1, 3, true, 0], [4, 4, true, 0], [7, null, true, 0], [6, 6, true, 0], [5, 5, false, 1]]);
+  assert.deepEqual(state.sections.map(s => s.splitFrom), [undefined, undefined, undefined, '4-6', '4-5']);
+  assert.ok(state.sections[4].nextAt > t.clock.now, 'a single page that times out uses normal backoff');
+  assert.match(t.requests.filter(r => r.scope === '4')[2].body.input[0].content[1].text, /page 4 through page 4/);
+  assert.equal(stagedRows(t), 4);
+  assert.equal(file.folder, 'INPUT');
+
+  t.clock.now += 5 * 60 * 1000;
+  assert.equal(t.context.runMarketingAgent().processed, 1);
+  const counts = scope => t.requests.filter(r => r.scope === scope).length;
+  assert.deepEqual(['1', '4', '5', '6', '7'].map(counts), [1, 3, 2, 1, 1], 'completed sections are never requested again');
+  assert.deepEqual(djNames(t), ['Boundary DJ', 'DJ 1', 'DJ 4', 'DJ 5', 'DJ 6', 'DJ 7']);
+  assert.equal(t.actionable().find(row => row['DJ Name'] === 'Boundary DJ').Email, 'boundarydj@example.test',
+    'an entry returned by two sections is kept once, using the fuller copy');
+  const report = t.books.SOURCE.sheets.find(sheet => sheet.rows.some(row => row.includes('DJ 5')));
+  const nameCol = report.rows[0].indexOf('Name / DJ Alias');
+  assert.deepEqual(report.rows.slice(1).map(row => row[nameCol]),
+    ['DJ 1', 'Boundary DJ', 'DJ 4', 'DJ 5', 'DJ 6', 'DJ 7'], 'split halves are combined in page order');
+  assert.equal(file.folder, 'OUTPUT');
+
+  const contacts = JSON.stringify(t.master.rows);
+  assert.equal(t.context.runMarketingAgent().processed, 0);
+  assert.equal(t.requests.length, 8);
+  assert.equal(JSON.stringify(t.master.rows), contacts, 'rerunning does not duplicate contacts or history');
+});
+
+test('authentication, quota and refusal failures are permanent, sanitized and isolated to their report', () => {
+  const t = openAI(id => ({
+    AUTH: oaError(401, 'invalid_api_key', 'Incorrect API key provided: ' + OPENAI_KEY + '. Bearer ' + OPENAI_KEY),
+    QUOTA: oaError(429, 'insufficient_quota', 'You exceeded your current quota.'),
+    REFUSE: [200, {status: 'completed', output: [{type: 'message', content: [{type: 'refusal', refusal: 'I cannot help.'}]}]}],
+    GOOD: oaOk([oaRecord({name_dj_alias: 'Good DJ', email_address: 'good@example.test', campaign_status: 'Downloaded No Feedback'})])
+  })[id]);
+  ['AUTH', 'QUOTA', 'REFUSE', 'GOOD'].forEach(id => t.upload(id, []));
+  assert.throws(() => t.context.runMarketingAgent(), /3 report\(s\) failed/);
+  assert.deepEqual(djNames(t), ['Good DJ']);
+  assert.equal(t.files.find(f => f.getId() === 'GOOD').folder, 'OUTPUT');
+  for (const [id, pattern] of [['AUTH', /HTTP 401 \(invalid_api_key\)/], ['QUOTA', /HTTP 429 \(insufficient_quota\)/],
+    ['REFUSE', /refused extraction/]]) {
+    const section = job(t, id).sections[0];
+    assert.equal(section.failed, true, id + ' is not retried automatically');
+    assert.match(section.error, pattern);
+    assert.equal(t.files.find(f => f.getId() === id).folder, 'INPUT');
+  }
+  assert.match(job(t, 'AUTH').sections[0].error, /sk-\[redacted\]/);
+  assert.doesNotMatch(t.runLog() + JSON.stringify(t.properties).replace(JSON.stringify(OPENAI_KEY), ''),
+    /SECRET1234567890/, 'the OpenAI key never reaches logs or job state');
+  t.clock.now += 2 * 60 * 60 * 1000;
+  const requests = t.requests.length;
+  assert.equal(t.context.runMarketingAgent().processed, 0);
+  assert.equal(t.requests.length, requests, 'permanent failures wait for marketingRetryFailedReports');
+});
+
+test('provider configuration is validated before any request and the model is configurable', () => {
+  const unsupported = openAI(() => { throw Error('no request expected'); }, {MARKETING_EXTRACTION_PROVIDER: 'claude'});
+  unsupported.upload('X', []);
+  assert.throws(() => unsupported.context.runMarketingAgent(), /Unsupported MARKETING_EXTRACTION_PROVIDER 'claude'/);
+  const missing = openAI(() => { throw Error('no request expected'); });
+  delete missing.properties.OPENAI_API_KEY;
+  missing.upload('X', []);
+  assert.throws(() => missing.context.runMarketingAgent(), /Missing Script Property: OPENAI_API_KEY/);
+  const custom = openAI(() => oaOk([oaRecord({name_dj_alias: 'DJ', email_address: 'dj@example.test'})]),
+    {OPENAI_EXTRACTION_MODEL: 'gpt-6-sol', OPENAI_REASONING_EFFORT: 'low'});
+  custom.upload('X', []);
+  assert.equal(custom.context.runMarketingAgent().processed, 1);
+  assert.equal(custom.requests[0].body.model, 'gpt-6-sol');
+  assert.deepEqual(custom.requests[0].body.reasoning, {effort: 'low'});
 });

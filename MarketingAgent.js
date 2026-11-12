@@ -5,9 +5,13 @@ const DJ_ACTIONABLE_HEADERS = [
 ];
 const MARKETING_ERROR_HEADERS = ["Timestamp", "Stage", "Source ID", "Error"];
 
-// UrlFetchApp timeout/network errors include the request URL, which carries the API key.
+// UrlFetchApp timeout/network errors include the request URL, which can carry an API key;
+// provider error bodies can echo keys or Authorization headers.
 function marketingRedact_(text) {
-  return String(text).replace(/([?&](?:key|api_key|access_token)=)[^&\s"']+/gi, "$1[redacted]");
+  return String(text)
+    .replace(/([?&](?:key|api_key|access_token)=)[^&\s"']+/gi, "$1[redacted]")
+    .replace(/\bBearer\s+[^\s"',]+/gi, "Bearer [redacted]")
+    .replace(/\bsk-[A-Za-z0-9_*-]{8,}/g, "sk-[redacted]");
 }
 
 function logMarketingFailure_(stage, sourceId, error) {
@@ -105,9 +109,11 @@ function runMarketingAgent() {
     return {skipped: true};
   }
   resetApiInventory();
+  marketingResetExtractionUsage_();
   try {
     marketingInitialize_();
     const stats = processNewPDFs(run);
+    stats.extraction = MARKETING_EXTRACTION_USAGE;
     marketingWithLock_(() => marketingAssertOwner_(run));
     const props = PropertiesService.getScriptProperties();
     const db = SpreadsheetApp.openById(props.getProperty("CONTACT_DATABASE_SPREADSHEET_ID"));
@@ -133,7 +139,7 @@ function runMarketingAgent() {
 function marketingInitialize_() {
   const props = PropertiesService.getScriptProperties();
   const required = ["PARSER_INPUT_FOLDER", "PARSER_OUTPUT_FOLDER",
-    "SPREADSHEET_DATA_EXTRACTION", "CONTACT_DATABASE_SPREADSHEET_ID", "GEMINI_API_KEY"];
+    "SPREADSHEET_DATA_EXTRACTION", "CONTACT_DATABASE_SPREADSHEET_ID", marketingExtractionProvider_().keyProperty];
   required.forEach(key => {
     if (!trimCellText(props.getProperty(key))) throw new Error("Missing Script Property: " + key);
   });
