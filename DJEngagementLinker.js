@@ -202,9 +202,13 @@ function djEngagementPendingReviews(ss) {
 		}
 
 		const candidate = details.candidate;
+		const reportUrl = djEngagementText(details.pdf);
+		const reportFile = reportUrl.match(/\/d\/([A-Za-z0-9_-]+)/);
 
 		pending.push({
 			observationId: key,
+			sourceReportId: reportFile ? "file:" + reportFile[1] : "",
+			sourceReportUrl: reportUrl,
 			djReportedName: djEngagementText(
 				candidate["Name / DJ Alias"]
 			),
@@ -313,7 +317,14 @@ function djEngagementReadSource(sourceSpreadsheet, logRow, columns, observationK
 		}
 	}
 
-	if (observations.length !== 1) {
+	// Identical source rows are one observation, not an ambiguous identity.
+	const responses = observations.map(found => readCampaignResponse(
+		found.fields, found.row, sourceSpreadsheet.getId(),
+		found.tab.getSheetId(), found.tab.getName(), tabUrl
+	));
+	if (observations.length < 1 || responses.some(response =>
+		campaignResponseContent(response || {}) !== campaignResponseContent(responses[0] || {})
+	)) {
 		throw new Error(
 			"Expected exactly one unchanged source observation: " +
 			observationKey

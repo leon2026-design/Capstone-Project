@@ -82,10 +82,47 @@
             state: importIntegrationText(record.state),
             country: importIntegrationText(record.country),
             "Social Accounts": importIntegrationText(record["Social Accounts"]),
-            sourceUrl: importIntegrationText(record.sourceUrl),
-            sourceReportId: "",
-            sourcePage: "",
-            sourceSection: ""
+            sourceUrl: importIntegrationText(record.sourceReportUrl || record.sourceUrl),
+            sourceReportId: importIntegrationText(record.sourceReportId || record.sourceTab),
+            sourcePage: importIntegrationText(record.sourcePage),
+            sourceSection: importIntegrationText(record.sourceSection)
+        };
+    }
+
+    function importIntegrationReviewResult(record, contacts) {
+        const observation = importIntegrationObservation(record);
+        const resolved = djResolveIdentity(observation, contacts);
+        const candidates = [...resolved.candidates];
+        const candidateIds = new Set(candidates.map(person => person.contactId));
+        const byId = new Set(contacts.map(person => person["Contact ID"]));
+
+        for (const id of importIntegrationText(record.candidateContactIds)
+            .split(",")
+            .map(importIntegrationText)
+            .filter(Boolean)) {
+            if (!byId.has(id) || candidateIds.has(id)) continue;
+            candidates.push({
+                contactId: id,
+                status: "POSSIBLE_MATCH",
+                matchScore: 0,
+                matchingFields: [],
+                conflictingFields: [],
+                safeToAutoLink: false,
+                reason: "PREVIOUS_IMPORT_REVIEW_CANDIDATE"
+            });
+            candidateIds.add(id);
+        }
+
+        const needsReview = candidates.length > 0;
+        return {
+            observation,
+            result: {
+                ...resolved,
+                candidates,
+                decision: needsReview ? "REVIEW" : "UNRESOLVED",
+                status: needsReview ? "POSSIBLE_MATCH" : "NO_MATCH",
+                contactId: null
+            }
         };
     }
 
@@ -93,43 +130,10 @@
     function importIntegrationSyncReviews(database) {
         const pending = djEngagementPendingReviews(database);
         const contacts = importIntegrationContacts(database);
-        const byId = new Map(contacts.map(person => [person["Contact ID"], person]));
         const summary = { observations: pending.length, queued: 0, socialProfiles: 0 };
 
         for (const record of pending) {
-            const observation = importIntegrationObservation(record);
-            const resolved = djResolveIdentity(observation, contacts);
-            const candidates = [...resolved.candidates];
-            const candidateIds = new Set(candidates.map(person => person.contactId));
-
-            //Keep candidates that the existing importer already flagged for review.
-            const previousIds = importIntegrationText(record.candidateContactIds)
-                .split(",")
-                .map(importIntegrationText)
-                .filter(Boolean);
-
-            for (const id of previousIds) {
-                if (!byId.has(id) || candidateIds.has(id)) continue;
-                candidates.push({
-                    contactId: id,
-                    status: "POSSIBLE_MATCH",
-                    matchScore: 0,
-                    matchingFields: [],
-                    conflictingFields: [],
-                    safeToAutoLink: false,
-                    reason: "PREVIOUS_IMPORT_REVIEW_CANDIDATE"
-                });
-                candidateIds.add(id);
-            }
-
-            const needsReview = candidates.length > 0;
-            const result = {
-                ...resolved,
-                candidates,
-                decision: needsReview ? "REVIEW" : "UNRESOLVED",
-                status: needsReview ? "POSSIBLE_MATCH" : "NO_MATCH",
-                contactId: null
-            };
+            const { observation, result } = importIntegrationReviewResult(record, contacts);
 
             //Each writer manages its own lock; never call under ContactImporter lock.
             djIdentitySaveReview(database, observation, result);

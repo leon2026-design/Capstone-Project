@@ -89,7 +89,8 @@ function fixture(options = {}) {
 
         PropertiesService: {
             getScriptProperties: () => ({
-                getProperty: () => ''
+                getProperty: key =>
+                    key === 'SPREADSHEET_DATA_EXTRACTION' ? 'SOURCE' : ''
             })
         },
 
@@ -122,11 +123,13 @@ function fixture(options = {}) {
         }
     });
 
-    vm.runInContext(
-        fs.readFileSync(path.join(ROOT, 'Parser.js'), 'utf8'),
-        context,
-        { filename: 'Parser.js' }
-    );
+    for (const file of ['Constants.js', 'Parser.js']) {
+        vm.runInContext(
+            fs.readFileSync(path.join(ROOT, file), 'utf8'),
+            context,
+            { filename: file }
+        );
+    }
 
     //Run the actual manual entry point from Parser.js.
     //Mock only external importer and MA-05 sync boundaries.

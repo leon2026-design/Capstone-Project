@@ -111,6 +111,10 @@ class Sheet {
                 ));
             },
 
+            getFormulas() {
+                return this.getValues().map(row => row.map(() => ''));
+            },
+
             getNote() {
                 return sheet.notes.get(`${r},${c}`) || '';
             },
@@ -261,6 +265,7 @@ function setup() {
         'Constants.js',
         'DataExtractor.js',
         'ContactMatcher.js',
+        'DJSocialProfileStore.js',
         'ContactImporter.js'
     ]) {
         vm.runInContext(

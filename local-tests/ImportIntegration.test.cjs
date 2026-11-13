@@ -426,6 +426,16 @@ test(
         );
 
         assert.equal(
+            t.records('DJ_Identity_Review')[0]['Source Report ID'],
+            'campaign_report'
+        );
+
+        assert.equal(
+            t.records('DJ_Identity_Review')[0]['Source URL'],
+            'https://docs.google.com/spreadsheets/d/SRC/edit#gid=101'
+        );
+
+        assert.equal(
             t.records('DJ_Identity_Review')[0]['Review Status'],
             'PENDING'
         );

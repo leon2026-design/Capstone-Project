@@ -10,8 +10,9 @@ const ROOT = path.resolve(__dirname, '..');
 function fixture(options = {}) {
     const events = [];
     const errors = [];
-    const sheet = { getSheetId: () => 111 };
+    const sheet = { getSheetId: () => 111, getLastRow: () => 0 };
     const targetFolder = { name: 'processed' };
+    const properties = new Map();
     const file = {
         getName: () => 'report.pdf',
         getId: () => 'PDF-1',
@@ -33,9 +34,20 @@ function fixture(options = {}) {
             error(message) { errors.push(String(message)); }
         },
         PropertiesService: {
-            getScriptProperties: () => ({ getProperty: () => '' })
+            getScriptProperties: () => ({
+                getProperty: key => properties.get(key) || null,
+                setProperty: (key, value) => properties.set(key, value),
+                getKeys: () => [...properties.keys()]
+            })
         },
         SPREADSHEET_DATA_EXTRACTION: 'SOURCE',
+        GEMINI_URL: 'https://example.test/generateContent',
+        LockService: {
+            getScriptLock: () => ({
+                waitLock() {},
+                releaseLock() {}
+            })
+        },
         SpreadsheetApp: {
             openById(id) {
                 assert.equal(id, 'SOURCE');
@@ -75,7 +87,7 @@ function fixture(options = {}) {
     };
     context.appendCampaignReportRows = () => { events.push('append'); };
     context.formatCampaignReportSheet = () => { events.push('format'); };
-    context.importReportContacts = ids => {
+    context.importReportContactsUnlocked_ = ids => {
         assert.equal(ids.length, 1);
         assert.equal(ids[0], 111);
         events.push('MA04');
@@ -87,6 +99,7 @@ function fixture(options = {}) {
         if (options.syncError) throw Error('MA-05 sync failed');
         return { observations: 1 };
     };
+    context.marketingRememberContent_ = () => {};
 
     return {
         context,
