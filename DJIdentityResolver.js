@@ -8,8 +8,36 @@ const DJ_IDENTITY_PLATFORMS = {
 	"m.facebook.com": "FACEBOOK",
 	"soundcloud.com": "SOUNDCLOUD",
 	"mixcloud.com": "MIXCLOUD",
-	"youtube.com": "YOUTUBE"
+	"youtube.com": "YOUTUBE",
+	"tiktok.com": "TIKTOK",
+	"m.tiktok.com": "TIKTOK"
 };
+
+// Instagram paths that are pages, posts or features rather than an account.
+const DJ_IDENTITY_INSTAGRAM_RESERVED = new Set([
+	"p", "reel", "reels", "explore", "stories", "tv", "accounts",
+	"direct", "about", "legal", "developer", "web", "challenge"
+]);
+
+// Reduce a platform URL path to its account path, or "" when it is not a profile.
+function djIdentityAccountPath(platform, path) {
+	const segments = path.split("/").filter(Boolean);
+	if (platform === "TIKTOK") {
+		// tiktok.com/@handle and tiktok.com/@handle/video/<id> both name the account.
+		const handle = (segments[0] || "").match(/^@([a-z0-9._]{2,24})$/i);
+		const tail = segments.slice(1);
+		const valid = handle && (!tail.length ||
+			(tail.length === 2 && /^(?:video|photo)$/i.test(tail[0]) && /^\d+$/.test(tail[1])));
+		return valid ? "/@" + handle[1].toLowerCase() : "";
+	}
+	if (platform === "INSTAGRAM") {
+		return segments.length === 1 &&
+			!DJ_IDENTITY_INSTAGRAM_RESERVED.has(segments[0].toLowerCase())
+			? "/" + segments[0]
+			: "";
+	}
+	return path;
+}
 
 // Convert a value to text.
 function djIdentityText(value) {
@@ -48,7 +76,9 @@ function djIdentityProfile(raw, source) {
 
 	const host = match[1].toLowerCase();
 	const platform = DJ_IDENTITY_PLATFORMS[host];
-	const accountPath = match[2].replace(/\/+$/, "");
+	const accountPath = platform
+		? djIdentityAccountPath(platform, match[2].replace(/\/+$/, ""))
+		: "";
 
 	if (!platform || !accountPath || accountPath === "/") {
 		return null;
@@ -56,7 +86,7 @@ function djIdentityProfile(raw, source) {
 
 	return {
 		platform: platform,
-		profileUrl: "https://" + host + accountPath,
+		profileUrl: "https://" + (platform === "TIKTOK" ? "tiktok.com" : host) + accountPath,
 		verificationStatus: obj.verificationStatus === "VERIFIED"
 			? "VERIFIED"
 			: "PENDING_REVIEW",
@@ -85,6 +115,7 @@ function djIdentityExtractProfiles(identity) {
 	add(identity.instagram, "INSTAGRAM_FIELD");
 	add(identity.facebook, "FACEBOOK_FIELD");
 	add(identity.soundcloud, "SOUNDCLOUD_FIELD");
+	add(identity.tiktok, "TIKTOK_FIELD");
 	add(identity["Social Accounts"], "CONTACT_FIELD");
 	add(identity["Social Media Account"], "REPORT_FIELD");
 

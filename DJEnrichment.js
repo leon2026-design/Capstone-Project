@@ -36,12 +36,12 @@ const DJ_ENRICHMENT_API_USAGE_HEADERS = [
 ];
 
 const DJ_ENRICHMENT_PLATFORMS = [
-	"INSTAGRAM", "FACEBOOK", "SOUNDCLOUD", "MIXCLOUD",
+	"INSTAGRAM", "TIKTOK", "FACEBOOK", "SOUNDCLOUD", "MIXCLOUD",
 	"WEBSITE", "RADIO_DIRECTORY", "BUSINESS_EMAIL"
 ];
 
 const DJ_ENRICHMENT_SOCIAL_PLATFORMS = [
-	"INSTAGRAM", "FACEBOOK", "SOUNDCLOUD", "MIXCLOUD"
+	"INSTAGRAM", "TIKTOK", "FACEBOOK", "SOUNDCLOUD", "MIXCLOUD"
 ];
 
 const DJ_ENRICHMENT_COMMON_SINGLE_NAMES = new Set([
@@ -187,6 +187,17 @@ function djEnrichmentIdentity(target) {
 		country: djEnrichmentText(target.country || target.Country),
 		website: knownWebsite ? djEnrichmentPublicUrl(knownWebsite) || "" : ""
 	};
+	// Only already-known public profile URLs are research hints; emails and phones never are.
+	const publicLinks = [];
+	String(target.socialAccounts || target["Social Accounts"] || "")
+		.split(/[\r\n,]+/).forEach(value => {
+			const profile = djEnrichmentText(value) && djIdentityProfile(value, "CONTACT_FIELD");
+			if (profile && profile.profileUrl.length <= 500 &&
+				!publicLinks.includes(profile.profileUrl) && publicLinks.length < 5) {
+				publicLinks.push(profile.profileUrl);
+			}
+		});
+	if (publicLinks.length) identity.publicLinks = publicLinks;
 	if (uniqueAliases.length > 20 ||
 		uniqueAliases.some(alias => alias.length > 500) ||
 		[identity.station, identity.city, identity.region, identity.country,
@@ -511,7 +522,10 @@ function djEnrichmentValidateTarget(ss, target) {
 				? ""
 				: row[columns["State / Region"]],
 			country: columns.Country == null ? "" : row[columns.Country],
-			website: columns.Website == null ? "" : row[columns.Website]
+			website: columns.Website == null ? "" : row[columns.Website],
+			socialAccounts: columns["Social Accounts"] == null
+				? ""
+				: row[columns["Social Accounts"]]
 		};
 	} else {
 		if (!djEnrichmentObservationExists(ss, observationId)) {
@@ -1722,6 +1736,56 @@ function djEnrichmentReview(ss, enrichmentId, decision, reviewer, notes) {
 	});
 }
 
+function djEnrichmentImportLinks(ss) {
+	const log = ss.getSheetByName("Import_Log");
+	if (!log || log.getLastRow() < 2) return [];
+	const rows = log.getDataRange().getDisplayValues();
+	const columns = djEnrichmentRequireHeaders(
+		rows[0], ["Observation Key", "Outcome", "Contact IDs"], "Import_Log"
+	);
+	return rows.slice(1).map(row => ({
+		observationId: djEnrichmentText(row[columns["Observation Key"]]),
+		outcome: djEnrichmentText(row[columns.Outcome]),
+		contactIds: djEnrichmentText(row[columns["Contact IDs"]])
+	})).filter(item => item.observationId);
+}
+
+/**
+ * Contact ID that the importer linked this observation to under its established rules
+ * ("Created" or "Matched" to exactly one contact), or "" when no such single link exists.
+ */
+function djEnrichmentImportLinkedContact(ss, observationId) {
+	const id = djEnrichmentText(observationId);
+	const rows = djEnrichmentImportLinks(ss).filter(item => item.observationId === id);
+	if (rows.length !== 1 || !["Created", "Matched"].includes(rows[0].outcome) ||
+		!/^[^,\s]+$/.test(rows[0].contactIds)) {
+		return "";
+	}
+	return rows[0].contactIds;
+}
+
+// Real logged import observations safely linked to a contact and never sent to identity review.
+function djEnrichmentImportObservationsForContact(ss, contactId) {
+	const id = djEnrichmentText(contactId);
+	const reviewSheet = ss.getSheetByName("DJ_Identity_Review");
+	const reviewed = new Set();
+	if (reviewSheet && reviewSheet.getLastRow() > 1) {
+		const rows = reviewSheet.getDataRange().getDisplayValues();
+		const column = rows[0].indexOf("Observation ID");
+		if (column < 0) throw new Error("Invalid DJ_Identity_Review headers.");
+		rows.slice(1).forEach(row => reviewed.add(row[column]));
+	}
+	const links = djEnrichmentImportLinks(ss);
+	const counts = new Map();
+	links.forEach(item => counts.set(item.observationId, (counts.get(item.observationId) || 0) + 1));
+	return links
+		.filter(item => !reviewed.has(item.observationId) &&
+			counts.get(item.observationId) === 1 &&
+			["Created", "Matched"].includes(item.outcome) &&
+			item.contactIds === id)
+		.map(item => item.observationId);
+}
+
 function djEnrichmentTransferApproved(ss, enrichmentId, observationId) {
 	const id = djEnrichmentText(enrichmentId);
 	const requestedObservationId = djEnrichmentText(observationId);
@@ -1738,28 +1802,40 @@ function djEnrichmentTransferApproved(ss, enrichmentId, observationId) {
 	}
 
 	const reviewSheet = ss.getSheetByName("DJ_Identity_Review");
-	if (!reviewSheet || reviewSheet.getLastRow() < 2) {
-		throw new Error("An approved MA-05 identity review is required.");
+	const reviewRows = reviewSheet && reviewSheet.getLastRow() > 1
+		? reviewSheet.getDataRange().getDisplayValues()
+		: [];
+	const reviewColumns = reviewRows.length ? djEnrichmentHeaderMap(reviewRows[0]) : {};
+	if (reviewRows.length) {
+		[
+			"Observation ID", "Review Status", "Selected Contact ID"
+		].forEach(header => {
+			if (reviewColumns[header] == null) {
+				throw new Error("Invalid DJ_Identity_Review headers.");
+			}
+		});
 	}
-	const reviewRows = reviewSheet.getDataRange().getDisplayValues();
-	const reviewColumns = djEnrichmentHeaderMap(reviewRows[0]);
-	[
-		"Observation ID", "Review Status", "Selected Contact ID"
-	].forEach(header => {
-		if (reviewColumns[header] == null) {
-			throw new Error("Invalid DJ_Identity_Review headers.");
-		}
-	});
-	const matches = reviewRows.slice(1).filter(row =>
-		row[reviewColumns["Observation ID"]] === requestedObservationId &&
+	const reviewed = reviewRows.slice(1).filter(row =>
+		row[reviewColumns["Observation ID"]] === requestedObservationId
+	);
+	const matches = reviewed.filter(row =>
 		row[reviewColumns["Review Status"]] === "APPROVED_LINK"
 	);
-	if (matches.length !== 1) {
-		throw new Error("Observation must have exactly one approved MA-05 identity review.");
+	let contactId;
+	if (reviewed.length) {
+		if (matches.length !== 1) {
+			throw new Error("Observation must have exactly one approved MA-05 identity review.");
+		}
+		contactId = djEnrichmentText(
+			matches[0][reviewColumns["Selected Contact ID"]]
+		);
+	} else {
+		// Observations never sent to identity review were linked by the importer's safe rules.
+		contactId = djEnrichmentImportLinkedContact(ss, requestedObservationId);
+		if (!contactId) {
+			throw new Error("Observation must have exactly one approved MA-05 identity review or one safe import link.");
+		}
 	}
-	const contactId = djEnrichmentText(
-		matches[0][reviewColumns["Selected Contact ID"]]
-	);
 	if (!contactId ||
 		(record.row[2] && record.row[2] !== contactId) ||
 		(record.row[3] && record.row[3] !== requestedObservationId)) {
