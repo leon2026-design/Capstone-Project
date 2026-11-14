@@ -36,12 +36,12 @@ const DJ_ENRICHMENT_API_USAGE_HEADERS = [
 ];
 
 const DJ_ENRICHMENT_PLATFORMS = [
-	"INSTAGRAM", "TIKTOK", "FACEBOOK", "SOUNDCLOUD", "MIXCLOUD",
+	"INSTAGRAM", "TIKTOK", "FACEBOOK", "X", "YOUTUBE", "SOUNDCLOUD", "MIXCLOUD",
 	"WEBSITE", "RADIO_DIRECTORY", "BUSINESS_EMAIL"
 ];
 
 const DJ_ENRICHMENT_SOCIAL_PLATFORMS = [
-	"INSTAGRAM", "TIKTOK", "FACEBOOK", "SOUNDCLOUD", "MIXCLOUD"
+	"INSTAGRAM", "TIKTOK", "FACEBOOK", "X", "YOUTUBE", "SOUNDCLOUD", "MIXCLOUD"
 ];
 
 const DJ_ENRICHMENT_COMMON_SINGLE_NAMES = new Set([
@@ -743,7 +743,10 @@ function djEnrichmentTrackedFetch(ss, provider, job, apiName, url, options, budg
 	const host = requestUrl.match(/^https:\/\/([^/]+)/i)[1].toLowerCase();
 	const authorizedHosts = (provider.authorizedHosts || [])
 		.map(value => djEnrichmentText(value).toLowerCase());
-	if (!authorizedHosts.includes(host)) {
+	// isAuthorizedHost lets a provider approve, per request, a public page host it observed.
+	if (!authorizedHosts.includes(host) &&
+		!(typeof provider.isAuthorizedHost === "function" &&
+			provider.isAuthorizedHost(host) === true)) {
 		throw new Error("Provider request host is not explicitly authorized: " + host);
 	}
 	if (typeof trackedFetch !== "function") {
@@ -933,7 +936,7 @@ function djEnrichmentCandidateData(candidate) {
 	const data = {};
 	[
 		"displayName", "profileName", "aliases", "station", "city",
-		"region", "country", "professionalActivity", "contactType"
+		"region", "country", "professionalActivity", "contactType", "sourceVerification"
 	].forEach(key => {
 		if (candidate[key] != null) data[key] = candidate[key];
 	});

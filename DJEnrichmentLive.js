@@ -4,8 +4,9 @@
  *
  * Script Properties (in addition to the OpenAI research properties):
  *   CONTACT_DATABASE_SPREADSHEET_ID   required (same contact spreadsheet as the Marketing Agent)
- *   MA06_PLATFORMS                    optional, default "INSTAGRAM,TIKTOK"
+ *   MA06_PLATFORMS                    optional, see DJ_ENRICHMENT_LIVE_DEFAULT_PLATFORMS
  *   MA06_MAX_CONTACTS_PER_RUN         optional, default 3, maximum 10
+ *   MA06_MAX_PAGE_FETCHES             optional, public pages inspected per DJ, default 4 (0-6)
  *   MA06_CONTACT_IDS                  optional comma-separated Contact IDs to restrict research
  *   MA06_TIME_BUDGET_SECONDS          optional, default 210; no new request starts after it
  */
@@ -13,16 +14,25 @@
 const DJ_ENRICHMENT_LIVE_LEASE = "MA06_ENRICHMENT_LEASE";
 // Longer than the 6-minute Apps Script limit, so an expired lease's execution has ended.
 const DJ_ENRICHMENT_LIVE_LEASE_MS = 7 * 60 * 1000;
+const DJ_ENRICHMENT_LIVE_DEFAULT_PLATFORMS = "INSTAGRAM,TIKTOK,FACEBOOK,X,YOUTUBE,MIXCLOUD,SOUNDCLOUD,WEBSITE,RADIO_DIRECTORY,BUSINESS_EMAIL";
 const DJ_ENRICHMENT_RUN_LOG_SHEET = "DJ_Enrichment_Run_Log";
 const DJ_ENRICHMENT_RUN_LOG_HEADERS = [
 	"Run ID", "Started At", "Completed At", "Model", "Jobs Queued", "Jobs Processed",
 	"OpenAI Requests", "Cached Searches", "Web Search Calls", "Seconds",
 	"Input Tokens", "Output Tokens", "Estimated USD", "Outcome", "Details JSON"
 ];
+// One row per live search (not per cached platform job): why a contact did or did not resolve.
+const DJ_ENRICHMENT_DIAGNOSTICS_SHEET = "DJ_Enrichment_Search_Diagnostics";
+const DJ_ENRICHMENT_DIAGNOSTICS_HEADERS = [
+	"Recorded At", "Run ID", "Job ID", "Contact ID", "Outcome", "Queries Planned", "Queries Run",
+	"Sources", "Social Sources", "Identity Pages", "Model Candidates", "Accepted Instagram/TikTok",
+	"Accepted Other Channels", "Page Candidates", "Rejected Reasons", "Pages JSON",
+	"Input Tokens", "Output Tokens", "Seconds", "Error"
+];
 
 function djEnrichmentLiveSettings_(props) {
 	const get = name => djEnrichmentText(props.getProperty(name));
-	const platforms = (get("MA06_PLATFORMS") || "INSTAGRAM,TIKTOK")
+	const platforms = (get("MA06_PLATFORMS") || DJ_ENRICHMENT_LIVE_DEFAULT_PLATFORMS)
 		.split(",").map(value => djEnrichmentText(value).toUpperCase()).filter(Boolean);
 	return {
 		platforms: platforms,
@@ -89,13 +99,29 @@ function runDJEnrichmentLive() {
 			}).jobs.length;
 		}
 		const jobLimit = settings.maxContacts * settings.platforms.length;
+		const pendingJobs = djEnrichmentReadTable(ss, DJ_ENRICHMENT_JOB_SHEET, DJ_ENRICHMENT_JOB_HEADERS)
+			.rows.filter(row => row[5] === "QUEUED");
+		const seenContacts = new Set();
+		const completedJobs = new Set();
 		// A request may take its full timeout, so stop starting new ones well before the 6-minute limit.
-		const budgetMs = Math.min(settings.budgetMs, 330000 - djEnrichmentOpenAIConfig_().timeoutSeconds * 1000);
+		const config = djEnrichmentOpenAIConfig_();
+		// Each inspected page can involve two 20-second fetches (one same-site redirect).
+		const networkReserveMs = (config.timeoutSeconds + config.maxPages * 40) * 1000;
+		const budgetMs = Math.max(0, Math.min(settings.budgetMs, 330000 - networkReserveMs));
+		if (!budgetMs) throw new Error("Research timeout and page-fetch settings leave no safe Apps Script execution budget.");
 		while (summary.processed.length < jobLimit && Date.now() - started < budgetMs) {
+			const next = pendingJobs.find(row => !completedJobs.has(row[0]));
+			if (!next) break;
+			const contact = next[1] || next[2];
+			if (!seenContacts.has(contact) && seenContacts.size >= settings.maxContacts) break;
+			seenContacts.add(contact);
 			const result = djEnrichmentProcessQueued(ss, [provider], {
-				maxProviderRequests: 1, maxApiCallsPerRun: 1, maxAttempts: 3, maxResultsPerProvider: 5
+				maxProviderRequests: 1, maxAttempts: 3, maxResultsPerProvider: 5,
+				// One OpenAI request plus bounded page inspections (each may follow one redirect).
+				maxApiCallsPerRun: 1 + 2 * djEnrichmentOpenAIConfig_().maxPages
 			});
 			if (!result.results.length) break;
+			result.results.forEach(item => completedJobs.add(item.jobId));
 			result.results.forEach(item => summary.processed.push({
 				jobId: item.jobId, status: item.status,
 				error: item.error ? djEnrichmentOpenAIError_(item.error).message.slice(0, 300) : undefined
@@ -126,9 +152,32 @@ function runDJEnrichmentLive() {
 			} catch (logError) {
 				console.error("MA-06 run log unavailable: " + logError.message);
 			}
+			try {
+				djEnrichmentLiveRecordDiagnostics_(ss, summary.runId, provider ? provider.diagnostics : []);
+			} catch (logError) {
+				console.error("MA-06 search diagnostics unavailable: " + logError.message);
+			}
 		}
 		djEnrichmentLiveLease_(lease);
 	}
+}
+
+function djEnrichmentLiveRecordDiagnostics_(ss, runId, diagnostics) {
+	if (!diagnostics || !diagnostics.length) return;
+	const contacts = new Map(djEnrichmentReadTable(ss, DJ_ENRICHMENT_JOB_SHEET, DJ_ENRICHMENT_JOB_HEADERS)
+		.rows.map(row => [row[0], row[1] || row[2]]));
+	const rows = diagnostics.map(item => [
+		djEnrichmentNow(), runId, item.jobId, contacts.get(item.jobId) || "", item.outcome,
+		(item.queriesPlanned || []).join(" | "), (item.queriesRun || []).join(" | "),
+		item.sources || 0, item.socialSources || 0, item.identityPages || 0, item.modelCandidates || 0,
+		item.acceptedPriority || 0, item.acceptedOther || 0, item.pageCandidates || 0,
+		(item.rejected || []).join(","), JSON.stringify(item.pages || []),
+		item.inputTokens || 0, item.outputTokens || 0, item.seconds || 0, item.error || ""
+	]);
+	djEnrichmentLock(() => {
+		const sheet = djEnrichmentEnsureSheet(ss, DJ_ENRICHMENT_DIAGNOSTICS_SHEET, DJ_ENRICHMENT_DIAGNOSTICS_HEADERS);
+		rows.forEach(row => djEnrichmentAppend(sheet, row));
+	});
 }
 
 /**
@@ -165,9 +214,17 @@ function djEnrichmentLiveMetrics(ss) {
 		.rows.filter(row => row[9] === provider);
 	const evidence = djEnrichmentReadTable(ss, DJ_ENRICHMENT_EVIDENCE_SHEET, DJ_ENRICHMENT_EVIDENCE_HEADERS).rows;
 	const strongIds = new Set(evidence.filter(row => row[6] === "STRONG").map(row => row[1]));
-	const calls = djEnrichmentReadTable(ss, DJ_ENRICHMENT_API_USAGE_SHEET, DJ_ENRICHMENT_API_USAGE_HEADERS)
+	const allCalls = djEnrichmentReadTable(ss, DJ_ENRICHMENT_API_USAGE_SHEET, DJ_ENRICHMENT_API_USAGE_HEADERS)
 		.rows.filter(row => row[2] === provider);
+	const calls = allCalls.filter(row => row[4] !== "page.inspect");
+	const pageCalls = allCalls.filter(row => row[4] === "page.inspect");
 	const runs = djEnrichmentReadTable(ss, DJ_ENRICHMENT_RUN_LOG_SHEET, DJ_ENRICHMENT_RUN_LOG_HEADERS).rows;
+	// Latest search outcome per contact (a contact may be searched again after a requeue).
+	const latestOutcome = new Map();
+	djEnrichmentReadTable(ss, DJ_ENRICHMENT_DIAGNOSTICS_SHEET, DJ_ENRICHMENT_DIAGNOSTICS_HEADERS).rows
+		.filter(row => row[3]).forEach(row => latestOutcome.set(row[3], row[4]));
+	const outcomes = {};
+	latestOutcome.forEach(outcome => { outcomes[outcome] = (outcomes[outcome] || 0) + 1; });
 	const contacts = rows => new Set(rows.map(row => row[2] || row[3])).size;
 	const finished = jobs.filter(row => !["QUEUED", "PROCESSING"].includes(row[5]));
 	const live = candidates.filter(row => row[12] !== "REJECTED");
@@ -180,6 +237,12 @@ function djEnrichmentLiveMetrics(ss) {
 		jobsByStatus: byStatus,
 		contactsWithInstagramCandidates: contacts(live.filter(row => row[4] === "INSTAGRAM")),
 		contactsWithTikTokCandidates: contacts(live.filter(row => row[4] === "TIKTOK")),
+		contactsWithFacebookCandidates: contacts(live.filter(row => row[4] === "FACEBOOK")),
+		contactsWithXCandidates: contacts(live.filter(row => row[4] === "X")),
+		contactsWithYouTubeCandidates: contacts(live.filter(row => row[4] === "YOUTUBE")),
+		contactsWithAlternativeChannels: contacts(live.filter(row =>
+			["FACEBOOK", "X", "YOUTUBE", "MIXCLOUD", "SOUNDCLOUD", "WEBSITE", "RADIO_DIRECTORY", "BUSINESS_EMAIL"].includes(row[4]))),
+		searchOutcomesByContact: outcomes,
 		candidates: {
 			total: candidates.length,
 			strongEvidence: candidates.filter(row => strongIds.has(row[0])).length,
@@ -193,6 +256,12 @@ function djEnrichmentLiveMetrics(ss) {
 			strongIds.has(row[0]) || ["PENDING_REVIEW", "APPROVED_FOR_MA05"].includes(row[12]))),
 		apiCalls: calls.length,
 		apiCallOutcomes: calls.reduce((all, row) => { all[row[7]] = (all[row[7]] || 0) + 1; return all; }, {}),
+		pageFetches: pageCalls.length,
+		pageFetchOutcomes: pageCalls.reduce((all, row) => {
+			const key = String(row[7]).split(":")[0];
+			all[key] = (all[key] || 0) + 1;
+			return all;
+		}, {}),
 		averageLatencySeconds: latencies.length
 			? Math.round(latencies.reduce((a, b) => a + b, 0) / latencies.length / 100) / 10 : null,
 		maxLatencySeconds: latencies.length ? Math.round(Math.max(...latencies) / 100) / 10 : null,

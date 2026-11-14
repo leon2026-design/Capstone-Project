@@ -9,6 +9,10 @@ const DJ_IDENTITY_PLATFORMS = {
 	"soundcloud.com": "SOUNDCLOUD",
 	"mixcloud.com": "MIXCLOUD",
 	"youtube.com": "YOUTUBE",
+	"m.youtube.com": "YOUTUBE",
+	"x.com": "X",
+	"twitter.com": "X",
+	"mobile.twitter.com": "X",
 	"tiktok.com": "TIKTOK",
 	"m.tiktok.com": "TIKTOK"
 };
@@ -22,6 +26,32 @@ const DJ_IDENTITY_INSTAGRAM_RESERVED = new Set([
 // Reduce a platform URL path to its account path, or "" when it is not a profile.
 function djIdentityAccountPath(platform, path) {
 	const segments = path.split("/").filter(Boolean);
+	if (platform === "X") {
+		const handle = segments[0] || "";
+		const reserved = /^(home|explore|search|i|intent|share|compose|messages|notifications|settings|login|signup|about|download|tos|privacy)$/i;
+		const tail = segments.slice(1);
+		return /^[a-z0-9_]{1,15}$/i.test(handle) && !reserved.test(handle) &&
+			(!tail.length || (tail.length === 2 && /^status$/i.test(tail[0]) && /^\d+$/.test(tail[1])))
+			? "/" + handle.toLowerCase() : "";
+	}
+	if (platform === "YOUTUBE") {
+		if (segments.length === 1 && /^@[a-z0-9._-]{3,30}$/i.test(segments[0])) {
+			return "/" + segments[0].toLowerCase();
+		}
+		if (segments.length === 2 && /^(channel|c|user)$/i.test(segments[0]) &&
+			/^[a-z0-9_-]+$/i.test(segments[1])) {
+			return "/" + segments[0].toLowerCase() + "/" + segments[1];
+		}
+		return "";
+	}
+	if (platform === "FACEBOOK") {
+		if (segments.length === 1 && /^[a-z0-9.]+$/i.test(segments[0]) &&
+			!/^(share|sharer|sharer\.php|profile\.php|story\.php|photo\.php|permalink\.php|watch|reel|reels|groups|events|gaming|login|dialog|plugins|help|privacy|marketplace)$/i.test(segments[0])) {
+			return "/" + segments[0];
+		}
+		return segments.length === 3 && /^(people|pages)$/i.test(segments[0]) &&
+			/^\d+$/.test(segments[2]) ? "/" + segments.join("/") : "";
+	}
 	if (platform === "TIKTOK") {
 		// tiktok.com/@handle and tiktok.com/@handle/video/<id> both name the account.
 		const handle = (segments[0] || "").match(/^@([a-z0-9._]{2,24})$/i);
@@ -86,7 +116,8 @@ function djIdentityProfile(raw, source) {
 
 	return {
 		platform: platform,
-		profileUrl: "https://" + (platform === "TIKTOK" ? "tiktok.com" : host) + accountPath,
+		profileUrl: "https://" + (platform === "TIKTOK" ? "tiktok.com" :
+			platform === "X" ? "x.com" : platform === "YOUTUBE" ? "youtube.com" : host) + accountPath,
 		verificationStatus: obj.verificationStatus === "VERIFIED"
 			? "VERIFIED"
 			: "PENDING_REVIEW",
@@ -116,6 +147,9 @@ function djIdentityExtractProfiles(identity) {
 	add(identity.facebook, "FACEBOOK_FIELD");
 	add(identity.soundcloud, "SOUNDCLOUD_FIELD");
 	add(identity.tiktok, "TIKTOK_FIELD");
+	add(identity.youtube, "YOUTUBE_FIELD");
+	add(identity.x, "X_FIELD");
+	add(identity.twitter, "TWITTER_FIELD");
 	add(identity["Social Accounts"], "CONTACT_FIELD");
 	add(identity["Social Media Account"], "REPORT_FIELD");
 

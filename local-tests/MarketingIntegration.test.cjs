@@ -166,6 +166,38 @@ test('Word conversion uses the same parser/importer and retains original source 
   assert.equal(row['Suggested Follow-Up'], 'THANK_YOU_DOWNLOAD');
 });
 
+test('verified X, YouTube and Facebook profiles appear in actionable contacts without changing campaign history', () => {
+  const t = integration();
+  t.upload('SOCIAL_CHANNELS', [sourceRecord({'Name / DJ Alias': 'Channel DJ', 'Email Address': 'channels@example.test'})]);
+  t.context.runMarketingAgent();
+  const row = t.actionable()[0];
+  const contactId = row['Contact ID'];
+  const db = t.books.DATABASE;
+  const log = db.getSheetByName('Import_Log');
+  const observationId = log.rows[1][log.rows[0].indexOf('Observation Key')];
+  const history = JSON.stringify(t.history());
+  const profiles = ['https://twitter.com/ChannelDJ', 'https://youtube.com/@ChannelDJ',
+    'https://facebook.com/channeldj', 'https://x.com/unconfirmed_dj']
+    .map(profileUrl => ({profileUrl, evidenceSource: 'https://channels.example/about'}));
+  const ids = t.context.djSocialProfileSave(db, {observationId}, {observationId, socialProfiles: profiles});
+  t.context.marketingRefreshActionable_(db, t.books.SOURCE);
+  assert.equal(t.actionable()[0]['Social Accounts'], '', 'pending profiles must not leak into actionable output');
+  for (const id of ids.slice(0, 3)) {
+    t.context.djSocialProfileReview(db, id, 'VERIFY', contactId, 'reviewer', 'Matched public source and known DJ affiliation.');
+  }
+  t.context.marketingRefreshActionable_(db, t.books.SOURCE);
+  const updated = t.actionable()[0];
+  for (const url of ['https://x.com/channeldj', 'https://youtube.com/@channeldj', 'https://facebook.com/channeldj']) {
+    assert.ok(updated['Social Accounts'].includes(url));
+  }
+  assert.ok(!updated['Social Accounts'].includes('unconfirmed_dj'));
+  assert.equal(updated['Contact Status'], 'VERIFIED');
+  assert.equal(JSON.stringify(t.history()), history);
+  t.context.marketingRefreshActionable_(db, t.books.SOURCE);
+  assert.equal(t.actionable()[0]['Social Accounts'], updated['Social Accounts'], 'refresh is idempotent');
+  assert.equal(t.calls.length, 1, 'social refresh does not re-extract the report');
+});
+
 test('archive failure retries without a second extraction, conversion or contact import', () => {
   const t = integration();
   const file = t.upload('ARCHIVE', [sourceRecord()], 'application/msword', 'legacy.doc');
