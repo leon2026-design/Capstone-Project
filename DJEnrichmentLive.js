@@ -125,10 +125,11 @@ function runDJEnrichmentLive() {
 			result.results.forEach(item => completedJobs.add(item.jobId));
 			result.results.forEach(item => summary.processed.push({
 				jobId: item.jobId, status: item.status,
+				partialDiscovery: item.partialDiscovery || undefined,
 				error: item.error ? djEnrichmentOpenAIError_(item.error).message.slice(0, 300) : undefined
 			}));
 			// A retryable provider error (rate limit, outage, timeout) is retried on a later run.
-			if (result.results.some(item => item.status === "QUEUED")) break;
+			if (result.results.some(item => item.status === "QUEUED" || item.providerRetryableFailure)) break;
 		}
 		summary.remainingQueued = queued();
 		return summary;
@@ -179,7 +180,8 @@ function djEnrichmentLiveRecordDiagnostics_(ss, runId, diagnostics) {
 		item.sources || 0, item.socialSources || 0, item.identityPages || 0, item.modelCandidates || 0,
 		item.acceptedPriority || 0, item.acceptedOther || 0, item.pageCandidates || 0,
 		(item.rejected || []).join(","), JSON.stringify({ pages: item.pages || [],
-			followUp: item.followUp || null, session: item.session || null }),
+			followUp: item.followUp || null, followUpDecision: item.followUpDecision || null,
+			partialDiscovery: item.partialDiscovery || false, session: item.session || null }),
 		item.inputTokens || 0, item.outputTokens || 0, item.seconds || 0, item.error || ""
 	]);
 	djEnrichmentLock(() => {

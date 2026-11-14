@@ -65,6 +65,8 @@ const context = vm.createContext({
 				// Public page GETs (source verification and link inspection).
 				pageRequests.push(url);
 				const html = pages.get(url);
+				if (html && typeof html === "object") return { getResponseCode: () => html.code,
+					getContentText: () => html.html || "", getHeaders: () => html.headers || {} };
 				return { getResponseCode: () => html == null ? 404 : 200, getContentText: () => html || "",
 					getHeaders: () => ({}) };
 			}
@@ -527,12 +529,12 @@ function runFor(ss, prov, platforms = ["INSTAGRAM", "TIKTOK"], options = {}) {
 	assert.equal(second.remainingQueued, 2, "the next contact resumes on a later execution");
 }
 
-// A source failure must not become genuine NOT_FOUND.
+// A completed search with a source failure becomes manual research, not NOT_FOUND or a paid retry.
 {
 	const ss = setup();
 	responses.push({ code: 200, body: searchBody([], { identityPages: [{ url: STATION, kind: "STATION_PAGE", excerpt: "DJ Example" }] }) });
 	const result = runFor(ss, provider(), ["INSTAGRAM"]);
-	assert.equal(result.processed[0].status, "QUEUED");
+	assert.equal(result.processed[0].status, "NEEDS_RESEARCH");
 }
 
 // Recursion happens before a conditional alias search, and does not spend a second request
@@ -572,22 +574,110 @@ for (const resolved of [true, false]) {
 	const result = runFor(ss, provider());
 	assert.equal(requests.length, 2);
 	assert.equal(result.processed[0].status, 'PENDING_REVIEW');
-	assert.equal(result.processed[1].status, 'QUEUED');
+	assert.equal(result.processed[1].status, 'NEEDS_RESEARCH');
 	assert.equal(ss.getSheetByName('DJ_Enrichment_Candidates').rows[1][5], 'https://instagram.com/velvetfox');
 }
 
-// Source-unavailable outcomes terminate after the existing three-attempt limit.
+// Provider-wide outages terminate after the existing three-attempt limit.
 {
 	const ss = setup();
 	const statuses = [];
 	for (let attempt = 0; attempt < 3; attempt++) {
-		responses.push({ code: 200, body: searchBody([], { identityPages: [{ url: STATION, kind: 'STATION_PAGE', excerpt: 'DJ Example' }] }) });
+		responses.push({ code: 503, body: { error: { type: 'server_error' } } });
 		const prov = provider();
 		const result = attempt === 0 ? runFor(ss, prov, ['INSTAGRAM'], { maxAttempts: 3 }) :
 			context.djEnrichmentResume(ss, [prov], { maxAttempts: 3, maxProviderRequests: 1 });
 		statuses.push(attempt === 0 ? result.processed[0].status : result.results[0].status);
 	}
 	assert.deepEqual(statuses, ['QUEUED', 'QUEUED', 'SOURCE_UNAVAILABLE']);
+}
+
+// Successful search + blocked page must checkpoint alternatives and progress to other contacts.
+{
+	const ss = setup();
+	const blocked = 'https://directory.example/dj/dj-example';
+	const alternative = 'https://mixcloud.com/djexample';
+	const unowned = 'https://linktr.ee/velvetfox';
+	pages.set(blocked, { code: 403 });
+	pages.set(unowned, '<h1>Velvet Fox</h1>instagram.com/velvetfox tiktok.com/@velvetfox');
+	for (const suffix of ['002', '003']) {
+		const row = [...ss.getSheetByName('Master_Contacts').rows[1]];
+		row[0] = 'CT-' + suffix; row[1] = 'Synthetic DJ ' + suffix;
+		ss.getSheetByName('Master_Contacts').rows.push(row);
+	}
+	properties.set('MA06_PLATFORMS','INSTAGRAM,TIKTOK,MIXCLOUD');
+	responses.push({ code: 200, body: searchBody([candidate({ platform: 'MIXCLOUD', profile_url: alternative,
+		source_url: alternative, display_name: null, station: null })], {
+		sources: [blocked, alternative, unowned], identityPages: [
+			{ url: blocked, kind: 'OTHER', excerpt: 'DJ Example' },
+			{ url: unowned, kind: 'LINK_PAGE', excerpt: 'Velvet Fox' }]
+	}) });
+	responses.push({ code: 200, body: searchBody([], { sources: [] }) });
+	responses.push({ code: 200, body: searchBody([], { sources: [] }) });
+	const result = context.runDJEnrichmentLive();
+	assert.equal(requests.length, 3, 'one request per contact, not repeated incomplete searches');
+	assert.equal(result.remainingQueued, 0);
+	const stored = ss.getSheetByName('DJ_Enrichment_Candidates').rows.slice(1);
+	assert.ok(stored.some(row => row[2] === 'CT-001' && row[4] === 'MIXCLOUD' && row[5] === alternative));
+	assert.equal(stored.some(row => row[4] === 'INSTAGRAM' || row[4] === 'TIKTOK'), false);
+	assert.deepEqual(plain(context.djSocialProfileGetVerified(ss, 'CT-001')), []);
+	assert.equal(ss.getSheetByName('DJ_Enrichment_Jobs').rows[1][5], 'NEEDS_RESEARCH');
+	const rerun=context.runDJEnrichmentLive();
+	assert.equal(rerun.queued,0);
+	assert.equal(requests.length,3,'completed incomplete sessions are not automatically researched again');
+	assert.equal(ss.getSheetByName('DJ_Enrichment_Candidates').rows.length-1,stored.length);
+}
+
+// One provider invocation checkpoints sibling channels durably before returning.
+{
+	const ss=setup(), source='https://directory.example/dj-example', alternative='https://mixcloud.com/djexample';
+	pages.set(source,{code:403});
+	responses.push({code:200,body:searchBody([candidate({platform:'MIXCLOUD',profile_url:alternative,
+		source_url:alternative,display_name:null,station:null})],{sources:[source,alternative],
+		identityPages:[{url:source,kind:'OTHER',excerpt:'DJ Example'}]})});
+	const prov=context.djEnrichmentCreateOpenAIProvider({platforms:['INSTAGRAM','TIKTOK','MIXCLOUD']});
+	const result=runFor(ss,prov,['INSTAGRAM','TIKTOK','MIXCLOUD'],{maxProviderRequests:1});
+	assert.equal(result.processed.length,3);
+	assert.equal(requests.length,1);
+	assert.equal(ss.getSheetByName('DJ_Enrichment_Candidates').rows[1][4],'MIXCLOUD');
+	const fresh=context.djEnrichmentCreateOpenAIProvider({platforms:['INSTAGRAM','TIKTOK','MIXCLOUD']});
+	assert.equal(context.djEnrichmentResume(ss,[fresh],{}).results.length,0);
+	assert.equal(requests.length,1,'fresh execution/cache loss cannot requeue completed partial jobs');
+}
+
+// Genuine provider-wide rate limiting still defers the queued batch until a later run.
+{
+	const ss=setup();
+	responses.push({code:429,body:{error:{code:'rate_limit_exceeded'}}});
+	const result=context.runDJEnrichmentLive();
+	assert.equal(requests.length,1);
+	assert.deepEqual(plain(result.processed.map(item=>item.status)),['QUEUED']);
+	assert.equal(result.remainingQueued,10);
+}
+
+// A corroborated model-proposed alias can trigger one application follow-up; query text cannot.
+for (const grounded of [true,false]) {
+	const ss=setup(), source='https://artists.example/dj-example';
+	const quote='Velvet Fox is the stage name of DJ Example.';
+	pages.set(source,'<p>DJ Example, Example Radio. '+(grounded?quote:'No alias relationship is published.')+'</p>');
+	responses.push({code:200,body:searchBody([],{sources:[source],identityPages:[{url:source,kind:'WEBSITE',excerpt:quote}]})});
+	if(grounded) responses.push({code:200,body:searchBody([],{sources:[]})});
+	const prov=provider();runFor(ss,prov);
+	assert.equal(requests.length,grounded?2:1);
+	assert.equal(prov.diagnostics[0].followUpDecision,grounded?'GROUNDED_ALIAS_SEARCH':'NO_GROUNDED_IDENTITY_CLUE');
+}
+
+// Exhausting one job's retry limit must not hammer a rate-limited provider on its next platform.
+{
+	const ss=setup();
+	const prov=context.djEnrichmentCreateOpenAIProvider({platforms:['INSTAGRAM','TIKTOK']});
+	context.djEnrichmentQueueTargets(ss,[{contactId:'CT-001'}],[prov],{platforms:['INSTAGRAM','TIKTOK']});
+	ss.getSheetByName('DJ_Enrichment_Jobs').rows[1][6]=2;
+	responses.push({code:429,body:{error:{code:'rate_limit_exceeded'}}});
+	const result=context.runDJEnrichmentLive();
+	assert.equal(requests.length,1);
+	assert.deepEqual(plain(result.processed.map(item=>item.status)),['SOURCE_UNAVAILABLE']);
+	assert.equal(result.remainingQueued,1);
 }
 
 console.log("DJEnrichmentOpenAI tests passed");

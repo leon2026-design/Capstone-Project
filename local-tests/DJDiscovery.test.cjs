@@ -143,3 +143,53 @@ test('candidate evidence cannot combine independent professional identity hypoth
   assert.equal(result.candidates[0].evidence.length, 0);
   assert.ok(result.rejected.includes('EVIDENCE_FROM_COMPETING_HYPOTHESIS'));
 });
+
+function aliasFixture(status = 'FETCHED') {
+  const url='https://artists.example/rory';
+  const quote='Velvet Fox is the stage name of Rory Vale.';
+  const html='Rory Vale on Synthetic FM. ' + quote;
+  const page={url,html,status,comparable:c.djEnrichmentOpenAIComparable_(html),links:new Map()};
+  page.hypothesis=c.djEnrichmentOpenAIHypothesis_(page,{station:'Synthetic FM'},['Rory Vale']);
+  return {url,quote,page,state:{identity:{station:'Synthetic FM'},pages:new Map([[url,page]])}};
+}
+test('model-proposed inverse alias must be quoted on a fetched observed source', () => {
+  const t=aliasFixture();
+  assert.equal(c.djEnrichmentOpenAIModelAliases_({identity_pages:[{url:t.url,excerpt:t.quote}]},[t.url],t.state),1);
+  assert.equal(t.page.hypothesis.aliases[0].value,'Velvet Fox');
+  assert.equal(c.djEnrichmentOpenAIModelAliases_({identity_pages:[{url:t.url,excerpt:t.quote}]},[t.url],t.state),0);
+});
+test('blocked sources, invented quotes and unreturned pages cannot support aliases', () => {
+  for (const mode of ['blocked','invented','unreturned']) {
+    const t=aliasFixture(mode==='blocked'?'HTTP_403':'FETCHED');
+    const quote=mode==='invented'?'Different Alias is the stage name of Rory Vale.':t.quote;
+    assert.equal(c.djEnrichmentOpenAIModelAliases_({identity_pages:[{url:t.url,excerpt:quote}]},mode==='unreturned'?[]:[t.url],t.state),0);
+    assert.equal(t.page.hypothesis.aliases.length,0);
+  }
+});
+test('grounded alias stays within its source hypothesis and does not establish unrelated Linktree ownership', () => {
+  const t=aliasFixture();
+  const other={url:'https://linktr.ee/velvetfox',html:'Velvet Fox',comparable:'velvet fox',status:'FETCHED',links:new Map()};
+  other.hypothesis=c.djEnrichmentOpenAIHypothesis_(other,{},['Rory Vale']);
+  t.state.pages.set(other.url,other);
+  c.djEnrichmentOpenAIModelAliases_({identity_pages:[{url:t.url,excerpt:t.quote}]},[t.url,other.url],t.state);
+  assert.equal(other.hypothesis.aliases.length,0);
+  assert.equal(other.hypothesis.contactMatch,'UNRESOLVED');
+});
+test('alias evidence from another biography section is not pooled', () => {
+  const t=aliasFixture();
+  t.page.html='<h2>Rory Vale</h2>Synthetic FM.<h2>Someone Else</h2>'+t.quote;
+  t.page.sections=c.djEnrichmentOpenAISections_(t.page.html,t.page,{names:['Rory Vale']});
+  assert.equal(c.djEnrichmentOpenAIModelAliases_({identity_pages:[{url:t.url,excerpt:t.quote}]},[t.url],t.state),0);
+});
+test('403 host suppression preserves fetch slots for other grounded sources', () => {
+  const calls=[];
+  const state={identity:{station:'Synthetic FM'},names:['Rory Vale'],pages:new Map(),fetched:0,maxPages:2,
+    allowedHosts:new Set(),session:{maxDepth:0,deadline:Date.now()+300000}};
+  c.djEnrichmentOpenAIExplore_(state,{fetch(api,url){calls.push(url);return {
+    getResponseCode:()=>url.includes('blocked.example')?403:200,
+    getContentText:()=>'<h1>Rory Vale</h1>Synthetic FM',getHeaders:()=>({})
+  };}},['https://blocked.example/one','https://blocked.example/two','https://healthy.example/person']);
+  assert.deepEqual(calls,['https://blocked.example/one','https://healthy.example/person']);
+  assert.equal(state.pages.get('https://blocked.example/two').status,'HOST_UNAVAILABLE');
+  assert.equal(state.pages.get('https://healthy.example/person').status,'FETCHED');
+});

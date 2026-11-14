@@ -1189,6 +1189,42 @@ function djEnrichmentFinishJob(ss, jobId, status, error) {
 	});
 }
 
+// Persist a completed, partially inspected search as bounded per-platform review work.
+// No network calls, new jobs or identity joins are performed here. A crash may resume
+// queued siblings; already-written candidates are reused by existing storage keys.
+function djEnrichmentCheckpointPartialSession(ss, job, provider, session, maxAttempts) {
+	if (!session || !Array.isArray(session.platforms) || !session.platforms.length ||
+		session.platforms.length > 10 || new Set(session.platforms).size !== session.platforms.length ||
+		session.platforms.some(platform => !provider.supportedPlatforms.includes(platform)) ||
+		!Array.isArray(session.candidates) || session.candidates.length > 200) {
+		throw new Error("Provider returned an invalid partial-session checkpoint.");
+	}
+	if (!session.platforms.includes(job[3])) throw new Error("Partial session does not include its claimed job.");
+	const related = djEnrichmentReadTable(ss, DJ_ENRICHMENT_JOB_SHEET, DJ_ENRICHMENT_JOB_HEADERS).rows
+		.filter(row => (row[0] === job[0] || row[5] === "QUEUED") && row[1] === job[1] && row[2] === job[2] &&
+			row[4] === provider.providerId && row[11] === job[11] && session.platforms.includes(row[3]))
+		.slice(0, 10);
+	const results = [];
+	for (const row of related) {
+		if (row[0] !== job[0] && Number(row[6]) >= maxAttempts) continue;
+		const claimed = row[0] === job[0] ? job : djEnrichmentClaimJob(ss, row[0], maxAttempts);
+		const ids = [], rejected = [];
+		for (const candidate of session.candidates.filter(item => item.platform === claimed[3])) {
+			let prepared;
+			try { prepared = djEnrichmentPrepareCandidate(claimed, candidate); }
+			catch (error) { rejected.push(error.message); continue; }
+			ids.push(djEnrichmentPersistPreparedCandidate(ss, claimed, provider.providerId, claimed[10], prepared));
+		}
+		const stored = ids.map(id => djEnrichmentFindCandidate(ss, id)).filter(Boolean);
+		const status = stored.some(item => item.row[12] === "PENDING_REVIEW") ? "PENDING_REVIEW" :
+			stored.some(item => item.row[12] === "CONFLICTING") ? "CONFLICTING" : "NEEDS_RESEARCH";
+		djEnrichmentFinishJob(ss, claimed[0], status, "Completed search; source inspection incomplete. Manual research required for unresolved channels.");
+		results.push({ jobId: claimed[0], status: status, enrichmentIds: [...new Set(ids)],
+			partialDiscovery: true, rejectedCandidates: rejected });
+	}
+	return results;
+}
+
 function djEnrichmentProcessQueued(ss, providers, options) {
 	const providerMap = djEnrichmentProviderMap(providers);
 	const opts = options || {};
@@ -1218,6 +1254,7 @@ function djEnrichmentProcessQueued(ss, providers, options) {
 
 	for (const queued of jobs) {
 		if (requests >= maxRequests) break;
+		if (results.some(result => result.jobId === queued[0])) continue;
 		const jobId = queued[0];
 		const platform = queued[3];
 		const provider = providerMap.get(queued[4]);
@@ -1279,6 +1316,7 @@ function djEnrichmentProcessQueued(ss, providers, options) {
 			results.push({
 				jobId: jobId,
 				status: retry ? "QUEUED" : "SOURCE_UNAVAILABLE",
+				providerRetryableFailure: retryable,
 				error: error && error.message ? error.message : String(error)
 			});
 			continue;
@@ -1294,6 +1332,12 @@ function djEnrichmentProcessQueued(ss, providers, options) {
 				status: "SOURCE_UNAVAILABLE",
 				error: error
 			});
+			continue;
+		}
+		if (response.completedPartialSession) {
+			results.push(...djEnrichmentCheckpointPartialSession(
+				ss, claimed, provider, response.completedPartialSession, maxAttempts
+			));
 			continue;
 		}
 		if (!response.candidates.length) {

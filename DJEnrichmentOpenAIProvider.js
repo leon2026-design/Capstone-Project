@@ -47,7 +47,7 @@ const DJ_ENRICHMENT_OPENAI_BRAND_HANDLES = new Set([
 	"youtube", "twitter", "x", "beatport", "residentadvisor", "instagram", "tiktok", "facebook", "wix",
 	"squarespace", "wordpress", "shopify", "godaddy", "beacons.ai", "hearthis.at", "tunein"
 ]);
-const DJ_ENRICHMENT_OPENAI_CACHE_VERSION = "ma06-search-v4";
+const DJ_ENRICHMENT_OPENAI_CACHE_VERSION = "ma06-search-v5";
 
 function djEnrichmentOpenAIError_(message, retryable) {
 	const text = String(message);
@@ -378,8 +378,14 @@ function djEnrichmentOpenAIFetchPage_(url, state, context) {
 	if (state.pages.has(key)) return state.pages.get(key);
 	const page = { url: djEnrichmentPublicUrl(url), status: "NOT_FETCHED", comparable: "", links: new Map() };
 	const host = djEnrichmentOpenAIHost_(page.url);
+	if (!state.blockedHosts) state.blockedHosts = new Set();
 	if (!page.url || DJ_ENRICHMENT_OPENAI_NO_FETCH.test(host)) {
 		page.status = "SOCIAL_NOT_FETCHED";
+		state.pages.set(key, page);
+		return page;
+	}
+	if (state.blockedHosts.has(host.replace(/^www\./, ""))) {
+		page.status = "HOST_UNAVAILABLE";
 		state.pages.set(key, page);
 		return page;
 	}
@@ -412,7 +418,11 @@ function djEnrichmentOpenAIFetchPage_(url, state, context) {
 				// Only same-site redirects (http to https, www, trailing slash) are followed.
 				if (next && site(next) === site(target)) { target = next; continue; }
 			}
-			if (code !== 200) { page.status = "HTTP_" + code; break; }
+			if (code !== 200) {
+				page.status = "HTTP_" + code;
+				if ([401, 403, 429].includes(code)) state.blockedHosts.add(host.replace(/^www\./, ""));
+				break;
+			}
 			const decoded = djEnrichmentOpenAIDecode_(String(response.getContentText() || "").slice(0, 3000000));
 			page.status = "FETCHED";
 			page.comparable = djEnrichmentOpenAIComparable_(decoded);
@@ -624,7 +634,14 @@ function djEnrichmentOpenAIPagePlan_(parsed, observedUrls, state) {
 	(parsed.identity_pages || []).forEach(page => page && add(page.url));
 	observedUrls.filter(url => djEnrichmentOpenAIControlled_(djEnrichmentPublicUrl(url) || "", state.identity, state.names))
 		.forEach(add);
-	return plan.slice(0, state.maxPages);
+	// Inspect different professional hosts before spending slots on more pages from
+	// the same host. Fetch limits apply to attempts, not the length of this worklist.
+	const hosts = new Set(), first = [], later = [];
+	plan.forEach(url => {
+		const host = djEnrichmentOpenAIHost_(url).replace(/^www\./, "");
+		(hosts.has(host) ? later : first).push(url); hosts.add(host);
+	});
+	return first.concat(later).slice(0, 40);
 }
 
 function djEnrichmentOpenAIRecordUsage_(usage, config, milliseconds, body, searches) {
@@ -657,7 +674,7 @@ function djEnrichmentOpenAIOutcome_(observed, parsed, result, pages) {
 	}
 	if (priority.length) return "AMBIGUOUS";
 	if (pages.some(page => page.status === "BUDGET_EXHAUSTED")) return "BUDGET_EXHAUSTED";
-	if (pages.some(page => /^(HTTP_|PAGE_UNAVAILABLE)/.test(page.status))) return "SOURCE_INSPECTION_INCOMPLETE";
+	if (pages.some(page => /^(HTTP_|PAGE_UNAVAILABLE|HOST_UNAVAILABLE)/.test(page.status))) return "SOURCE_INSPECTION_INCOMPLETE";
 	if (result.rejectedPriority) return "CANDIDATE_REJECTED_BY_GROUNDING";
 	if (identityFound) return "IDENTITY_FOUND_NO_SOCIAL";
 	return "MODEL_NO_CANDIDATES";
@@ -686,6 +703,36 @@ function djEnrichmentOpenAIHypothesis_(page, identity, originalNames) {
 	return { id: djEnrichmentOpenAIUrlKey_(page.url), sourceUrl: page.url, aliases: aliases, names: names,
 		contactMatch: trusted ? "PREVIOUSLY_VERIFIED" : affiliation ? "EXACT_AFFILIATION_SUPPORTED" : "UNRESOLVED",
 		sourceOwnership: page.controlled ? "HEURISTIC_CONTROL_ONLY" : "UNCONFIRMED" };
+}
+
+// Model-discovered aliases remain proposals until a returned, fetched page contains
+// the full relationship quote. A query, slug or co-occurrence is never an alias edge.
+function djEnrichmentOpenAIModelAliases_(parsed, observedUrls, state) {
+	const observed = new Set(observedUrls.map(djEnrichmentOpenAIUrlKey_));
+	const claims = (parsed.identity_pages || []).map(page => ({ source_url: page.url, excerpt: page.excerpt }))
+		.concat((parsed.candidates || []).flatMap(candidate => candidate.evidence || []));
+	let added = 0;
+	for (const claim of claims.slice(0, 100)) {
+		const key = djEnrichmentOpenAIUrlKey_(claim.source_url), page = state.pages.get(key);
+		if (!observed.has(key) || !page || page.status !== "FETCHED" || !page.hypothesis || page.competingHypotheses) continue;
+		const scopes = page.sections ? page.sections.filter(section => section.namesDJ) : [page];
+		if (!scopes.some(scope => djEnrichmentOpenAIPageHas_(scope, claim.excerpt))) continue;
+		const quote = djEnrichmentText(claim.excerpt);
+		// Reuse the existing forward relationship parser on the corroborated quote.
+		const proposed = djEnrichmentOpenAIHypothesis_({ url: page.url, html: quote,
+			comparable: djEnrichmentOpenAIComparable_(quote) }, state.identity, page.hypothesis.names).aliases;
+		// Also recognize the explicit inverse form: "Alias is the stage name of Name".
+		const inverse = quote.match(/^\s*([A-Za-z][A-Za-z .!'-]{2,60}?)\s+is the (?:stage name|professional alias) of\s+([A-Za-z][A-Za-z .!'-]{2,60}?)[.!]?\s*$/i);
+		if (inverse && page.hypothesis.names.some(name => djEnrichmentNormalizeText(name) === djEnrichmentNormalizeText(inverse[2]))) {
+			proposed.push({ value: inverse[1].trim(), sourceUrl: page.url, excerpt: quote.slice(0, 300) });
+		}
+		for (const alias of proposed) {
+			if (page.hypothesis.aliases.length >= 4 || page.hypothesis.names.some(name =>
+				djEnrichmentNormalizeText(name) === djEnrichmentNormalizeText(alias.value))) continue;
+			page.hypothesis.aliases.push(alias); page.hypothesis.names.push(alias.value); added++;
+		}
+	}
+	return added;
 }
 
 function djEnrichmentOpenAIAssess_(candidate, page) {
@@ -860,6 +907,12 @@ function djEnrichmentOpenAISearch_(query, context, config, platforms, usage, dia
 	});
 	djEnrichmentOpenAIExplore_(state, context, [].concat(context.identity.verifiedLinks || [],
 		context.identity.reportLinks || [], djEnrichmentOpenAIPagePlan_(parsed, observed.urls, state)));
+	if (djEnrichmentOpenAIModelAliases_(parsed, observed.urls, state)) {
+		// Reuse already fetched pages and shared budgets; never spread a new alias to
+		// unrelated hypotheses just because another page has a similar handle.
+		djEnrichmentOpenAIExplore_(state, context, [...state.pages.values()]
+			.filter(page => page.status === "FETCHED").map(page => page.url));
+	}
 	const result = djEnrichmentOpenAICandidates_(parsed.candidates, observed.urls, state);
 	const fromPages = djEnrichmentOpenAIPageCandidates_(state, platforms, result.candidates);
 	result.candidates = result.candidates.concat(fromPages);
@@ -882,13 +935,14 @@ function djEnrichmentOpenAISearch_(query, context, config, platforms, usage, dia
 			namesDJ: !!page.namesDJ, controlled: !!page.controlled, socialLinks: page.links.size,
 			hypothesis: page.hypothesis || null }))
 	});
-	return { candidates: result.candidates, outcome: diagnostic.outcome };
+	return { candidates: result.candidates, outcome: diagnostic.outcome,
+		incomplete: pages.some(page => /^(HTTP_|PAGE_UNAVAILABLE|BUDGET_EXHAUSTED|HOST_UNAVAILABLE)/.test(page.status)) };
 }
 
 function djEnrichmentOpenAICacheKey_(identity, platforms, config) {
 	try {
 		const digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256,
-			JSON.stringify([DJ_ENRICHMENT_OPENAI_CACHE_VERSION, identity, platforms, config.model, config.maxPages]),
+			JSON.stringify([DJ_ENRICHMENT_OPENAI_CACHE_VERSION, identity, platforms, config.model, config.effort, config.maxPages]),
 			Utilities.Charset.UTF_8);
 		return "MA06S:" + Utilities.base64EncodeWebSafe(digest);
 	} catch (_) {
@@ -962,6 +1016,8 @@ function djEnrichmentCreateOpenAIProvider(options) {
 						!page.competingHypotheses && page.hypothesis.contactMatch !== "UNRESOLVED")
 						.flatMap(page => page.hypothesis.aliases).filter(clue => !djEnrichmentOpenAINames_(context.identity)
 							.some(name => djEnrichmentNormalizeText(name) === djEnrichmentNormalizeText(clue.value)));
+					diagnostic.followUpDecision = !missing.length ? "PRIORITIES_RESOLVED" :
+						!clues.length ? "NO_GROUNDED_IDENTITY_CLUE" : "SESSION_BUDGET";
 					if (missing.length && clues.length && research.session.requests < config.maxRequests &&
 						research.session.searches < config.maxSearches && research.session.tokens < config.maxTokens &&
 						Date.now() + config.timeoutSeconds * 1000 < research.session.deadline) {
@@ -970,17 +1026,21 @@ function djEnrichmentCreateOpenAIProvider(options) {
 						const follow = Object.assign({}, research, { identity: Object.assign({}, context.identity,
 							{ aliases: [clue.value] }) });
 						const followDiagnostic = { jobId: context.jobId, outcome: "SEARCH_FAILED" };
+						diagnostic.followUpDecision = "GROUNDED_ALIAS_SEARCH";
 						try {
 							const more = djEnrichmentOpenAISearch_('"' + clue.value + '" ' + missing.join(" "),
 								follow, config, platforms, usage, followDiagnostic);
 							result.candidates = result.candidates.concat(more.candidates);
+							result.incomplete = result.incomplete || more.incomplete;
 						} catch (error) {
 							followDiagnostic.error = djEnrichmentOpenAIError_(error.message).message.slice(0, 300);
 							result.outcome = "SOURCE_INSPECTION_INCOMPLETE";
+							result.incomplete = true;
 						}
 						diagnostic.followUp = followDiagnostic;
 					}
 					diagnostic.session = research.session;
+					diagnostic.partialDiscovery = !!result.incomplete;
 				} catch (error) {
 					diagnostic.error = djEnrichmentOpenAIError_(error && error.message || error).message.slice(0, 300);
 					throw error;
@@ -988,18 +1048,21 @@ function djEnrichmentCreateOpenAIProvider(options) {
 					diagnostic.seconds = Math.round((Date.now() - started) / 100) / 10;
 					console.log("MA-06 search outcome job " + context.jobId + ": " + diagnostic.outcome);
 				}
-				if (!opts.disableCache && scriptCache && cacheKey && !/INCOMPLETE|EXHAUSTED/.test(result.outcome)) {
+				if (!opts.disableCache && scriptCache && cacheKey) {
 					try { scriptCache.put(cacheKey, JSON.stringify(result), 21600); } catch (_) {}
 				}
 			}
 			cache.set(identityKey, result);
-			const platformCandidates = result.candidates.filter(candidate => candidate.platform === context.platform);
-			if (!platformCandidates.length && /INCOMPLETE|EXHAUSTED/.test(result.outcome)) {
-				throw djEnrichmentOpenAIError_(result.outcome, true);
-			}
 			return { candidates: result.candidates
 				.filter(candidate => candidate.platform === context.platform)
-				.slice(0, context.maxResults || 10) };
+				.slice(0, context.maxResults || 10),
+				// Completed searches with inaccessible pages are not provider-wide failures.
+				// Checkpoint the session into its matching queued jobs before yielding.
+				completedPartialSession: result.incomplete ? {
+					platforms: platforms, outcome: result.outcome,
+					candidates: platforms.flatMap(platform => result.candidates
+						.filter(candidate => candidate.platform === platform).slice(0, context.maxResults || 10))
+				} : undefined };
 		}
 	};
 }
