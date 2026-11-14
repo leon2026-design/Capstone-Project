@@ -198,6 +198,9 @@ function djEnrichmentIdentity(target) {
 			}
 		});
 	if (publicLinks.length) identity.publicLinks = publicLinks;
+	["verifiedLinks", "reportLinks"].forEach(key => {
+		if (Array.isArray(target[key])) identity[key] = target[key].map(djEnrichmentPublicUrl).filter(Boolean).slice(0, 5);
+	});
 	if (uniqueAliases.length > 20 ||
 		uniqueAliases.some(alias => alias.length > 500) ||
 		[identity.station, identity.city, identity.region, identity.country,
@@ -451,7 +454,8 @@ function djEnrichmentObservationIdentity(ss, observationId) {
 				city: candidate.City,
 				region: candidate["State / Region"],
 				country: candidate.Country,
-				website: candidate.Website
+				website: candidate.Website,
+				reportLinks: djIdentityExtractProfiles(candidate).map(profile => profile.profileUrl)
 			};
 		}
 	}
@@ -527,6 +531,20 @@ function djEnrichmentValidateTarget(ss, target) {
 				? ""
 				: row[columns["Social Accounts"]]
 		};
+		identitySource.verifiedLinks = djSocialProfileGetVerified(ss, contactId).map(profile => profile.profileUrl);
+		identitySource.reportLinks = [];
+		// Use only original observations safely linked to this contact; never name-based joins.
+		const importSheet = ss.getSheetByName("Import_Log");
+		if (importSheet && importSheet.getLastRow() > 1) {
+			const imported = importSheet.getDataRange().getDisplayValues();
+			const map = djEnrichmentHeaderMap(imported[0]);
+			imported.slice(1).forEach(record => {
+				if (!["Created", "Matched"].includes(record[map.Outcome]) || record[map["Contact IDs"]] !== contactId) return;
+				let detail;
+				try { detail = JSON.parse(record[map.Details]); } catch (_) { return; }
+				if (detail && detail.candidate) identitySource.reportLinks.push(...djIdentityExtractProfiles(detail.candidate).map(profile => profile.profileUrl));
+			});
+		}
 	} else {
 		if (!djEnrichmentObservationExists(ss, observationId)) {
 			throw new Error("Observation ID is not present in MA-05 review or import records.");
@@ -936,7 +954,8 @@ function djEnrichmentCandidateData(candidate) {
 	const data = {};
 	[
 		"displayName", "profileName", "aliases", "station", "city",
-		"region", "country", "professionalActivity", "contactType", "sourceVerification"
+		"region", "country", "professionalActivity", "contactType", "sourceVerification",
+		"hypothesisId", "identityEvidence", "assessments", "channelRole"
 	].forEach(key => {
 		if (candidate[key] != null) data[key] = candidate[key];
 	});
@@ -1015,7 +1034,7 @@ function djEnrichmentPrepareCandidate(job, candidate) {
 	);
 	const candidateKey = [
 		job[0], platform, candidateUrl.toLowerCase(), candidateValue.toLowerCase()
-	].join("|");
+	].join("|") + djEnrichmentHypothesisKey_(djEnrichmentCandidateData(candidate));
 	return {
 		platform: platform,
 		candidateUrl: candidateUrl,
@@ -1026,6 +1045,16 @@ function djEnrichmentPrepareCandidate(job, candidate) {
 		candidateKey: candidateKey,
 		candidateData: djEnrichmentCandidateData(candidate)
 	};
+}
+
+function djEnrichmentHypothesisKey_(data) {
+	return data && data.hypothesisId ? "|" + data.hypothesisId : "";
+}
+
+function djEnrichmentStoredHypothesisKey_(row) {
+	let data;
+	try { data = JSON.parse(row[15] || "{}"); } catch (_) { throw new Error("Invalid enrichment candidate metadata."); }
+	return djEnrichmentHypothesisKey_(data);
 }
 
 function djEnrichmentPersistPreparedCandidate(ss, job, providerId, query, prepared) {
@@ -1044,14 +1073,14 @@ function djEnrichmentPersistPreparedCandidate(ss, job, providerId, query, prepar
 				djEnrichmentText(row[1]), djEnrichmentText(row[4]),
 				djEnrichmentText(row[5]).toLowerCase(),
 				djEnrichmentText(row[6]).toLowerCase()
-			].join("|") === prepared.candidateKey
+			].join("|") + djEnrichmentStoredHypothesisKey_(row) === prepared.candidateKey
 		);
 		const duplicateCandidates = existingTable.rows.filter(row =>
 			[
 				djEnrichmentText(row[1]), djEnrichmentText(row[4]),
 				djEnrichmentText(row[5]).toLowerCase(),
 				djEnrichmentText(row[6]).toLowerCase()
-			].join("|") === prepared.candidateKey
+			].join("|") + djEnrichmentStoredHypothesisKey_(row) === prepared.candidateKey
 		);
 		if (duplicateCandidates.length > 1) {
 			throw new Error("Duplicate enrichment candidate record.");

@@ -462,7 +462,7 @@ function runFor(ss, prov, platforms = ["INSTAGRAM", "TIKTOK"], options = {}) {
 {
 	const ss = setup();
 	properties.set("MA06_MAX_CONTACTS_PER_RUN", "1");
-	responses.push({ code: 200, body: searchBody([]) });
+	responses.push({ code: 200, body: searchBody([], { sources: [] }) });
 	const summary = context.runDJEnrichmentLive();
 	assert.equal(summary.queued, 10, "social, professional and business email channels by default");
 	assert.deepEqual(plain(summary.processed.map(item => item.status)), Array(10).fill("NOT_FOUND"));
@@ -493,7 +493,7 @@ function runFor(ss, prov, platforms = ["INSTAGRAM", "TIKTOK"], options = {}) {
 	assert.equal(metrics.jobsByStatus.NOT_FOUND, 9);
 	const diagnostics = ss.getSheetByName("DJ_Enrichment_Search_Diagnostics").rows.slice(1);
 	assert.deepEqual(diagnostics.map(row => [row[3], row[4]]),
-		[["CT-001", "MODEL_NO_CANDIDATES"], ["CT-001", "SEARCH_FAILED"]],
+		[["CT-001", "NO_SEARCH_RESULTS"], ["CT-001", "SEARCH_FAILED"]],
 		"one diagnostic per live search, not per cached platform job");
 	assert.deepEqual(plain(metrics.searchOutcomesByContact), { SEARCH_FAILED: 1 });
 }
@@ -516,15 +516,78 @@ function runFor(ss, prov, platforms = ["INSTAGRAM", "TIKTOK"], options = {}) {
 	context.djEnrichmentQueueTargets(ss, master.rows.slice(1).map(row => ({ contactId: row[0] })), [prov],
 		{ platforms: oldPlatforms, maxCandidatesPerRun: 100 });
 	ss.getSheetByName("DJ_Enrichment_Jobs").rows.slice(1).forEach(row => { row[5] = "NOT_FOUND"; });
-	responses.push({ code: 200, body: searchBody([]) });
+	responses.push({ code: 200, body: searchBody([], { sources: [] }) });
 	const first = context.runDJEnrichmentLive();
 	assert.equal(requests.length, 1, "only one identity may be searched even when each needs only two new channels");
 	assert.equal(first.processed.length, 2);
 	assert.equal(first.remainingQueued, 4);
-	responses.push({ code: 200, body: searchBody([]) });
+	responses.push({ code: 200, body: searchBody([], { sources: [] }) });
 	const second = context.runDJEnrichmentLive();
 	assert.equal(requests.length, 2);
 	assert.equal(second.remainingQueued, 2, "the next contact resumes on a later execution");
+}
+
+// A source failure must not become genuine NOT_FOUND.
+{
+	const ss = setup();
+	responses.push({ code: 200, body: searchBody([], { identityPages: [{ url: STATION, kind: "STATION_PAGE", excerpt: "DJ Example" }] }) });
+	const result = runFor(ss, provider(), ["INSTAGRAM"]);
+	assert.equal(result.processed[0].status, "QUEUED");
+}
+
+// Recursion happens before a conditional alias search, and does not spend a second request
+// when both priority channels are already attributed on the linked professional page.
+for (const resolved of [true, false]) {
+	const ss = setup();
+	const source = 'https://artists.example/dj-example';
+	const links = 'https://links.example/velvetfox';
+	pages.set(source, 'DJ Example also known as Velvet Fox, Example Radio. <a href="' + links + '">Website</a>');
+	pages.set(links, 'Velvet Fox Example Radio instagram.com/velvetfox' + (resolved ? ' tiktok.com/@velvetfox' : ''));
+	responses.push({ code: 200, body: searchBody([], { sources: [source], identityPages: [{ url: source, kind: 'WEBSITE', excerpt: 'DJ Example' }] }) });
+	if (!resolved) responses.push({ code: 200, body: searchBody([], { sources: [] }) });
+	const prov = provider();
+	runFor(ss, prov);
+	assert.equal(requests.length, resolved ? 1 : 2);
+	assert.ok(pageRequests.includes(links));
+	if (!resolved) assert.ok(requests[1].body.input.includes('Velvet Fox'));
+}
+
+// Observed token exhaustion suppresses a follow-up despite a credible alias clue.
+{
+	const ss = setup();
+	pages.set(STATION, 'DJ Example also known as Velvet Fox, Example Radio. instagram.com/velvetfox');
+	const body = searchBody([], { sources: [STATION], identityPages: [{ url: STATION, kind: 'STATION_PAGE', excerpt: 'DJ Example' }] });
+	body.usage.input_tokens = 60000;
+	responses.push({ code: 200, body });
+	runFor(ss, provider());
+	assert.equal(requests.length, 1);
+}
+
+// A failed optional second request preserves useful first-stage candidates.
+{
+	const ss = setup();
+	pages.set(STATION, 'DJ Example also known as Velvet Fox, Example Radio. instagram.com/velvetfox');
+	responses.push({ code: 200, body: searchBody([], { sources: [STATION], identityPages: [{ url: STATION, kind: 'STATION_PAGE', excerpt: 'DJ Example' }] }) });
+	responses.push({ code: 503, body: { error: { type: 'server_error' } } });
+	const result = runFor(ss, provider());
+	assert.equal(requests.length, 2);
+	assert.equal(result.processed[0].status, 'PENDING_REVIEW');
+	assert.equal(result.processed[1].status, 'QUEUED');
+	assert.equal(ss.getSheetByName('DJ_Enrichment_Candidates').rows[1][5], 'https://instagram.com/velvetfox');
+}
+
+// Source-unavailable outcomes terminate after the existing three-attempt limit.
+{
+	const ss = setup();
+	const statuses = [];
+	for (let attempt = 0; attempt < 3; attempt++) {
+		responses.push({ code: 200, body: searchBody([], { identityPages: [{ url: STATION, kind: 'STATION_PAGE', excerpt: 'DJ Example' }] }) });
+		const prov = provider();
+		const result = attempt === 0 ? runFor(ss, prov, ['INSTAGRAM'], { maxAttempts: 3 }) :
+			context.djEnrichmentResume(ss, [prov], { maxAttempts: 3, maxProviderRequests: 1 });
+		statuses.push(attempt === 0 ? result.processed[0].status : result.results[0].status);
+	}
+	assert.deepEqual(statuses, ['QUEUED', 'QUEUED', 'SOURCE_UNAVAILABLE']);
 }
 
 console.log("DJEnrichmentOpenAI tests passed");

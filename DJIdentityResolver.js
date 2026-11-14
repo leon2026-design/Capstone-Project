@@ -26,6 +26,10 @@ const DJ_IDENTITY_INSTAGRAM_RESERVED = new Set([
 // Reduce a platform URL path to its account path, or "" when it is not a profile.
 function djIdentityAccountPath(platform, path) {
 	const segments = path.split("/").filter(Boolean);
+	if (platform === "MIXCLOUD" || platform === "SOUNDCLOUD") {
+		const reserved = /^(discover|search|charts|upload|you|pages|terms|privacy|stations|tags)$/i;
+		return segments[0] && !reserved.test(segments[0]) ? "/" + segments[0] : "";
+	}
 	if (platform === "X") {
 		const handle = segments[0] || "";
 		const reserved = /^(home|explore|search|i|intent|share|compose|messages|notifications|settings|login|signup|about|download|tos|privacy)$/i;

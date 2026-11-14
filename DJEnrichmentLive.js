@@ -80,7 +80,8 @@ function runDJEnrichmentLive() {
 	try {
 		ss = SpreadsheetApp.openById(djEnrichmentText(props.getProperty("CONTACT_DATABASE_SPREADSHEET_ID")));
 		const settings = djEnrichmentLiveSettings_(props);
-		provider = djEnrichmentCreateOpenAIProvider({ platforms: settings.platforms });
+		const researchDeadline = djEnrichmentLiveResearchDeadline_(started, settings.budgetMs);
+		provider = djEnrichmentCreateOpenAIProvider({ platforms: settings.platforms, deadline: researchDeadline });
 		// With the lease held, PROCESSING jobs belong to an execution that already ended.
 		djEnrichmentResume(ss, [provider], { maxProviderRequests: 0 });
 		const queued = () => djEnrichmentReadTable(ss, DJ_ENRICHMENT_JOB_SHEET, DJ_ENRICHMENT_JOB_HEADERS)
@@ -106,8 +107,8 @@ function runDJEnrichmentLive() {
 		// A request may take its full timeout, so stop starting new ones well before the 6-minute limit.
 		const config = djEnrichmentOpenAIConfig_();
 		// Each inspected page can involve two 20-second fetches (one same-site redirect).
-		const networkReserveMs = (config.timeoutSeconds + config.maxPages * 40) * 1000;
-		const budgetMs = Math.max(0, Math.min(settings.budgetMs, 330000 - networkReserveMs));
+		const networkReserveMs = config.timeoutSeconds * 1000;
+		const budgetMs = Math.max(0, researchDeadline - started - networkReserveMs);
 		if (!budgetMs) throw new Error("Research timeout and page-fetch settings leave no safe Apps Script execution budget.");
 		while (summary.processed.length < jobLimit && Date.now() - started < budgetMs) {
 			const next = pendingJobs.find(row => !completedJobs.has(row[0]));
@@ -117,8 +118,8 @@ function runDJEnrichmentLive() {
 			seenContacts.add(contact);
 			const result = djEnrichmentProcessQueued(ss, [provider], {
 				maxProviderRequests: 1, maxAttempts: 3, maxResultsPerProvider: 5,
-				// One OpenAI request plus bounded page inspections (each may follow one redirect).
-				maxApiCallsPerRun: 1 + 2 * djEnrichmentOpenAIConfig_().maxPages
+				// At most two OpenAI requests plus bounded page inspections.
+				maxApiCallsPerRun: 2 + 2 * djEnrichmentOpenAIConfig_().maxPages
 			});
 			if (!result.results.length) break;
 			result.results.forEach(item => completedJobs.add(item.jobId));
@@ -162,6 +163,12 @@ function runDJEnrichmentLive() {
 	}
 }
 
+function djEnrichmentLiveResearchDeadline_(started, budgetMs) {
+	// Finish network activity before persistence, logs and lease cleanup. Also leave
+	// 30 seconds beyond the largest configurable budget before Google's 6-minute limit.
+	return started + Math.min(budgetMs, 330000) - 30000;
+}
+
 function djEnrichmentLiveRecordDiagnostics_(ss, runId, diagnostics) {
 	if (!diagnostics || !diagnostics.length) return;
 	const contacts = new Map(djEnrichmentReadTable(ss, DJ_ENRICHMENT_JOB_SHEET, DJ_ENRICHMENT_JOB_HEADERS)
@@ -171,7 +178,8 @@ function djEnrichmentLiveRecordDiagnostics_(ss, runId, diagnostics) {
 		(item.queriesPlanned || []).join(" | "), (item.queriesRun || []).join(" | "),
 		item.sources || 0, item.socialSources || 0, item.identityPages || 0, item.modelCandidates || 0,
 		item.acceptedPriority || 0, item.acceptedOther || 0, item.pageCandidates || 0,
-		(item.rejected || []).join(","), JSON.stringify(item.pages || []),
+		(item.rejected || []).join(","), JSON.stringify({ pages: item.pages || [],
+			followUp: item.followUp || null, session: item.session || null }),
 		item.inputTokens || 0, item.outputTokens || 0, item.seconds || 0, item.error || ""
 	]);
 	djEnrichmentLock(() => {
@@ -241,7 +249,8 @@ function djEnrichmentLiveMetrics(ss) {
 		contactsWithXCandidates: contacts(live.filter(row => row[4] === "X")),
 		contactsWithYouTubeCandidates: contacts(live.filter(row => row[4] === "YOUTUBE")),
 		contactsWithAlternativeChannels: contacts(live.filter(row =>
-			["FACEBOOK", "X", "YOUTUBE", "MIXCLOUD", "SOUNDCLOUD", "WEBSITE", "RADIO_DIRECTORY", "BUSINESS_EMAIL"].includes(row[4]))),
+			["FACEBOOK", "X", "YOUTUBE", "MIXCLOUD", "SOUNDCLOUD", "WEBSITE", "BUSINESS_EMAIL"].includes(row[4]))),
+		contactsWithIdentityDirectories: contacts(live.filter(row => row[4] === "RADIO_DIRECTORY")),
 		searchOutcomesByContact: outcomes,
 		candidates: {
 			total: candidates.length,
@@ -269,5 +278,34 @@ function djEnrichmentLiveMetrics(ss) {
 		inputTokens: sum(10),
 		outputTokens: sum(11),
 		estimatedUsd: Math.round(sum(12) * 1e4) / 1e4
+	};
+}
+
+/** Pure aggregation for a private, independently reviewed fixed cohort export.
+ * Each record describes ONE contact. Reviewer assertions are inputs, never AI conclusions.
+ * Call separately for baseline and improved snapshots, with phase-specific usage totals.
+ */
+function djEnrichmentBenchmarkSummary(records, usage) {
+	if (!Array.isArray(records) || !records.length) throw new Error("A fixed cohort is required.");
+	const ids = new Set();
+	records.forEach(record => {
+		if (!record.contactId || ids.has(record.contactId)) throw new Error("Cohort must contain unique contact IDs.");
+		ids.add(record.contactId);
+	});
+	const count = predicate => records.filter(predicate).length;
+	const reviewed = (record, field) => record[field] === true;
+	return {
+		cohortSize: records.length,
+		contactsResearched: count(record => reviewed(record, "researched")),
+		correctIdentitiesManuallyConfirmed: count(record => reviewed(record, "identityConfirmed")),
+		contactsWithInstagramCandidates: count(record => reviewed(record, "instagramCandidate")),
+		contactsWithTikTokCandidates: count(record => reviewed(record, "tiktokCandidate")),
+		contactsWithUsableProfessionalChannels: count(record => reviewed(record, "usableChannelConfirmed")),
+		contactsWithCorroboratedOwnership: count(record => reviewed(record, "ownershipCorroborated")),
+		contactsWithUnresolvedAmbiguity: count(record => reviewed(record, "identityAmbiguous")),
+		contactsWithVerifiedPublishedProfiles: count(record => reviewed(record, "verifiedPublished")),
+		// Missing prices/timing must remain unknown, never silently become zero.
+		usage: Object.assign({ requests: null, webSearchCalls: null, pageFetches: null,
+			inputTokens: null, outputTokens: null, elapsedSeconds: null, estimatedUsd: null }, usage || {})
 	};
 }

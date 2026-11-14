@@ -47,7 +47,7 @@ const DJ_ENRICHMENT_OPENAI_BRAND_HANDLES = new Set([
 	"youtube", "twitter", "x", "beatport", "residentadvisor", "instagram", "tiktok", "facebook", "wix",
 	"squarespace", "wordpress", "shopify", "godaddy", "beacons.ai", "hearthis.at", "tunein"
 ]);
-const DJ_ENRICHMENT_OPENAI_CACHE_VERSION = "ma06-search-v3";
+const DJ_ENRICHMENT_OPENAI_CACHE_VERSION = "ma06-search-v4";
 
 function djEnrichmentOpenAIError_(message, retryable) {
 	const text = String(message);
@@ -71,6 +71,8 @@ function djEnrichmentOpenAIConfig_(overrides) {
 		effort: djEnrichmentText(opts.reasoningEffort) || get("OPENAI_RESEARCH_REASONING_EFFORT") || "low",
 		timeoutSeconds: Math.max(10, Math.min(300, timeout)),
 		maxPages: Number.isFinite(pages) ? Math.max(0, Math.min(6, Math.floor(pages))) : 4,
+		maxRequests: 2, maxDepth: 2, maxSearches: 6, maxTokens: 60000,
+		maxOutputTokens: 10000,
 		inputPrice: Number(get("OPENAI_INPUT_USD_PER_1M_TOKENS")),
 		outputPrice: Number(get("OPENAI_OUTPUT_USD_PER_1M_TOKENS")),
 		searchPrice: Number(get("OPENAI_WEB_SEARCH_USD_PER_1K_CALLS"))
@@ -202,6 +204,8 @@ function djEnrichmentOpenAIIdentity_(identity, platforms, plan) {
 	if (Array.isArray(identity.publicLinks) && identity.publicLinks.length) {
 		out.known_public_profiles = identity.publicLinks.slice(0, 5);
 	}
+	out.priority_verified_links = (identity.verifiedLinks || []).slice(0, 5);
+	out.priority_report_links = (identity.reportLinks || []).slice(0, 5);
 	return out;
 }
 
@@ -279,7 +283,7 @@ function djEnrichmentOpenAIPageLinks_(decoded, pageUrl, names) {
 	let siteLabel = labels.length > 1 ? labels[labels.length - 2] : labels[0];
 	if (labels.length > 2 && /^(co|com|org|net|ac|gov)$/.test(siteLabel)) siteLabel = labels[labels.length - 3];
 	const links = new Map();
-	const pattern = /(?:https?:)?(?:\/\/)?(?:www\.|m\.|mobile\.)?(instagram\.com|tiktok\.com|facebook\.com|x\.com|twitter\.com|youtube\.com)\/([@A-Za-z0-9._/-]+)/gi;
+	const pattern = /(?:https?:)?(?:\/\/)?(?:www\.|m\.|mobile\.)?(instagram\.com|tiktok\.com|facebook\.com|x\.com|twitter\.com|youtube\.com|mixcloud\.com|soundcloud\.com)\/([@A-Za-z0-9._/-]+)/gi;
 	let match;
 	while ((match = pattern.exec(decoded)) && links.size < 50) {
 		if (match.index && /[a-z0-9._-]/i.test(decoded.charAt(match.index - 1))) continue;
@@ -291,9 +295,26 @@ function djEnrichmentOpenAIPageLinks_(decoded, pageUrl, names) {
 		const handle = url.split("/").pop().replace(/^@/, "").toLowerCase();
 		if (DJ_ENRICHMENT_OPENAI_BRAND_HANDLES.has(handle)) continue;
 		if (handle === siteLabel && !djEnrichmentOpenAIResembles_(handle, names || [])) continue;
-		links.set(url.toLowerCase(), { platform: platform, url: url, handle: handle });
+		const localText = decoded.slice(Math.max(0, match.index - 120), match.index + match[0].length + 40);
+		links.set(url.toLowerCase(), { platform: platform, url: url, handle: handle,
+			collaboratorContext: /\b(?:collaborator|featuring|feat\.|produced by|remix by)\b/i.test(localText) });
 	}
 	return links;
+}
+
+// Keep biography links with their heading, never with another person's heading or footer.
+function djEnrichmentOpenAISections_(html, page, state) {
+	const sections = String(html).split(/(?=<h[1-6]\b)/i).filter(section => /^<h[1-6]\b/i.test(section));
+	if (sections.length < 2) return null;
+	return sections.slice(0, 50).map(section => {
+		section = section.split(/<(?:footer|nav)\b/i)[0];
+		const heading = (section.match(/^<h[1-6]\b[^>]*>([\s\S]*?)<\/h[1-6]>/i) || [])[1] || "";
+		const comparable = djEnrichmentOpenAIComparable_(section.replace(/<[^>]*>/g, " "));
+		return { url: page.url, comparable: comparable,
+			links: djEnrichmentOpenAIPageLinks_(section, page.url, state.names),
+			namesDJ: state.names.some(name => djEnrichmentOpenAIContains_(djEnrichmentOpenAIComparable_(heading), name)),
+			biographySection: true, controlled: page.controlled, contentPage: page.contentPage };
+	});
 }
 
 /** A handle, host or path resembles a DJ name: the whole name (either word order) is in it. */
@@ -313,7 +334,8 @@ function djEnrichmentOpenAIControlled_(pageUrl, identity, names) {
 	const host = djEnrichmentOpenAIHost_(pageUrl).replace(/^www\./, "");
 	if (identity.website && host === djEnrichmentOpenAIHost_(identity.website).replace(/^www\./, "")) return true;
 	if (DJ_ENRICHMENT_OPENAI_PROFILE_HOSTS.test(host)) {
-		const segment = (String(pageUrl).split("/")[3] || "");
+		const parts = String(pageUrl).split("/");
+		const segment = host === "ra.co" && parts[3] === "dj" ? parts[4] || "" : parts[3] || "";
 		const sub = host.split(".").length > 2 ? host.split(".")[0] : "";
 		return djEnrichmentOpenAIResembles_(segment, names) || djEnrichmentOpenAIResembles_(sub, names);
 	}
@@ -334,8 +356,18 @@ function djEnrichmentOpenAIDisambiguated_(page, identity) {
  * Pages listing many same-platform accounts (people-search aggregators) never qualify.
  */
 function djEnrichmentOpenAIAttributable_(page, link, identity, names) {
+	if (page.sections) {
+		const sections = page.sections.filter(section => section.links.has(link.url.toLowerCase()));
+		return sections.some(section => djEnrichmentOpenAIAttributable_(section,
+			section.links.get(link.url.toLowerCase()), identity, names));
+	}
 	const samePlatform = [...page.links.values()].filter(item => item.platform === link.platform).length;
 	if (!page.namesDJ || samePlatform > 3) return false;
+	if (page.contentPage) return false;
+	if (link.collaboratorContext) return false;
+	// A dedicated named biography section attributes its explicit account links to
+	// that professional identity, independently of whether it matches our contact.
+	if (page.biographySection) return true;
 	return page.controlled ||
 		(djEnrichmentOpenAIResembles_(link.handle, names) && djEnrichmentOpenAIDisambiguated_(page, identity));
 }
@@ -351,12 +383,20 @@ function djEnrichmentOpenAIFetchPage_(url, state, context) {
 		state.pages.set(key, page);
 		return page;
 	}
-	if (state.fetched >= state.maxPages) return page;
+	if (state.fetched >= state.maxPages || (state.session && Date.now() + 40000 > state.session.deadline)) {
+		page.status = "BUDGET_EXHAUSTED";
+		state.pages.set(key, page);
+		return page;
+	}
 	state.fetched++;
 	state.pages.set(key, page);
 	let target = page.url;
 	try {
 		for (let hop = 0; hop < 2; hop++) {
+			if (state.session && Date.now() + 20000 > state.session.deadline) {
+				page.status = "BUDGET_EXHAUSTED";
+				break;
+			}
 			state.allowedHosts.add(djEnrichmentOpenAIHost_(target));
 			const response = context.fetch("page.inspect", target, {
 				method: "get", muteHttpExceptions: true, timeoutSeconds: 20
@@ -379,6 +419,9 @@ function djEnrichmentOpenAIFetchPage_(url, state, context) {
 			page.links = djEnrichmentOpenAIPageLinks_(decoded, page.url, state.names);
 			page.namesDJ = state.names.some(name => djEnrichmentOpenAIContains_(page.comparable, name));
 			page.controlled = djEnrichmentOpenAIControlled_(page.url, state.identity, state.names);
+			page.html = decoded;
+			page.contentPage = /\/(?:track|tracks|release|releases|album|albums)\//i.test(page.url);
+			page.sections = djEnrichmentOpenAISections_(decoded, page, state);
 			break;
 		}
 	} catch (error) {
@@ -436,9 +479,16 @@ function djEnrichmentOpenAICandidates_(records, observedUrls, state) {
 			return;
 		}
 		const candidate = { platform: platform, sourceUrl: sourceUrl };
+		const sourcePage = pageFor(sourceUrl);
 		// Excerpts from an observed source; when that page was fetched, only ones it contains.
 		const items = (record.evidence || []).filter(item => {
 			if (!item || !observed.has(djEnrichmentOpenAIUrlKey_(item.source_url))) return false;
+			const evidencePage = pageFor(item.source_url);
+			if (sourcePage && sourcePage.hypothesis && evidencePage && evidencePage.hypothesis &&
+				sourcePage.hypothesis.id !== evidencePage.hypothesis.id) {
+				rejected.push("EVIDENCE_FROM_COMPETING_HYPOTHESIS");
+				return false;
+			}
 			const page = fetched(item.source_url);
 			if (page && !djEnrichmentOpenAIPageHas_(page, item.excerpt) &&
 				djEnrichmentText(item.type).toUpperCase() !== "OFFICIAL_CROSS_LINK") {
@@ -505,7 +555,8 @@ function djEnrichmentOpenAICandidates_(records, observedUrls, state) {
 				if (!candidate.candidateUrl || fromSelf) return null;
 				const page = fetched(itemSource);
 				const link = page && page.links.get(candidate.candidateUrl.toLowerCase());
-				if (link && djEnrichmentOpenAIAttributable_(page, link, state.identity, state.names)) {
+				if (link && djEnrichmentOpenAIAttributable_(page, link, state.identity,
+					page.hypothesis ? page.hypothesis.names : state.names)) {
 					verification.push("PAGE_CONTAINS_LINK");
 					return { type: type, value: candidate.candidateUrl, sourceUrl: itemSource };
 				}
@@ -518,7 +569,7 @@ function djEnrichmentOpenAICandidates_(records, observedUrls, state) {
 			return { type: type, value: excerpt, sourceUrl: itemSource };
 		}).filter(Boolean).slice(0, 20);
 		if (verification.length) candidate.sourceVerification = [...new Set(verification)].join(",");
-		candidates.push(candidate);
+		candidates.push(djEnrichmentOpenAIAssess_(candidate, pageFor(sourceUrl)));
 	});
 	return { candidates: candidates, rejected: rejected, rejectedPriority: rejectedPriority };
 }
@@ -526,25 +577,30 @@ function djEnrichmentOpenAICandidates_(records, observedUrls, state) {
 /** Stage B: explicit requested social links on fetched professional pages the model missed. */
 function djEnrichmentOpenAIPageCandidates_(state, platforms, existing) {
 	const have = new Set(existing.filter(item => item.candidateUrl)
-		.map(item => item.candidateUrl.toLowerCase()));
+		.map(item => item.candidateUrl.toLowerCase() + "|" + (item.hypothesisId || "")));
 	const found = [];
 	state.pages.forEach(page => {
 		if (page.status !== "FETCHED" || !page.namesDJ) return;
 		page.links.forEach((link, key) => {
-			if (!platforms.includes(link.platform) || have.has(key)) return;
+			const hypothesisKey = key + "|" + (page.hypothesis ? page.hypothesis.id : "");
+			if (!platforms.includes(link.platform) || have.has(hypothesisKey)) return;
 			const samePlatform = [...page.links.values()].filter(item => item.platform === link.platform).length;
-			if (samePlatform > 3) return;
-			const strong = djEnrichmentOpenAIAttributable_(page, link, state.identity, state.names);
-			if (!strong && !djEnrichmentOpenAIResembles_(link.handle, state.names)) return;
-			const name = state.names.find(value => djEnrichmentOpenAIContains_(page.comparable, value));
+			if (samePlatform > 3 && !page.sections) return;
+			const names = page.hypothesis ? page.hypothesis.names : state.names;
+			const strong = djEnrichmentOpenAIAttributable_(page, link, state.identity, names);
+			if (!strong && !djEnrichmentOpenAIResembles_(link.handle, names)) return;
+			const name = names.find(value => djEnrichmentOpenAIContains_(page.comparable, value));
 			const evidence = [{ type: "DJ_ALIAS_MATCH", value: name, sourceUrl: page.url }];
+			if (page.hypothesis && page.hypothesis.contactMatch === "EXACT_AFFILIATION_SUPPORTED") {
+				evidence.push({ type: "STATION_AFFILIATION", value: state.identity.station, sourceUrl: page.url });
+			}
 			if (strong) evidence.unshift({ type: "OFFICIAL_CROSS_LINK", value: link.url, sourceUrl: page.url });
 			else evidence.push({ type: "PROFILE_DESCRIPTION", value: "Page links " + link.url, sourceUrl: page.url });
-			have.add(key);
-			found.push({
+			have.add(hypothesisKey);
+			found.push(djEnrichmentOpenAIAssess_({
 				platform: link.platform, candidateUrl: link.url, sourceUrl: page.url, evidence: evidence,
 				sourceVerification: strong ? "PAGE_CONTAINS_LINK" : "LINK_ON_PAGE_UNATTRIBUTED"
-			});
+			}, page));
 		});
 	});
 	return found;
@@ -600,24 +656,126 @@ function djEnrichmentOpenAIOutcome_(observed, parsed, result, pages) {
 		return "STRONG_MATCH_PENDING_REVIEW";
 	}
 	if (priority.length) return "AMBIGUOUS";
+	if (pages.some(page => page.status === "BUDGET_EXHAUSTED")) return "BUDGET_EXHAUSTED";
+	if (pages.some(page => /^(HTTP_|PAGE_UNAVAILABLE)/.test(page.status))) return "SOURCE_INSPECTION_INCOMPLETE";
 	if (result.rejectedPriority) return "CANDIDATE_REJECTED_BY_GROUNDING";
 	if (identityFound) return "IDENTITY_FOUND_NO_SOCIAL";
 	return "MODEL_NO_CANDIDATES";
 }
 
+// A hypothesis is local to a professional page. Explicitly attributed descendants inherit it;
+// unrelated sources never contribute evidence to that hypothesis.
+function djEnrichmentOpenAIHypothesis_(page, identity, originalNames) {
+	const aliases = [];
+	const text = String(page.html || "").replace(/<[^>]*>/g, " ").replace(/\s+/g, " ");
+	const relation = /([A-Za-z][A-Za-z .!'-]{2,60}?)\s+(?:also known as|aka|a\.k\.a\.|performs as)\s+([A-Za-z][A-Za-z .!'-]{2,60}?)(?=[,;.<]|$)/gi;
+	let match;
+	while ((match = relation.exec(text)) && aliases.length < 4) {
+		const left = match[1].trim(), right = match[2].trim();
+		if (originalNames.some(name => (" " + djEnrichmentOpenAIComparable_(left))
+			.endsWith(" " + djEnrichmentOpenAIComparable_(name)))) {
+			aliases.push({ value: right, excerpt: match[0].slice(0, 300), sourceUrl: page.url });
+		}
+	}
+	const names = originalNames.concat(aliases.map(alias => alias.value));
+	const named = names.some(name => djEnrichmentOpenAIContains_(page.comparable, name));
+	const relevantSections = page.sections ? page.sections.filter(section => section.namesDJ) : [page];
+	const affiliation = named && !!identity.station && relevantSections.some(section =>
+		djEnrichmentOpenAIContains_(section.comparable, identity.station));
+	const trusted = (identity.verifiedLinks || []).some(url => djEnrichmentOpenAIUrlKey_(url) === djEnrichmentOpenAIUrlKey_(page.url));
+	return { id: djEnrichmentOpenAIUrlKey_(page.url), sourceUrl: page.url, aliases: aliases, names: names,
+		contactMatch: trusted ? "PREVIOUSLY_VERIFIED" : affiliation ? "EXACT_AFFILIATION_SUPPORTED" : "UNRESOLVED",
+		sourceOwnership: page.controlled ? "HEURISTIC_CONTROL_ONLY" : "UNCONFIRMED" };
+}
+
+function djEnrichmentOpenAIAssess_(candidate, page) {
+	const hypothesis = page && page.hypothesis;
+	candidate.hypothesisId = hypothesis ? hypothesis.id : djEnrichmentOpenAIUrlKey_(candidate.sourceUrl);
+	candidate.identityEvidence = hypothesis ? { aliases: hypothesis.aliases, sourceUrl: hypothesis.sourceUrl } : {};
+	candidate.assessments = {
+		contactIdentity: hypothesis ? hypothesis.contactMatch : "UNRESOLVED",
+		sourceOwnership: hypothesis ? hypothesis.sourceOwnership : "UNCONFIRMED",
+		profileOwnership: candidate.sourceVerification === "PAGE_CONTAINS_LINK" ? "ATTRIBUTED_LINK_OBSERVED" : "UNCONFIRMED",
+		humanApproval: "NOT_APPROVED", publication: "NOT_VERIFIED"
+	};
+	if (page && page.competingHypotheses && page.competingHypotheses.length) {
+		candidate.identityEvidence.competingHypotheses = page.competingHypotheses;
+		candidate.assessments.contactIdentity = "AMBIGUOUS";
+		candidate.evidence = (candidate.evidence || []).concat({ type: "CONFLICTING_IDENTITY",
+			value: "Multiple identity hypotheses reached this source; manual resolution required.", sourceUrl: page.url });
+	}
+	candidate.channelRole = candidate.platform === "RADIO_DIRECTORY" ? "IDENTITY_EVIDENCE" :
+		candidate.platform === "BUSINESS_EMAIL" ? "BOOKING_EMAIL_CANDIDATE" : "PROFESSIONAL_CHANNEL_CANDIDATE";
+	return candidate;
+}
+
+function djEnrichmentOpenAIExplore_(state, context, seeds) {
+	const queue = seeds.map(url => ({ url: url, depth: 0, hypothesis: null }));
+	const visited = new Set();
+	while (queue.length) {
+		const item = queue.shift(), key = djEnrichmentOpenAIUrlKey_(item.url);
+		const cachedPage = state.pages.get(key);
+		if (cachedPage && cachedPage.hypothesis && item.hypothesis && cachedPage.hypothesis.id !== item.hypothesis.id) {
+			cachedPage.competingHypotheses = (cachedPage.competingHypotheses || []).concat(item.hypothesis).slice(0, 5);
+			continue;
+		}
+		if (visited.has(key)) continue;
+		visited.add(key);
+		const page = djEnrichmentOpenAIFetchPage_(item.url, state, context);
+		if (page.status !== "FETCHED") continue;
+		page.hypothesis = page.hypothesis || item.hypothesis || djEnrichmentOpenAIHypothesis_(page, state.identity, state.names);
+		const names = page.hypothesis.names;
+		page.namesDJ = names.some(name => djEnrichmentOpenAIContains_(page.comparable, name));
+		page.controlled = djEnrichmentOpenAIControlled_(page.url, state.identity, names);
+		page.sections = djEnrichmentOpenAISections_(page.html, page, { names: names });
+		if (item.depth >= state.session.maxDepth || page.hypothesis.contactMatch === "UNRESOLVED" || page.contentPage) continue;
+		const sections = page.sections ? page.sections.filter(section => section.namesDJ) : [page];
+		// Only explicit anchors from a matching biography section are followed, with provenance.
+		const htmlSections = page.sections ? String(page.html).split(/(?=<h[1-6]\b)/i)
+			.filter(section => /^<h[1-6]\b/i.test(section)).slice(0, 50) : [page.html];
+		for (const html of htmlSections) {
+			const comparable = djEnrichmentOpenAIComparable_(html.replace(/<[^>]*>/g, " "));
+			if (!sections.some(section => section.comparable === comparable) && page.sections) continue;
+			const anchors = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+			let anchor;
+			while ((anchor = anchors.exec(html)) && queue.length < 12) {
+				let url = anchor[1];
+				if (/^\/[^/]/.test(url)) url = "https://" + djEnrichmentOpenAIHost_(page.url) + url;
+				url = djEnrichmentPublicUrl(url);
+				if (!url || DJ_ENRICHMENT_OPENAI_NO_FETCH.test(djEnrichmentOpenAIHost_(url))) continue;
+				const label = djEnrichmentOpenAIComparable_(anchor[2].replace(/<[^>]*>/g, " "));
+				const relevant = names.some(name => djEnrichmentOpenAIContains_(label, name)) ||
+					/^(official (?:website|site)|website|linktree|links|mixcloud|soundcloud|resident advisor)$/.test(label);
+				if (!relevant) continue;
+				queue.push({ url: url, depth: item.depth + 1, hypothesis: page.hypothesis });
+			}
+		}
+	}
+}
+
 function djEnrichmentOpenAISearch_(query, context, config, platforms, usage, diagnostic) {
+	const session = context.session;
+	if (session.requests >= config.maxRequests || session.searches >= config.maxSearches ||
+		session.tokens >= config.maxTokens || Date.now() + config.timeoutSeconds * 1000 > session.deadline) {
+		throw djEnrichmentOpenAIError_("Research session budget exhausted.", true);
+	}
+	session.requests++;
 	const key = djEnrichmentText(PropertiesService.getScriptProperties().getProperty("OPENAI_API_KEY"));
 	if (!key) throw djEnrichmentOpenAIError_("Missing Script Property: OPENAI_API_KEY", false);
 	const plan = djEnrichmentOpenAIQueries_(query, context.identity, platforms);
+	// Hosted tool execution is opaque until the response returns. Bound the prompt's
+	// remaining search allowance and stop further requests after measured exhaustion.
+	const searchAllowance = config.maxSearches - session.searches;
 	diagnostic.queriesPlanned = plan.map(item => item.query);
 	const request = {
 		model: config.model,
 		store: false,
-		max_output_tokens: 10000,
+		max_output_tokens: Math.min(config.maxOutputTokens, config.maxTokens - session.tokens),
 		tools: [{ type: "web_search" }],
 		tool_choice: "required",
 		include: ["web_search_call.action.sources"],
-		instructions: djEnrichmentOpenAIInstructions_(platforms),
+		instructions: djEnrichmentOpenAIInstructions_(platforms) + " Use at most " + searchAllowance +
+			" web searches in this request. Prioritize supplied verified and original-report links over name-only search hits.",
 		input: JSON.stringify(djEnrichmentOpenAIIdentity_(context.identity, platforms, plan)),
 		text: { format: { type: "json_schema", name: "dj_profile_candidates", strict: true,
 			schema: djEnrichmentOpenAISchema_(platforms) } }
@@ -647,6 +805,8 @@ function djEnrichmentOpenAISearch_(query, context, config, platforms, usage, dia
 	const observed = body ? djEnrichmentOpenAIObserved_(body) : { searches: 0, urls: [], queries: [] };
 	djEnrichmentOpenAIRecordUsage_(usage, config, elapsed, body, observed.searches);
 	const tokens = body && body.usage || {};
+	session.searches += observed.searches;
+	session.tokens += (tokens.input_tokens || 0) + (tokens.output_tokens || 0);
 	diagnostic.queriesRun = observed.queries;
 	diagnostic.sources = new Set(observed.urls.map(djEnrichmentOpenAIUrlKey_).filter(Boolean)).size;
 	diagnostic.socialSources = observed.urls.filter(url =>
@@ -694,12 +854,12 @@ function djEnrichmentOpenAISearch_(query, context, config, platforms, usage, dia
 	}
 	if (!Array.isArray(parsed.identity_pages)) parsed.identity_pages = [];
 
-	const state = {
+	const state = context.state || (context.state = {
 		identity: context.identity, names: djEnrichmentOpenAINames_(context.identity),
-		pages: context.pages, fetched: 0, maxPages: config.maxPages, allowedHosts: context.allowedHosts
-	};
-	djEnrichmentOpenAIPagePlan_(parsed, observed.urls, state)
-		.forEach(url => djEnrichmentOpenAIFetchPage_(url, state, context));
+		pages: context.pages, fetched: 0, maxPages: config.maxPages, allowedHosts: context.allowedHosts, session: session
+	});
+	djEnrichmentOpenAIExplore_(state, context, [].concat(context.identity.verifiedLinks || [],
+		context.identity.reportLinks || [], djEnrichmentOpenAIPagePlan_(parsed, observed.urls, state)));
 	const result = djEnrichmentOpenAICandidates_(parsed.candidates, observed.urls, state);
 	const fromPages = djEnrichmentOpenAIPageCandidates_(state, platforms, result.candidates);
 	result.candidates = result.candidates.concat(fromPages);
@@ -707,7 +867,8 @@ function djEnrichmentOpenAISearch_(query, context, config, platforms, usage, dia
 	result.rejected.forEach(reason => { usage.rejected[reason] = (usage.rejected[reason] || 0) + 1; });
 	usage.candidatesReturned += parsed.candidates.length;
 	usage.candidatesAccepted += result.candidates.length;
-	usage.pageFetches = (usage.pageFetches || 0) + state.fetched;
+	usage.pageFetches = (usage.pageFetches || 0) + state.fetched - (state.reportedFetches || 0);
+	state.reportedFetches = state.fetched;
 	usage.pageCandidates = (usage.pageCandidates || 0) + fromPages.length;
 	Object.assign(diagnostic, {
 		outcome: djEnrichmentOpenAIOutcome_(observed, parsed, result, pages),
@@ -718,7 +879,8 @@ function djEnrichmentOpenAISearch_(query, context, config, platforms, usage, dia
 		pageCandidates: fromPages.length,
 		rejected: result.rejected,
 		pages: pages.map(page => ({ host: djEnrichmentOpenAIHost_(page.url), status: page.status,
-			namesDJ: !!page.namesDJ, controlled: !!page.controlled, socialLinks: page.links.size }))
+			namesDJ: !!page.namesDJ, controlled: !!page.controlled, socialLinks: page.links.size,
+			hypothesis: page.hypothesis || null }))
 	});
 	return { candidates: result.candidates, outcome: diagnostic.outcome };
 }
@@ -777,7 +939,7 @@ function djEnrichmentCreateOpenAIProvider(options) {
 			const identityKey = JSON.stringify(context.identity);
 			let result = cache.get(identityKey);
 			const cacheKey = result ? "" : djEnrichmentOpenAICacheKey_(context.identity, platforms, config);
-			if (!result && scriptCache && cacheKey) {
+			if (!opts.disableCache && !result && scriptCache && cacheKey) {
 				try { result = JSON.parse(scriptCache.get(cacheKey) || "null"); } catch (_) { result = null; }
 			}
 			if (result) {
@@ -787,9 +949,38 @@ function djEnrichmentCreateOpenAIProvider(options) {
 				const diagnostic = { jobId: context.jobId, platform: context.platform, outcome: "SEARCH_FAILED" };
 				diagnostics.push(diagnostic);
 				try {
-					result = djEnrichmentOpenAISearch_(query, Object.assign({}, context, {
-						pages: new Map(), allowedHosts: allowedHosts
-					}), config, platforms, usage, diagnostic);
+					const research = Object.assign({}, context, {
+						pages: new Map(), allowedHosts: allowedHosts,
+						session: { requests: 0, searches: 0, tokens: 0, maxDepth: config.maxDepth,
+							deadline: Math.min(opts.deadline || Infinity, Date.now() + 300000) }
+					});
+					result = djEnrichmentOpenAISearch_(query, research, config, platforms, usage, diagnostic);
+					const missing = platforms.filter(platform => DJ_ENRICHMENT_OPENAI_PRIORITY.includes(platform) &&
+						!result.candidates.some(candidate => candidate.platform === platform &&
+							candidate.evidence.some(e => e.type === "OFFICIAL_CROSS_LINK")));
+					const clues = [...research.pages.values()].filter(page => page.hypothesis &&
+						!page.competingHypotheses && page.hypothesis.contactMatch !== "UNRESOLVED")
+						.flatMap(page => page.hypothesis.aliases).filter(clue => !djEnrichmentOpenAINames_(context.identity)
+							.some(name => djEnrichmentNormalizeText(name) === djEnrichmentNormalizeText(clue.value)));
+					if (missing.length && clues.length && research.session.requests < config.maxRequests &&
+						research.session.searches < config.maxSearches && research.session.tokens < config.maxTokens &&
+						Date.now() + config.timeoutSeconds * 1000 < research.session.deadline) {
+						// One hypothesis supplies the new alias; never pool aliases across competing identities.
+						const clue = clues[0];
+						const follow = Object.assign({}, research, { identity: Object.assign({}, context.identity,
+							{ aliases: [clue.value] }) });
+						const followDiagnostic = { jobId: context.jobId, outcome: "SEARCH_FAILED" };
+						try {
+							const more = djEnrichmentOpenAISearch_('"' + clue.value + '" ' + missing.join(" "),
+								follow, config, platforms, usage, followDiagnostic);
+							result.candidates = result.candidates.concat(more.candidates);
+						} catch (error) {
+							followDiagnostic.error = djEnrichmentOpenAIError_(error.message).message.slice(0, 300);
+							result.outcome = "SOURCE_INSPECTION_INCOMPLETE";
+						}
+						diagnostic.followUp = followDiagnostic;
+					}
+					diagnostic.session = research.session;
 				} catch (error) {
 					diagnostic.error = djEnrichmentOpenAIError_(error && error.message || error).message.slice(0, 300);
 					throw error;
@@ -797,11 +988,15 @@ function djEnrichmentCreateOpenAIProvider(options) {
 					diagnostic.seconds = Math.round((Date.now() - started) / 100) / 10;
 					console.log("MA-06 search outcome job " + context.jobId + ": " + diagnostic.outcome);
 				}
-				if (scriptCache && cacheKey) {
+				if (!opts.disableCache && scriptCache && cacheKey && !/INCOMPLETE|EXHAUSTED/.test(result.outcome)) {
 					try { scriptCache.put(cacheKey, JSON.stringify(result), 21600); } catch (_) {}
 				}
 			}
 			cache.set(identityKey, result);
+			const platformCandidates = result.candidates.filter(candidate => candidate.platform === context.platform);
+			if (!platformCandidates.length && /INCOMPLETE|EXHAUSTED/.test(result.outcome)) {
+				throw djEnrichmentOpenAIError_(result.outcome, true);
+			}
 			return { candidates: result.candidates
 				.filter(candidate => candidate.platform === context.platform)
 				.slice(0, context.maxResults || 10) };
