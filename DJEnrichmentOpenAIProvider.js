@@ -143,6 +143,27 @@ function djEnrichmentOpenAIObserved_(body) {
 }
 
 /**
+ * True when a returned (observed) page is quoted as linking to this exact profile, e.g. a
+ * DJ's Bandcamp bio "Follow: instagram.com/handle". Search engines often list the linking
+ * page but not the profile itself. The handle must end where the quote's handle ends.
+ */
+function djEnrichmentOpenAIQuotedProfile_(profileUrl, evidence, observed) {
+	const bare = value => String(value || "").toLowerCase()
+		.replace(/https?:\/\//g, "").replace(/(^|[\s(<"'])www\./g, "$1");
+	const target = bare(profileUrl).replace(/\/+$/, "");
+	return (evidence || []).some(item => {
+		if (!item || !observed.has(djEnrichmentOpenAIUrlKey_(item.source_url))) return false;
+		const text = bare(item.excerpt);
+		let at = text.indexOf(target);
+		while (at >= 0) {
+			if (!/[a-z0-9._-]/.test(text.charAt(at + target.length))) return true;
+			at = text.indexOf(target, at + 1);
+		}
+		return false;
+	});
+}
+
+/**
  * Converts schema candidates to MA-06 candidates, keeping only URLs and evidence that are
  * grounded in the observed search sources. Returns {candidates, rejected:[reason]}.
  */
@@ -175,7 +196,8 @@ function djEnrichmentOpenAICandidates_(records, observedUrls) {
 		} else {
 			const url = djEnrichmentNormalizeCandidateUrl(record.profile_url, platform);
 			const seen = !url ? false : DJ_ENRICHMENT_SOCIAL_PLATFORMS.includes(platform)
-				? observedProfile(platform).has(url.toLowerCase())
+				? observedProfile(platform).has(url.toLowerCase()) ||
+					djEnrichmentOpenAIQuotedProfile_(url, record.evidence, observed)
 				: observed.has(djEnrichmentOpenAIUrlKey_(url));
 			if (!seen) {
 				rejected.push(url ? "PROFILE_URL_NOT_IN_SEARCH_RESULTS" : "INVALID_PROFILE_URL");

@@ -226,6 +226,31 @@ function runFor(ss, prov, platforms = ["INSTAGRAM", "TIKTOK"], options = {}) {
 	assert.equal(ss.getSheetByName("DJ_Enrichment_Evidence").rows.some(row => row[2] === "OFFICIAL_CROSS_LINK"), false);
 }
 
+// A profile the search didn't list is accepted only when a returned page quotes its exact link.
+{
+	const ss = setup();
+	const linked = "https://instagram.com/linked_dj";
+	responses.push({ code: 200, body: searchBody([
+		candidate({ profile_url: linked, display_name: null, station: null, evidence: [
+			{ type: "OFFICIAL_CROSS_LINK", excerpt: "Follow DJ Example: instagram.com/linked_dj", source_url: STATION }
+		] }),
+		candidate({ profile_url: "https://instagram.com/linked", display_name: null, station: null, evidence: [
+			{ type: "OFFICIAL_CROSS_LINK", excerpt: "Follow DJ Example: instagram.com/linked_dj", source_url: STATION }
+		] }),
+		candidate({ profile_url: "https://instagram.com/unseen_dj", display_name: null, station: null, evidence: [
+			{ type: "OFFICIAL_CROSS_LINK", excerpt: "instagram.com/unseen_dj", source_url: "https://unseen.example/a" }
+		] })
+	], { sources: [STATION] }) });
+	const prov = provider();
+	runFor(ss, prov, ["INSTAGRAM"]);
+	assert.deepEqual(plain(prov.usage.rejected), { PROFILE_URL_NOT_IN_SEARCH_RESULTS: 2 },
+		"a shorter handle prefix and a quote from an unreturned page are both rejected");
+	const rows = ss.getSheetByName("DJ_Enrichment_Candidates").rows.slice(1);
+	assert.deepEqual(rows.map(row => row[5]), [linked]);
+	assert.ok(ss.getSheetByName("DJ_Enrichment_Evidence").rows.some(row =>
+		row[2] === "OFFICIAL_CROSS_LINK" && row[6] === "STRONG"));
+}
+
 // A response without an executed web search is never accepted as evidence.
 {
 	const ss = setup();
