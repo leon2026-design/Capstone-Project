@@ -73,6 +73,20 @@ test("automatically matches a single file with a matching ISRC and no conflicts"
   });
 });
 
+test("an ISRC alone is a review suggestion and conflicting same-ISRC durations block automatic selection", async ({}, testInfo) => {
+  const onlyIsrc = mp3(testInfo, "unknown.mp3", { isrc: RADIO_ISRC });
+  const isolated = matchAudioToRecording(recording(), await extractAudioMetadataBatch([onlyIsrc]));
+  expect(isolated).toMatchObject({ status: "NEEDS_REVIEW", selectedFilePath: null });
+  expect(isolated.candidates[0]).toMatchObject({ basis: "ISRC", autoEligible: false });
+
+  const short = writeFixture(testInfo.outputPath("audio", "short.wav"), buildWav({ id3: radioTags, durationSeconds: 3 }));
+  const long = writeFixture(testInfo.outputPath("audio", "long.wav"), buildWav({ id3: radioTags, durationSeconds: 55 }));
+  const result = matchAudioToRecording(recording(), await extractAudioMetadataBatch([short, long]));
+  expect(result).toMatchObject({ status: "AMBIGUOUS", selectedFilePath: null });
+  expect(result.candidates.every((candidate) =>
+    !candidate.autoEligible && candidate.conflicts.some((conflict) => conflict.includes("conflicting identity or duration")))).toBe(true);
+});
+
 test("blocks automatic matching when an embedded ISRC contradicts Orchard", async ({}, testInfo) => {
   const contradictory = wav(testInfo, "glass-coast-radio-edit.wav", { ...radioTags, isrc: "USAAA2600099" });
   const mixed = mp3(testInfo, "glass-coast-two-isrcs.mp3", { ...radioTags, isrc: [RADIO_ISRC, "USAAA2600099"] });
@@ -164,8 +178,11 @@ test("never matches a Radio Edit automatically to a Remix or another version", a
 
   const radio = wav(testInfo, "glass-coast-radio.wav", radioTags);
   const withRadio = matchAudioToRecording(recording(), await extractAudioMetadataBatch([...versionFiles, radio]));
-  expect(withRadio).toMatchObject({ status: "MATCHED", selectedFilePath: radio, basis: "ISRC" });
-  expect(withRadio.candidates[0].filePath).toBe(radio);
+  expect(withRadio).toMatchObject({ status: "AMBIGUOUS", selectedFilePath: null, basis: null });
+  expect(withRadio.candidates.find((candidate) => candidate.filePath === radio)).toMatchObject({
+    autoEligible: false,
+    conflicts: expect.arrayContaining(["Files with the same ISRC have conflicting identity or duration; review the versions."])
+  });
 });
 
 test("marks multiple possible files as AMBIGUOUS and requires human selection", async ({ page }, testInfo) => {

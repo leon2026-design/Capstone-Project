@@ -129,7 +129,8 @@ is detected from file content (RIFF/WAVE or ID3/MPEG Layer III frames), not the
 extension; `extensionMatchesFormat` reports any mismatch.
 
 Extracted fields: `filePath`, `fileName`, `format`, `durationSeconds`,
-`sampleRate`, `bitDepth`, `channels`, `artist`, `title`, `album`, `isrc`
+`sampleRate`, `bitDepth`, `channels`, `artist`, `albumArtist`, `title`, `album`,
+`genre`, `year`, `date`, `comments`, `isrc`
 (normalized, only when every embedded value agrees on one valid ISRC),
 `rawIsrcs` (exact embedded values), and `version` (only from an explicit ID3
 `TIT3` subtitle tag; never inferred from the title). Unavailable values are
@@ -1366,3 +1367,189 @@ temporary folder:
 After a simulated restart it runs the queue. It verifies the SHA-256 of each
 received file against its source, runs the queue again to show that nothing is
 sent twice, and prints the ledger, timings, and counters.
+
+## MB-11: Verified Audio Preparation
+
+MB-11 prepares separate, verified MP3 and supported WAV copies from
+already-reviewed metadata. It preserves the MB-06 through MB-09 decision rules
+and MB-08 review-event history; preparation manifests are stored separately
+and do not rewrite review history or grant final approval.
+
+```text
+reviewed recording + selected source audio
+  -> validate approved metadata and source tags
+  -> write a separate ID3-tagged copy (and update existing WAV INFO)
+  -> independently read tags back
+  -> compare MPEG frames and decoding, or WAV PCM and preserved chunks
+  -> append a checksummed preparation manifest
+  -> MB-10 verifies the manifest and requires separate final approval
+  -> local mock submission only
+```
+
+`src/submission/audioPreparation.ts` exposes `prepareAudioArtifact` for one
+record and `prepareAudioArtifactsBatch` for a batch. Batch preparation
+continues after per-record failures and blocks destination filename
+collisions. Output files are created without overwriting existing files.
+`src/submission/audioPreparationStore.ts` appends versioned, per-recording
+manifests through the existing review storage backend, with SHA-256 integrity
+checks and optional HMAC-SHA256 signatures. Set an integrity key in the
+application configuration to authenticate persisted manifests.
+
+Tag selection uses an explicit, versioned `AudioTagProfile`. Values come only
+from the reviewed recording, validated fields, Orchard provenance, or a
+reviewer-approved explicit source. Existing tags that conflict with reviewed
+identity data are not silently replaced; non-ISRC conflicts require an
+identified reviewer, note, and field-level acknowledgment. The source audio
+file is never changed. Existing ID3 metadata, including unrelated user frames
+and artwork, is preserved and checked by tests.
+
+The default `SPONSOR_METADATA_CONTRACT` is separately versioned and requires
+the sponsor's reviewed metadata, including ISRC, release year, album and album
+artist, genre, publisher information, comments, and clean/explicit status.
+Additional artists and versions are required when applicable. It records
+field-level evidence and distinguishes a known value from a supported
+embedded mapping. Missing values and conflicts block the individual record.
+In particular, the publisher and content-rating encodings are **not confirmed**:
+even a known value cannot currently pass the strict contract as an embedded
+tag. `Radio`, `DJ Version`, and `(AI)` are not clean/explicit decisions.
+Publisher aliases require an individually approved, versioned rule; no legal
+identity is inferred from similar names.
+
+The default `SPONSOR_TITLE_NAMING_PROFILE` derives the upload name from the
+reviewed title, applicable version, and detected extension. It rejects unsafe,
+reserved, or overlong names rather than truncating or silently disambiguating
+them. A prepared upload's name is checked against its manifest and actually
+used by the form. `allowUploadRename` must still be explicitly enabled when
+that name differs from the private artifact filename. Title-profile preparation
+requires a shared preparation store, which serializes and checks names across
+recordings as well as within a batch.
+
+The prepared MP3 is independently read back, its MPEG Layer III frame stream
+must exactly match the source, and both streams must decode with the same
+sample rate, channel count, and decoded sample count. The writer preserves
+supported ID3v2.3 or v2.4 versions, unrelated frames, artwork, and ID3v1 bytes.
+An incompatible ID3v1 value blocks preparation rather than leaving a
+contradictory legacy tag.
+
+For WAV, a narrow RIFF writer preserves the PCM `data` chunk, format, ancillary
+chunks, unknown INFO entries, unrelated ID3 frames, and artwork. It updates
+supported fields in embedded ID3 and, when an INFO list exists, in INFO as
+well. It rejects conflicting representations unless an eligible conflict is
+explicitly acknowledged; a conflicting ISRC cannot be overridden. Read-back
+uses `node-id3` for embedded ID3 and `music-metadata` for INFO. Preparation and
+MB-10 verify PCM bytes and unchanged format/chunks independently of the write.
+No audio is transcoded. MB-10 can be configured with `audioPreparationStore`;
+when present, it refuses approval/submission unless a current prepared
+artifact and manifest verify. Final approval is still a separate explicit human
+decision.
+
+Destination naming is injectable and versioned via
+`UploadNamingProfile`/`createConfigurableNamingProfile`. The title policy is a
+sponsor requirement, not a claim about production Mediabase policy. The
+included `BASIC_FILENAME_PROFILE` is a technical example only. An ISRC alone
+no longer authorizes automatic audio selection, and conflicting identity or
+duration among files sharing an ISRC requires review.
+
+### MB-11 limitations and sponsor decisions
+
+- WAV support is limited to well-formed RIFF PCM and IEEE float, including
+  supported extensible WAV. RF64, BW64, RIFX, compressed WAV, ambiguous chunks,
+  unsupported INFO encodings, and unsupported ID3 variants fail closed. The
+  parser is intentionally narrow; a rejected file needs human review, not
+  conversion.
+- Only supported ID3v2.3/v2.4 tags and representable INFO values are written.
+  Malformed, duplicate, flagged, unsynchronized, or otherwise unsupported
+  mapped tags are rejected; unknown frames and unrelated chunks are preserved.
+- The MP3 decoder verifies decodability and preserved frame payload; it is not
+  a substitute for listening tests, loudness checks, or a full media-quality
+  certification workflow.
+- Publisher and clean/explicit frame mappings, genre vocabulary, exact
+  multi-artist representation, and destination compatibility remain unresolved.
+  The confirmed and outstanding decisions are tracked in
+  [MB11_SPONSOR_DECISIONS.md](./MB11_SPONSOR_DECISIONS.md).
+- Preparation manifests include the local artifact path so that MB-10 can
+  resume. Restrict access to the local storage directory and avoid publishing
+  manifests or logs; persisted files are integrity-protected but not encrypted
+  at rest.
+- The demo's upload is to the loopback mock only. A mock receipt is not a
+  Mediabase confirmation, and no live Mediabase connection or submission is
+  implemented.
+
+### Tag Editor compatibility check
+
+The actual Tag Editor application, version, and its precedence for WAV ID3
+versus RIFF INFO are not confirmed. The writer's supported encodings are a
+technical assumption, not a destination-compatibility guarantee. Once the
+sponsor identifies the editor and accepted format:
+
+1. Run `npm run mb11:demo -- --keep`. The printed temporary directory contains
+   generated fictional MP3 and WAV sources and prepared copies; the WAV has
+   ID3v2.4 and INFO. Work only with these fixtures or other authorized,
+   non-sensitive synthetic files.
+2. Record the editor name and version. Open copies of the prepared artifacts
+   without saving over the sources. Check the displayed title, artist, album,
+   ISRC, year, album artist, and any other populated tags against the demo and
+   reviewed inputs. Check both ID3 and INFO views if the editor exposes them.
+3. If editing or saving is necessary, save to another copy. Compare the
+   retained source hashes to the demo output and use the commands below to
+   compare the saved copies with the source audio. Also re-run the synthetic
+   tests below. Test artwork/unknown-frame preservation with
+   `wav-preparation.spec.ts`; visual artwork display requires a valid,
+   independently supplied fictional image.
+4. Record any mismatch and the specific versions/encodings tested in the
+   decision register. Do not mark the sponsor mappings or destination support
+   confirmed without sponsor approval. Remove only the printed demo temporary
+   directory when it is no longer needed.
+
+For example, from `mediabase-agent` in PowerShell, substitute the actual local
+fixture paths and verify each edited copy:
+
+```powershell
+$source = "C:\path\to\source-2.wav"
+$editorCopy = "C:\path\to\editor-copy.wav"
+npx tsx -e "const fs = require('node:fs'); const {waveAudioUnchanged} = require('.\\src\\submission\\wavAudio'); if (!waveAudioUnchanged(fs.readFileSync(process.argv[1]), fs.readFileSync(process.argv[2]))) throw new Error('WAV integrity mismatch'); console.log('WAV integrity OK')" $source $editorCopy
+
+$source = "C:\path\to\source-1.mp3"
+$editorCopy = "C:\path\to\editor-copy.mp3"
+npx tsx -e "const fs = require('node:fs'); const {extractMpegAudioPayload} = require('.\\src\\submission\\audioPreparation'); if (!extractMpegAudioPayload(fs.readFileSync(process.argv[1])).equals(extractMpegAudioPayload(fs.readFileSync(process.argv[2])))) throw new Error('MP3 frame mismatch'); console.log('MP3 frame payload OK')" $source $editorCopy
+```
+
+The WAV check compares PCM, format, and preserved non-tag chunks; the MP3
+check compares MPEG frames. Neither verifies what the editor displays or
+certifies its handling of metadata and artwork: inspect those separately.
+
+### Optional local reference audit
+
+The read-only audit requires an explicit absolute directory and never uploads
+audio or writes a report:
+
+```powershell
+npm run mb11:audit -- "C:\path\to\local-reference-directory"
+```
+
+Its JSON output uses per-run file IDs rather than paths, filenames, or catalog
+values. It reports SHA-256 hashes, missing tags, conflicts, possible pairings,
+version indicators, and rights-review flags. Hashes can still correlate
+private material, so treat any redirected output as sensitive. The audit
+skips symbolic links, needs no sponsor files in CI, and does not establish
+rights, clean/explicit status, or publisher mappings. Audio files and reports
+named `mb11-audit*.json` are ignored under this application; do not commit
+reference audio or differently named private reports.
+
+### MB-11 commands
+
+```sh
+npm run mb11:demo
+npm run mb11:demo -- --keep
+npx playwright test audio-preparation.spec.ts wav-preparation.spec.ts sample-audit.spec.ts --reporter=line
+npm run typecheck
+```
+
+The offline demo uses fictional records, a deliberately separate fictional
+technical-test contract, and generated MP3 and WAV fixtures; it does not claim
+that the unresolved strict sponsor mappings are supported. It shows successful
+preparation and local mock uploads, trusted metadata recovery, blocked
+clean/explicit, conflicting-identity and missing-field cases, verified receipt
+names/hashes, and a second run without duplicate submissions. It prints
+measured timings and configured usage counters; cost is not estimated. No real
+Mediabase, paid API, or sponsor account is contacted.

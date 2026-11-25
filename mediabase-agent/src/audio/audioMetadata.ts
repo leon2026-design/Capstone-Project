@@ -15,8 +15,13 @@ export type AudioMetadata = {
   bitDepth: number | null;
   channels: number | null;
   artist: string | null;
+  albumArtist?: string | null;
   title: string | null;
   album: string | null;
+  genre?: string | null;
+  year?: string | null;
+  date?: string | null;
+  comments?: string | null;
   /** Normalized embedded ISRC when every embedded value agrees on one valid ISRC. */
   isrc: string | null;
   /** Every embedded ISRC value exactly as stored in the file. */
@@ -174,6 +179,12 @@ export async function extractAudioMetadata(filePath: string): Promise<AudioExtra
   const isrc =
     distinctIsrcs.size === 1 && normalizedIsrcs[0] !== null ? normalizedIsrcs[0] : null;
 
+  const albumArtist = firstText([parsed.common.albumartist]);
+  const genre = firstText(parsed.common.genre);
+  const year = parsed.common.year ? String(parsed.common.year) : null;
+  const date = firstText([parsed.common.date, parsed.common.releasedate]);
+  const comments = firstText((parsed.common.comment ?? []).map((item) => item.text));
+
   return {
     status: "OK",
     filePath: absolutePath,
@@ -192,7 +203,12 @@ export async function extractAudioMetadata(filePath: string): Promise<AudioExtra
       album: firstText([parsed.common.album]),
       isrc,
       rawIsrcs,
-      version: firstText(parsed.common.subtitle)
+      version: firstText(parsed.common.subtitle),
+      ...(albumArtist ? { albumArtist } : {}),
+      ...(genre ? { genre } : {}),
+      ...(year ? { year } : {}),
+      ...(date ? { date } : {}),
+      ...(comments ? { comments } : {})
     }
   };
 }
