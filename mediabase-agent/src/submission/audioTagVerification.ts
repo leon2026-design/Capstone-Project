@@ -1,13 +1,20 @@
 import { normalizeMatchText, type AudioMatchResult } from "../audio/audioMatcher";
 import { normalizeIsrcValue, type AudioMetadata } from "../audio/audioMetadata";
 import type { DemoRecording } from "../metadata/recordValidation";
+import {
+  DEFAULT_MP3_TAG_PROFILE,
+  resolveAudioTagValues,
+  type AudioTagField,
+  type AudioTagProfile,
+  type ExplicitTagValues
+} from "./audioTagProfile";
 
 /**
  * Compares the tags actually embedded in the selected audio file with the
  * approved recording. The file is read by `extractAudioMetadata`; nothing is
  * rewritten. Missing, incorrect, and unsupported tags are reported separately.
  */
-export type TaggedField = "artist" | "title" | "album" | "isrc" | "version";
+export type TaggedField = AudioTagField;
 
 export type TagStatus =
   /** The embedded tag agrees with the approved value. */
@@ -42,7 +49,12 @@ const RECORD_FIELD: Record<TaggedField, keyof DemoRecording> = {
   title: "title",
   album: "albumTitle",
   isrc: "isrc",
-  version: "version"
+  version: "version",
+  genre: "recordingId",
+  year: "officialReleaseDate",
+  albumArtist: "artistAttribution",
+  comments: "comments",
+  contentRating: "recordingId"
 };
 
 /** Fields that identify the recording; a wrong value blocks unless a human acknowledged the conflict. */
@@ -56,7 +68,9 @@ const UNSUPPORTED_BY_FORMAT: Record<AudioMetadata["format"], ReadonlySet<TaggedF
 
 function tagValue(metadata: AudioMetadata, field: TaggedField): string | null {
   if (field === "isrc") return metadata.rawIsrcs.length > 0 ? metadata.rawIsrcs.join(" ") : null;
-  return metadata[field];
+  if (field === "contentRating") return null;
+  const value = metadata[field];
+  return typeof value === "string" ? value : null;
 }
 
 function agrees(field: TaggedField, approved: string, metadata: AudioMetadata): boolean {
@@ -64,6 +78,10 @@ function agrees(field: TaggedField, approved: string, metadata: AudioMetadata): 
     const wanted = normalizeIsrcValue(approved);
     return metadata.rawIsrcs.length > 0 && metadata.rawIsrcs.every((value) => normalizeIsrcValue(value) === wanted);
   }
+  if (field === "year") {
+    return metadata.year === approved || metadata.date?.slice(0, 4) === approved;
+  }
+  if (field === "contentRating") return false;
   return normalizeMatchText(metadata[field]) === normalizeMatchText(approved);
 }
 
@@ -82,22 +100,36 @@ function conflictsAcknowledged(record: DemoRecording, filePath: string, currentM
 export function verifyAudioTags(
   record: Readonly<DemoRecording>,
   metadata: AudioMetadata,
-  currentMatch: AudioMatchResult | null
+  currentMatch: AudioMatchResult | null,
+  profile?: AudioTagProfile,
+  explicitValues?: ExplicitTagValues
 ): AudioTagVerification {
   const acknowledged = conflictsAcknowledged(record as DemoRecording, metadata.filePath, currentMatch);
-  const fields: TagFieldResult[] = (Object.keys(RECORD_FIELD) as TaggedField[]).map((field) => {
-    const approved = record[RECORD_FIELD[field]];
-    const approvedText = typeof approved === "string" && approved.trim() ? approved : null;
+  const selectedProfile = profile ?? {
+    ...DEFAULT_MP3_TAG_PROFILE,
+    mappings: ["artist", "title", "album", "isrc", "version"] as const,
+    requiredFields: [] as const
+  };
+  const resolved = resolveAudioTagValues(record, selectedProfile, explicitValues);
+  const fields: TagFieldResult[] = selectedProfile.mappings.map((field) => {
+    const approvedText = resolved.values[field] ?? null;
     const embedded = tagValue(metadata, field);
     if (approvedText === null) {
-      return { field, status: "NOT_APPLICABLE", severity: "informational", acknowledged: false };
+      const required = selectedProfile.requiredFields.includes(field);
+      return {
+        field,
+        status: required ? "MISSING_TAG" : "NOT_APPLICABLE",
+        severity: required ? "blocking" : "informational",
+        acknowledged: false
+      };
     }
     if (embedded === null) {
       const unsupported = UNSUPPORTED_BY_FORMAT[metadata.format].has(field);
+      const required = selectedProfile.requiredFields.includes(field);
       return {
         field,
         status: unsupported ? "UNSUPPORTED_FIELD" : "MISSING_TAG",
-        severity: unsupported ? "informational" : "warning",
+        severity: required || unsupported ? (required ? "blocking" : "warning") : "warning",
         acknowledged: false
       };
     }
@@ -108,8 +140,8 @@ export function verifyAudioTags(
     return {
       field,
       status: "INCORRECT_TAG",
-      severity: identity && !acknowledged ? "blocking" : "warning",
-      acknowledged: identity && acknowledged
+      severity: profile ? "blocking" : identity && !acknowledged ? "blocking" : "warning",
+      acknowledged: !profile && identity && acknowledged
     };
   });
   return { format: metadata.format, fields, blocking: fields.filter((item) => item.severity === "blocking") };

@@ -36,12 +36,12 @@ const DJ_ENRICHMENT_API_USAGE_HEADERS = [
 ];
 
 const DJ_ENRICHMENT_PLATFORMS = [
-	"INSTAGRAM", "FACEBOOK", "SOUNDCLOUD", "MIXCLOUD",
+	"INSTAGRAM", "TIKTOK", "FACEBOOK", "X", "YOUTUBE", "SOUNDCLOUD", "MIXCLOUD",
 	"WEBSITE", "RADIO_DIRECTORY", "BUSINESS_EMAIL"
 ];
 
 const DJ_ENRICHMENT_SOCIAL_PLATFORMS = [
-	"INSTAGRAM", "FACEBOOK", "SOUNDCLOUD", "MIXCLOUD"
+	"INSTAGRAM", "TIKTOK", "FACEBOOK", "X", "YOUTUBE", "SOUNDCLOUD", "MIXCLOUD"
 ];
 
 const DJ_ENRICHMENT_COMMON_SINGLE_NAMES = new Set([
@@ -187,6 +187,20 @@ function djEnrichmentIdentity(target) {
 		country: djEnrichmentText(target.country || target.Country),
 		website: knownWebsite ? djEnrichmentPublicUrl(knownWebsite) || "" : ""
 	};
+	// Only already-known public profile URLs are research hints; emails and phones never are.
+	const publicLinks = [];
+	String(target.socialAccounts || target["Social Accounts"] || "")
+		.split(/[\r\n,]+/).forEach(value => {
+			const profile = djEnrichmentText(value) && djIdentityProfile(value, "CONTACT_FIELD");
+			if (profile && profile.profileUrl.length <= 500 &&
+				!publicLinks.includes(profile.profileUrl) && publicLinks.length < 5) {
+				publicLinks.push(profile.profileUrl);
+			}
+		});
+	if (publicLinks.length) identity.publicLinks = publicLinks;
+	["verifiedLinks", "reportLinks"].forEach(key => {
+		if (Array.isArray(target[key])) identity[key] = target[key].map(djEnrichmentPublicUrl).filter(Boolean).slice(0, 5);
+	});
 	if (uniqueAliases.length > 20 ||
 		uniqueAliases.some(alias => alias.length > 500) ||
 		[identity.station, identity.city, identity.region, identity.country,
@@ -440,7 +454,8 @@ function djEnrichmentObservationIdentity(ss, observationId) {
 				city: candidate.City,
 				region: candidate["State / Region"],
 				country: candidate.Country,
-				website: candidate.Website
+				website: candidate.Website,
+				reportLinks: djIdentityExtractProfiles(candidate).map(profile => profile.profileUrl)
 			};
 		}
 	}
@@ -511,8 +526,25 @@ function djEnrichmentValidateTarget(ss, target) {
 				? ""
 				: row[columns["State / Region"]],
 			country: columns.Country == null ? "" : row[columns.Country],
-			website: columns.Website == null ? "" : row[columns.Website]
+			website: columns.Website == null ? "" : row[columns.Website],
+			socialAccounts: columns["Social Accounts"] == null
+				? ""
+				: row[columns["Social Accounts"]]
 		};
+		identitySource.verifiedLinks = djSocialProfileGetVerified(ss, contactId).map(profile => profile.profileUrl);
+		identitySource.reportLinks = [];
+		// Use only original observations safely linked to this contact; never name-based joins.
+		const importSheet = ss.getSheetByName("Import_Log");
+		if (importSheet && importSheet.getLastRow() > 1) {
+			const imported = importSheet.getDataRange().getDisplayValues();
+			const map = djEnrichmentHeaderMap(imported[0]);
+			imported.slice(1).forEach(record => {
+				if (!["Created", "Matched"].includes(record[map.Outcome]) || record[map["Contact IDs"]] !== contactId) return;
+				let detail;
+				try { detail = JSON.parse(record[map.Details]); } catch (_) { return; }
+				if (detail && detail.candidate) identitySource.reportLinks.push(...djIdentityExtractProfiles(detail.candidate).map(profile => profile.profileUrl));
+			});
+		}
 	} else {
 		if (!djEnrichmentObservationExists(ss, observationId)) {
 			throw new Error("Observation ID is not present in MA-05 review or import records.");
@@ -729,7 +761,10 @@ function djEnrichmentTrackedFetch(ss, provider, job, apiName, url, options, budg
 	const host = requestUrl.match(/^https:\/\/([^/]+)/i)[1].toLowerCase();
 	const authorizedHosts = (provider.authorizedHosts || [])
 		.map(value => djEnrichmentText(value).toLowerCase());
-	if (!authorizedHosts.includes(host)) {
+	// isAuthorizedHost lets a provider approve, per request, a public page host it observed.
+	if (!authorizedHosts.includes(host) &&
+		!(typeof provider.isAuthorizedHost === "function" &&
+			provider.isAuthorizedHost(host) === true)) {
 		throw new Error("Provider request host is not explicitly authorized: " + host);
 	}
 	if (typeof trackedFetch !== "function") {
@@ -919,7 +954,8 @@ function djEnrichmentCandidateData(candidate) {
 	const data = {};
 	[
 		"displayName", "profileName", "aliases", "station", "city",
-		"region", "country", "professionalActivity", "contactType"
+		"region", "country", "professionalActivity", "contactType", "sourceVerification",
+		"hypothesisId", "identityEvidence", "assessments", "channelRole"
 	].forEach(key => {
 		if (candidate[key] != null) data[key] = candidate[key];
 	});
@@ -998,7 +1034,7 @@ function djEnrichmentPrepareCandidate(job, candidate) {
 	);
 	const candidateKey = [
 		job[0], platform, candidateUrl.toLowerCase(), candidateValue.toLowerCase()
-	].join("|");
+	].join("|") + djEnrichmentHypothesisKey_(djEnrichmentCandidateData(candidate));
 	return {
 		platform: platform,
 		candidateUrl: candidateUrl,
@@ -1009,6 +1045,16 @@ function djEnrichmentPrepareCandidate(job, candidate) {
 		candidateKey: candidateKey,
 		candidateData: djEnrichmentCandidateData(candidate)
 	};
+}
+
+function djEnrichmentHypothesisKey_(data) {
+	return data && data.hypothesisId ? "|" + data.hypothesisId : "";
+}
+
+function djEnrichmentStoredHypothesisKey_(row) {
+	let data;
+	try { data = JSON.parse(row[15] || "{}"); } catch (_) { throw new Error("Invalid enrichment candidate metadata."); }
+	return djEnrichmentHypothesisKey_(data);
 }
 
 function djEnrichmentPersistPreparedCandidate(ss, job, providerId, query, prepared) {
@@ -1027,14 +1073,14 @@ function djEnrichmentPersistPreparedCandidate(ss, job, providerId, query, prepar
 				djEnrichmentText(row[1]), djEnrichmentText(row[4]),
 				djEnrichmentText(row[5]).toLowerCase(),
 				djEnrichmentText(row[6]).toLowerCase()
-			].join("|") === prepared.candidateKey
+			].join("|") + djEnrichmentStoredHypothesisKey_(row) === prepared.candidateKey
 		);
 		const duplicateCandidates = existingTable.rows.filter(row =>
 			[
 				djEnrichmentText(row[1]), djEnrichmentText(row[4]),
 				djEnrichmentText(row[5]).toLowerCase(),
 				djEnrichmentText(row[6]).toLowerCase()
-			].join("|") === prepared.candidateKey
+			].join("|") + djEnrichmentStoredHypothesisKey_(row) === prepared.candidateKey
 		);
 		if (duplicateCandidates.length > 1) {
 			throw new Error("Duplicate enrichment candidate record.");
@@ -1143,6 +1189,42 @@ function djEnrichmentFinishJob(ss, jobId, status, error) {
 	});
 }
 
+// Persist a completed, partially inspected search as bounded per-platform review work.
+// No network calls, new jobs or identity joins are performed here. A crash may resume
+// queued siblings; already-written candidates are reused by existing storage keys.
+function djEnrichmentCheckpointPartialSession(ss, job, provider, session, maxAttempts) {
+	if (!session || !Array.isArray(session.platforms) || !session.platforms.length ||
+		session.platforms.length > 10 || new Set(session.platforms).size !== session.platforms.length ||
+		session.platforms.some(platform => !provider.supportedPlatforms.includes(platform)) ||
+		!Array.isArray(session.candidates) || session.candidates.length > 200) {
+		throw new Error("Provider returned an invalid partial-session checkpoint.");
+	}
+	if (!session.platforms.includes(job[3])) throw new Error("Partial session does not include its claimed job.");
+	const related = djEnrichmentReadTable(ss, DJ_ENRICHMENT_JOB_SHEET, DJ_ENRICHMENT_JOB_HEADERS).rows
+		.filter(row => (row[0] === job[0] || row[5] === "QUEUED") && row[1] === job[1] && row[2] === job[2] &&
+			row[4] === provider.providerId && row[11] === job[11] && session.platforms.includes(row[3]))
+		.slice(0, 10);
+	const results = [];
+	for (const row of related) {
+		if (row[0] !== job[0] && Number(row[6]) >= maxAttempts) continue;
+		const claimed = row[0] === job[0] ? job : djEnrichmentClaimJob(ss, row[0], maxAttempts);
+		const ids = [], rejected = [];
+		for (const candidate of session.candidates.filter(item => item.platform === claimed[3])) {
+			let prepared;
+			try { prepared = djEnrichmentPrepareCandidate(claimed, candidate); }
+			catch (error) { rejected.push(error.message); continue; }
+			ids.push(djEnrichmentPersistPreparedCandidate(ss, claimed, provider.providerId, claimed[10], prepared));
+		}
+		const stored = ids.map(id => djEnrichmentFindCandidate(ss, id)).filter(Boolean);
+		const status = stored.some(item => item.row[12] === "PENDING_REVIEW") ? "PENDING_REVIEW" :
+			stored.some(item => item.row[12] === "CONFLICTING") ? "CONFLICTING" : "NEEDS_RESEARCH";
+		djEnrichmentFinishJob(ss, claimed[0], status, "Completed search; source inspection incomplete. Manual research required for unresolved channels.");
+		results.push({ jobId: claimed[0], status: status, enrichmentIds: [...new Set(ids)],
+			partialDiscovery: true, rejectedCandidates: rejected });
+	}
+	return results;
+}
+
 function djEnrichmentProcessQueued(ss, providers, options) {
 	const providerMap = djEnrichmentProviderMap(providers);
 	const opts = options || {};
@@ -1172,6 +1254,7 @@ function djEnrichmentProcessQueued(ss, providers, options) {
 
 	for (const queued of jobs) {
 		if (requests >= maxRequests) break;
+		if (results.some(result => result.jobId === queued[0])) continue;
 		const jobId = queued[0];
 		const platform = queued[3];
 		const provider = providerMap.get(queued[4]);
@@ -1233,6 +1316,7 @@ function djEnrichmentProcessQueued(ss, providers, options) {
 			results.push({
 				jobId: jobId,
 				status: retry ? "QUEUED" : "SOURCE_UNAVAILABLE",
+				providerRetryableFailure: retryable,
 				error: error && error.message ? error.message : String(error)
 			});
 			continue;
@@ -1248,6 +1332,12 @@ function djEnrichmentProcessQueued(ss, providers, options) {
 				status: "SOURCE_UNAVAILABLE",
 				error: error
 			});
+			continue;
+		}
+		if (response.completedPartialSession) {
+			results.push(...djEnrichmentCheckpointPartialSession(
+				ss, claimed, provider, response.completedPartialSession, maxAttempts
+			));
 			continue;
 		}
 		if (!response.candidates.length) {
@@ -1722,6 +1812,56 @@ function djEnrichmentReview(ss, enrichmentId, decision, reviewer, notes) {
 	});
 }
 
+function djEnrichmentImportLinks(ss) {
+	const log = ss.getSheetByName("Import_Log");
+	if (!log || log.getLastRow() < 2) return [];
+	const rows = log.getDataRange().getDisplayValues();
+	const columns = djEnrichmentRequireHeaders(
+		rows[0], ["Observation Key", "Outcome", "Contact IDs"], "Import_Log"
+	);
+	return rows.slice(1).map(row => ({
+		observationId: djEnrichmentText(row[columns["Observation Key"]]),
+		outcome: djEnrichmentText(row[columns.Outcome]),
+		contactIds: djEnrichmentText(row[columns["Contact IDs"]])
+	})).filter(item => item.observationId);
+}
+
+/**
+ * Contact ID that the importer linked this observation to under its established rules
+ * ("Created" or "Matched" to exactly one contact), or "" when no such single link exists.
+ */
+function djEnrichmentImportLinkedContact(ss, observationId) {
+	const id = djEnrichmentText(observationId);
+	const rows = djEnrichmentImportLinks(ss).filter(item => item.observationId === id);
+	if (rows.length !== 1 || !["Created", "Matched"].includes(rows[0].outcome) ||
+		!/^[^,\s]+$/.test(rows[0].contactIds)) {
+		return "";
+	}
+	return rows[0].contactIds;
+}
+
+// Real logged import observations safely linked to a contact and never sent to identity review.
+function djEnrichmentImportObservationsForContact(ss, contactId) {
+	const id = djEnrichmentText(contactId);
+	const reviewSheet = ss.getSheetByName("DJ_Identity_Review");
+	const reviewed = new Set();
+	if (reviewSheet && reviewSheet.getLastRow() > 1) {
+		const rows = reviewSheet.getDataRange().getDisplayValues();
+		const column = rows[0].indexOf("Observation ID");
+		if (column < 0) throw new Error("Invalid DJ_Identity_Review headers.");
+		rows.slice(1).forEach(row => reviewed.add(row[column]));
+	}
+	const links = djEnrichmentImportLinks(ss);
+	const counts = new Map();
+	links.forEach(item => counts.set(item.observationId, (counts.get(item.observationId) || 0) + 1));
+	return links
+		.filter(item => !reviewed.has(item.observationId) &&
+			counts.get(item.observationId) === 1 &&
+			["Created", "Matched"].includes(item.outcome) &&
+			item.contactIds === id)
+		.map(item => item.observationId);
+}
+
 function djEnrichmentTransferApproved(ss, enrichmentId, observationId) {
 	const id = djEnrichmentText(enrichmentId);
 	const requestedObservationId = djEnrichmentText(observationId);
@@ -1738,28 +1878,40 @@ function djEnrichmentTransferApproved(ss, enrichmentId, observationId) {
 	}
 
 	const reviewSheet = ss.getSheetByName("DJ_Identity_Review");
-	if (!reviewSheet || reviewSheet.getLastRow() < 2) {
-		throw new Error("An approved MA-05 identity review is required.");
+	const reviewRows = reviewSheet && reviewSheet.getLastRow() > 1
+		? reviewSheet.getDataRange().getDisplayValues()
+		: [];
+	const reviewColumns = reviewRows.length ? djEnrichmentHeaderMap(reviewRows[0]) : {};
+	if (reviewRows.length) {
+		[
+			"Observation ID", "Review Status", "Selected Contact ID"
+		].forEach(header => {
+			if (reviewColumns[header] == null) {
+				throw new Error("Invalid DJ_Identity_Review headers.");
+			}
+		});
 	}
-	const reviewRows = reviewSheet.getDataRange().getDisplayValues();
-	const reviewColumns = djEnrichmentHeaderMap(reviewRows[0]);
-	[
-		"Observation ID", "Review Status", "Selected Contact ID"
-	].forEach(header => {
-		if (reviewColumns[header] == null) {
-			throw new Error("Invalid DJ_Identity_Review headers.");
-		}
-	});
-	const matches = reviewRows.slice(1).filter(row =>
-		row[reviewColumns["Observation ID"]] === requestedObservationId &&
+	const reviewed = reviewRows.slice(1).filter(row =>
+		row[reviewColumns["Observation ID"]] === requestedObservationId
+	);
+	const matches = reviewed.filter(row =>
 		row[reviewColumns["Review Status"]] === "APPROVED_LINK"
 	);
-	if (matches.length !== 1) {
-		throw new Error("Observation must have exactly one approved MA-05 identity review.");
+	let contactId;
+	if (reviewed.length) {
+		if (matches.length !== 1) {
+			throw new Error("Observation must have exactly one approved MA-05 identity review.");
+		}
+		contactId = djEnrichmentText(
+			matches[0][reviewColumns["Selected Contact ID"]]
+		);
+	} else {
+		// Observations never sent to identity review were linked by the importer's safe rules.
+		contactId = djEnrichmentImportLinkedContact(ss, requestedObservationId);
+		if (!contactId) {
+			throw new Error("Observation must have exactly one approved MA-05 identity review or one safe import link.");
+		}
 	}
-	const contactId = djEnrichmentText(
-		matches[0][reviewColumns["Selected Contact ID"]]
-	);
 	if (!contactId ||
 		(record.row[2] && record.row[2] !== contactId) ||
 		(record.row[3] && record.row[3] !== requestedObservationId)) {

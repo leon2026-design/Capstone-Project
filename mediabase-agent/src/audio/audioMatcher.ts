@@ -1,5 +1,6 @@
 import { basename, extname, resolve } from "node:path";
 import type { DemoRecording } from "../metadata/recordValidation";
+import { reviewedVersionFromTitle } from "../metadata/versionDesignation";
 import {
   normalizeIsrcValue,
   type AudioExtractionErrorCode,
@@ -16,7 +17,7 @@ export type AudioMatchCandidate = {
   filePath: string;
   fileName: string;
   basis: AudioMatchBasis;
-  /** True only for conflict-free ISRC or exact metadata evidence. */
+  /** True only when artist, title, version, and any ISRC evidence agree. */
   autoEligible: boolean;
   evidence: string[];
   conflicts: string[];
@@ -128,7 +129,8 @@ function evaluateFile(
   const evidence: string[] = [];
   const conflicts: string[] = [];
   const title = normalizeMatchText(record.title);
-  const version = normalizeMatchText(record.version);
+  const titleVersion = normalizeMatchText(reviewedVersionFromTitle(record.title));
+  const version = normalizeMatchText(record.version ?? titleVersion);
   const artists = recordArtistNames(record);
   const expectedIsrc = recordIsrc(record);
 
@@ -189,7 +191,8 @@ function evaluateFile(
   const versionAgrees =
     version === ""
       ? embeddedVersion === "" && fileLabels.size === 0 && titleResidual === ""
-      : embeddedVersion === version || titleResidual === version;
+      : embeddedVersion === version || titleResidual === version ||
+        (titleVersion === version && embeddedTitle === title);
   if (versionAgrees) evidence.push("Version/mix agrees with Orchard.");
 
   let basis: AudioMatchBasis | null = null;
@@ -203,7 +206,8 @@ function evaluateFile(
     filePath: metadata.filePath,
     fileName: metadata.fileName,
     basis,
-    autoEligible: (basis === "ISRC" || basis === "EXACT_METADATA") && conflicts.length === 0,
+    autoEligible: (basis === "ISRC" || basis === "EXACT_METADATA") &&
+      artistAgrees && titleAgrees && versionAgrees && conflicts.length === 0,
     evidence,
     conflicts
   };
@@ -231,6 +235,29 @@ function buildResult(
     }
     const candidate = evaluateFile(record, extraction.metadata, isrcOwners);
     if (candidate) candidates.push(candidate);
+  }
+  const expectedIsrc = recordIsrc(record);
+  const sameIsrcFiles = extractions.filter((extraction) =>
+    extraction.status === "OK" && expectedIsrc !== null &&
+    extraction.metadata.rawIsrcs.some((value) => normalizeIsrcValue(value) === expectedIsrc));
+  const conflictingSameIsrc = sameIsrcFiles.some((left, index) =>
+    left.status === "OK" && sameIsrcFiles.slice(index + 1).some((right) => {
+      if (right.status !== "OK") return false;
+      const a = left.metadata;
+      const b = right.metadata;
+      const durationConflict = a.durationSeconds !== null && b.durationSeconds !== null &&
+        Math.abs(a.durationSeconds - b.durationSeconds) > 2;
+      const metadataConflict = (["artist", "title", "version"] as const).some((field) =>
+        !!a[field] && !!b[field] && normalizeMatchText(a[field]) !== normalizeMatchText(b[field]));
+      return durationConflict || metadataConflict;
+    }));
+  if (conflictingSameIsrc) {
+    const affectedPaths = new Set(sameIsrcFiles.map((item) => item.filePath));
+    for (const candidate of candidates) {
+      if (!affectedPaths.has(candidate.filePath)) continue;
+      candidate.autoEligible = false;
+      candidate.conflicts.push("Files with the same ISRC have conflicting identity or duration; review the versions.");
+    }
   }
   candidates.sort(compareCandidates);
   rejectedFiles.sort((left, right) => (left.filePath < right.filePath ? -1 : 1));
